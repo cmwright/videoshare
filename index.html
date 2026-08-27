@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="description" content="Record your screen, encrypt it in the browser, share a link." />
+    <title>VideoShare — Record</title>
+    <!-- Deploy config, copied verbatim to dist/. Classic script: runs before the module. -->
+    <script src="/config.js"></script>
+  </head>
+
+  <body>
+    <main class="page">
+      <header class="site-header">
+        <h1 class="brand">VideoShare</h1>
+        <p class="muted">Record your screen, encrypt it here, share a link.</p>
+      </header>
+
+      <details id="settings-panel" class="card settings">
+        <summary id="settings-summary">Storage settings</summary>
+
+        <form id="settings-form" autocomplete="off">
+          <p class="muted hint">
+            Credentials stay in this browser's localStorage and are used to sign uploads directly
+            to your bucket. A write-only key is enough — see
+            <code>docs/storage-setup.md</code>.
+          </p>
+
+          <div class="fields">
+            <div class="field wide">
+              <label for="endpoint">S3 endpoint</label>
+              <input
+                id="endpoint"
+                name="endpoint"
+                type="url"
+                required
+                placeholder="http://localhost:9000"
+                spellcheck="false"
+              />
+            </div>
+
+            <div class="field">
+              <label for="bucket">Bucket</label>
+              <input id="bucket" name="bucket" type="text" required placeholder="videoshare" spellcheck="false" />
+            </div>
+
+            <div class="field">
+              <label for="region">Region</label>
+              <input id="region" name="region" type="text" value="us-east-1" spellcheck="false" />
+            </div>
+
+            <div class="field">
+              <label for="accessKeyId">Access key ID</label>
+              <input id="accessKeyId" name="accessKeyId" type="text" required spellcheck="false" />
+            </div>
+
+            <div class="field">
+              <label for="secretAccessKey">Secret access key</label>
+              <input id="secretAccessKey" name="secretAccessKey" type="password" required />
+            </div>
+
+            <div class="field wide">
+              <label for="publicBaseUrl">Public base URL</label>
+              <input
+                id="publicBaseUrl"
+                name="publicBaseUrl"
+                type="url"
+                required
+                placeholder="http://localhost:9000/videoshare"
+                spellcheck="false"
+              />
+              <p class="muted hint">Where the bucket's objects are readable without credentials.</p>
+            </div>
+
+            <div class="field">
+              <label for="videoBitsPerSecond">Video bitrate (bits/s)</label>
+              <input
+                id="videoBitsPerSecond"
+                name="videoBitsPerSecond"
+                type="number"
+                min="100000"
+                step="100000"
+                value="2000000"
+              />
+            </div>
+          </div>
+
+          <div class="settings-actions">
+            <button type="submit" class="primary">Save settings</button>
+            <span id="settings-status" class="muted" role="status" aria-live="polite"></span>
+          </div>
+        </form>
+      </details>
+
+      <section class="card recorder" aria-label="Recorder">
+        <div data-stage="idle" class="stage">
+          <button id="start" type="button" class="primary record-button">
+            <span class="record-glyph" aria-hidden="true"></span>
+            Record screen
+          </button>
+          <label class="toggle">
+            <input id="mic" type="checkbox" checked />
+            <span>Record microphone</span>
+          </label>
+        </div>
+
+        <div data-stage="picking" class="stage hidden">
+          <p class="muted">Waiting for you to choose a screen, window, or tab…</p>
+        </div>
+
+        <div data-stage="recording" class="stage hidden">
+          <div class="recording-row">
+            <span class="rec-dot" aria-hidden="true"></span>
+            <span id="timer" class="timer" role="timer" aria-live="off">00:00</span>
+            <button id="stop" type="button" class="danger">Stop recording</button>
+          </div>
+          <p id="uploaded" class="muted hint" role="status" aria-live="off">Uploading as you record…</p>
+          <p class="muted hint">The browser's own “Stop sharing” bar works too.</p>
+        </div>
+
+        <div data-stage="preview" class="stage hidden">
+          <video id="preview" class="preview-video" controls playsinline></video>
+          <p id="preview-info" class="muted hint"></p>
+          <div class="field">
+            <label for="title">Title</label>
+            <input id="title" type="text" placeholder="Untitled recording" maxlength="200" />
+          </div>
+          <div class="button-row">
+            <button id="finish" type="button" class="primary">Finish</button>
+            <button id="discard" type="button" class="danger">Discard</button>
+          </div>
+        </div>
+
+        <div data-stage="finishing" class="stage hidden">
+          <h2>Finishing…</h2>
+          <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="progress">
+            <div id="progress-fill" class="progress-fill"></div>
+          </div>
+          <p id="progress-text" class="muted hint">0%</p>
+
+          <div id="recovery" class="recovery hidden">
+            <p class="muted hint">
+              Nothing was lost — the recording is still in this tab. Download it, or try again.
+            </p>
+            <div class="button-row">
+              <a id="download" class="button-link" download>Download recording</a>
+              <button id="retry" type="button" class="primary">Retry</button>
+            </div>
+          </div>
+        </div>
+
+        <div data-stage="done" class="stage hidden">
+          <h2>Ready to share</h2>
+          <div class="link-row">
+            <input id="link" type="text" readonly class="mono" aria-label="Share link" />
+            <button id="copy-link" type="button" class="primary">Copy</button>
+          </div>
+          <p class="muted hint">
+            The decryption key lives in the link's <code>#</code> fragment — anyone with the link can
+            watch, and nobody else can.
+          </p>
+          <div class="button-row">
+            <button id="again" type="button">Record another</button>
+          </div>
+        </div>
+
+        <p id="message" class="message" role="status" aria-live="polite"></p>
+      </section>
+
+      <section class="card library" aria-label="My videos">
+        <h2>My videos</h2>
+        <p id="library-empty" class="muted hint">
+          Nothing yet. Recordings you upload are listed here — this list is local to this browser.
+        </p>
+        <ul id="library-list" class="library-list"></ul>
+      </section>
+    </main>
+
+    <script type="module" src="/src/record.ts"></script>
+  </body>
+</html>

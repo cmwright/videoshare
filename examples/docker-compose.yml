@@ -1,0 +1,149 @@
+# VideoShare local stack: MinIO (S3-compatible bucket) + nginx (static site).
+#
+#   npm install && npm run build
+#   docker compose -f examples/docker-compose.yml up -d
+#   open http://localhost:8080
+#
+# Ports: 9000 S3 API, 9001 MinIO console (minioadmin / minioadmin), 8080 site.
+#
+# Paste these into the recorder's Settings panel:
+#   Endpoint          http://localhost:9000
+#   Region            us-east-1
+#   Bucket            videoshare
+#   Access key ID     videoshare-uploader
+#   Secret access key videoshare-uploader-secret
+#   Public base URL   http://localhost:9000/videoshare
+#
+# Tear down with `docker compose -f examples/docker-compose.yml down -v`
+# (-v also drops the recorded videos).
+
+services:
+  minio:
+    image: quay.io/minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+      # MinIO has no per-bucket CORS configuration: it does not implement the S3
+      # PutBucketCors API (`mc cors set` fails with NotImplemented), and instead
+      # answers preflights permissively out of the box — it reflects the request
+      # origin and the requested method/headers, so the multipart preflights
+      # (POST to create and complete, DELETE to abort) come back allowed just as
+      # readily as the player's GET. Its Access-Control-Expose-Headers already
+      # covers ETag, Content-Length, Content-Range and Accept-Ranges — the ETag
+      # being the one the recorder must read off every UploadPart response to
+      # complete the upload. This one server-wide setting is the only knob;
+      # narrow it to your site's origin for anything past local development.
+      MINIO_API_CORS_ALLOW_ORIGIN: "*"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 2s
+
+  # One-shot: creates the bucket, makes it anonymously readable (objects only),
+  # mints an upload-only access key, and sets abandoned multipart uploads to be
+  # swept after a day. Safe to re-run; exits 0 when done.
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        mc alias set local http://minio:9000 minioadmin minioadmin > /dev/null
+        mc mb --ignore-existing local/videoshare
+
+        # Anonymous read of objects, and nothing else. Note this is NOT
+        # `mc anonymous set download`, which additionally grants anonymous
+        # s3:ListBucket and would let anyone enumerate every video id in the
+        # bucket. Unguessable ids are half of the sharing model, so the policy
+        # is written out longhand instead. Mirrors examples/s3-bucket-policy.json.
+        cat > /tmp/anonymous-read.json <<'JSON'
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "PublicReadObjectsOnly",
+              "Effect": "Allow",
+              "Principal": "*",
+              "Action": ["s3:GetObject"],
+              "Resource": ["arn:aws:s3:::videoshare/*"]
+            }
+          ]
+        }
+        JSON
+        mc anonymous set-json /tmp/anonymous-read.json local/videoshare
+
+        # Upload-only credentials for the recorder. PutObject authorizes the
+        # whole multipart write path — create, every part, complete — but
+        # abandoning an upload is authorized separately: without
+        # s3:AbortMultipartUpload, MinIO answers the recorder's Discard with a
+        # 403 (verified against RELEASE.2025-09-07T16-13-09Z). These keys still
+        # cannot read, list, or delete a stored object, so losing them costs you
+        # spam in the bucket, not your videos.
+        # Mirrors examples/iam-uploader-policy.json.
+        cat > /tmp/uploader-policy.json <<'JSON'
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "VideoShareUploadOnly",
+              "Effect": "Allow",
+              "Action": ["s3:PutObject", "s3:AbortMultipartUpload"],
+              "Resource": ["arn:aws:s3:::videoshare/*"]
+            }
+          ]
+        }
+        JSON
+        mc admin user add local videoshare-uploader videoshare-uploader-secret
+        mc admin policy create local videoshare-uploader /tmp/uploader-policy.json
+        mc admin policy attach local videoshare-uploader --user videoshare-uploader
+
+        # Sweep multipart uploads that were never completed — a closed tab or a
+        # crashed browser mid-recording leaves parts behind, and unfinished
+        # parts are billed like objects while being invisible to a plain `ls`.
+        #
+        # This is *not* a bucket lifecycle rule here. MinIO rejects a lifecycle
+        # rule whose only action is AbortIncompleteMultipartUpload with
+        # InvalidArgument, and silently drops that action from a rule that also
+        # carries an Expiration — so `mc ilm rule add/import` cannot express it
+        # (verified against RELEASE.2025-09-07T16-13-09Z). The server-wide knob
+        # below is MinIO's equivalent, and 24h is already its default; it is set
+        # explicitly so this stack visibly matches what docs/storage-setup.md
+        # tells you to configure on S3 and R2. The sweep itself runs every
+        # api stale_uploads_cleanup_interval (6h by default), so a stranded
+        # upload lives at most about 30 hours.
+        mc admin config set local api stale_uploads_expiry=24h > /dev/null
+
+        echo
+        echo "  Recorder settings (http://localhost:8080 -> Settings)"
+        echo "  ---------------------------------------------------"
+        echo "  Endpoint           http://localhost:9000"
+        echo "  Region             us-east-1"
+        echo "  Bucket             videoshare"
+        echo "  Access key ID      videoshare-uploader"
+        echo "  Secret access key  videoshare-uploader-secret"
+        echo "  Public base URL    http://localhost:9000/videoshare"
+        echo
+
+  # Serves the built site. `npm run build` must have produced dist/ first —
+  # Docker creates an empty directory for a missing bind mount, which shows up
+  # as a 403 from nginx rather than an error here.
+  web:
+    image: nginx:alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ../dist:/usr/share/nginx/html:ro
+
+volumes:
+  minio-data:

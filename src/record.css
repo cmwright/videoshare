@@ -1,0 +1,286 @@
+/* Recorder page layout. Tokens and base element styles come from app.css. */
+
+.page {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: var(--space-6) var(--space-4) var(--space-7);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+
+.site-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2) var(--space-3);
+}
+
+.brand {
+  font-size: 1.6rem;
+}
+
+.hint {
+  font-size: 0.8125rem;
+}
+
+.button-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.message {
+  margin-top: var(--space-4);
+  font-size: 0.875rem;
+  color: var(--text-muted);
+}
+
+.message:empty {
+  display: none;
+}
+
+.message.error {
+  color: var(--danger);
+}
+
+/* Settings ------------------------------------------------------------------ */
+
+.settings summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  cursor: pointer;
+  font-weight: 600;
+  list-style: none;
+}
+
+/* Safari still paints the default triangle without this. */
+.settings summary::-webkit-details-marker {
+  display: none;
+}
+
+.settings summary::after {
+  content: "▾";
+  color: var(--text-faint);
+  transition: transform 0.15s ease;
+}
+
+.settings[open] summary::after {
+  transform: rotate(180deg);
+}
+
+.settings[open] summary {
+  margin-bottom: var(--space-4);
+}
+
+.fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-4);
+  margin: var(--space-4) 0;
+}
+
+.field.wide {
+  grid-column: 1 / -1;
+}
+
+.field .hint {
+  margin-top: var(--space-1);
+}
+
+.settings-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+/* Recorder ------------------------------------------------------------------ */
+
+.stage {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.record-button {
+  padding: var(--space-4) var(--space-5);
+  border-radius: var(--radius-md);
+  font-size: 1.05rem;
+}
+
+.record-glyph {
+  width: 0.7em;
+  height: 0.7em;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+  color: var(--text);
+  font-size: 0.9375rem;
+  font-weight: 450;
+  cursor: pointer;
+}
+
+.recording-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.rec-dot {
+  flex: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--recording);
+  animation: rec-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes rec-pulse {
+  50% {
+    opacity: 0.25;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rec-dot {
+    animation: none;
+  }
+}
+
+.timer {
+  flex: 1;
+  font-family: var(--font-mono);
+  font-size: 1.75rem;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+}
+
+.preview-video {
+  display: block;
+  width: 100%;
+  max-height: 55vh;
+  border-radius: var(--radius-md);
+  background: #000;
+}
+
+.progress {
+  height: 10px;
+  border-radius: 999px;
+  background: var(--surface-sunken);
+  overflow: hidden;
+}
+
+.progress-fill {
+  width: 0%;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 0.15s ease;
+}
+
+/* Shown inside the finishing stage when finish() fails, so the local recording
+   can always be saved instead of lost (SPEC §7). */
+.recovery {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+/* An <a download> that has to sit beside a button and match it. */
+.button-link {
+  display: inline-flex;
+  align-items: center;
+  padding: var(--space-2) var(--space-4);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font-weight: 550;
+  line-height: 1.4;
+  text-decoration: none;
+}
+
+.button-link:hover {
+  background: var(--surface-sunken);
+  border-color: var(--text-faint);
+  color: var(--text);
+}
+
+.link-row {
+  display: flex;
+  gap: var(--space-2);
+}
+
+.link-row input {
+  font-size: 0.8125rem;
+}
+
+.link-row button {
+  flex: none;
+}
+
+/* Library ------------------------------------------------------------------- */
+
+.library-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.library-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-3) 0;
+  border-top: 1px solid var(--border);
+}
+
+.library-item:first-child {
+  border-top: none;
+  padding-top: var(--space-4);
+}
+
+.library-details {
+  flex: 1;
+  min-width: 0;
+}
+
+.library-title {
+  display: block;
+  overflow: hidden;
+  color: var(--text);
+  font-weight: 550;
+  text-decoration: none;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.library-title:hover {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+.library-sub {
+  font-size: 0.8125rem;
+}
+
+@media (max-width: 560px) {
+  .fields {
+    grid-template-columns: 1fr;
+  }
+
+  .library-item {
+    flex-wrap: wrap;
+  }
+
+  .library-details {
+    flex-basis: 100%;
+  }
+}

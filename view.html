@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex" />
+    <title>VideoShare</title>
+    <!-- Deploy config, copied verbatim to dist/. Classic script: runs before the module. -->
+    <script src="/config.js"></script>
+  </head>
+  <body>
+    <main class="page">
+      <header id="video-header" class="video-header hidden">
+        <h1 id="video-title"></h1>
+        <p id="video-meta" class="video-meta"></p>
+      </header>
+
+      <div id="stage" class="stage">
+        <video id="video" controls playsinline preload="metadata"></video>
+        <div id="play-overlay" class="play-overlay hidden">
+          <button id="play-button" class="play-button" type="button" aria-label="Play video">
+            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <path d="M8 5v14l11-7z" fill="currentColor" />
+            </svg>
+          </button>
+          <p class="play-hint">Your browser blocked autoplay &mdash; press play</p>
+        </div>
+      </div>
+
+      <p id="status" class="status">
+        <span class="spinner" aria-hidden="true"></span>
+        <span id="status-text">Loading&hellip;</span>
+      </p>
+
+      <section id="error-card" class="card error-card hidden" role="alert">
+        <h2 id="error-title"></h2>
+        <p id="error-detail"></p>
+      </section>
+
+      <noscript>
+        <section class="card error-card">
+          <h2>JavaScript required</h2>
+          <p>
+            This video is encrypted in your browser with the key from the link,
+            so playback needs JavaScript enabled.
+          </p>
+        </section>
+      </noscript>
+
+      <!-- Deploying a fork? Wrap this in a link to your own repository. -->
+      <footer class="footer muted">Powered by VideoShare</footer>
+    </main>
+
+    <script type="module" src="/src/player.ts"></script>
+  </body>
+</html>
