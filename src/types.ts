@@ -58,6 +58,18 @@ export interface Settings {
 }
 
 /**
+ * The encoder half of `Settings`, persisted on its own at `videoshare.recording`
+ * (SPEC §15.5). Gateway mode has no storage settings panel to keep these in —
+ * the credentials they used to sit beside live on the gateway — but the choice
+ * of codec is the recording operator's, not the deployment's.
+ */
+export interface RecordingPrefs {
+  quality: Quality;
+  codec: CodecChoice;
+  videoBitsPerSecond: number;
+}
+
+/**
  * What `GET {gatewayUrl}/config` answers (SPEC §15.3). Public, no auth — it
  * carries nothing secret, only what the recorder needs to sign in and to check
  * that config.js points viewers at the same bucket the gateway writes to.

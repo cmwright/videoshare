@@ -27,10 +27,12 @@ import {
   fetchGatewayConfig,
   gatewayUrl,
   loadLibrary,
+  loadRecordingPrefs,
   loadSettings,
   publicBaseUrl,
   QUALITIES,
   removeFromLibrary,
+  saveRecordingPrefs,
   saveSettings,
 } from "./settings";
 import type {
@@ -38,6 +40,7 @@ import type {
   GatewayConfig,
   LibraryEntry,
   Quality,
+  RecordingPrefs,
   Settings,
   VideoMeta,
 } from "./types";
@@ -78,6 +81,12 @@ const stages = Array.from(document.querySelectorAll<HTMLElement>("[data-stage]")
 const settingsPanel = el<HTMLDetailsElement>("#settings-panel");
 const settingsForm = el<HTMLFormElement>("#settings-form");
 const settingsStatus = el<HTMLElement>("#settings-status");
+
+const recordingPanel = el<HTMLElement>("#recording-panel");
+const recordingQuality = el<HTMLSelectElement>("#rec-quality");
+const recordingCodec = el<HTMLSelectElement>("#rec-codec");
+const recordingBitrate = el<HTMLInputElement>("#rec-videoBitsPerSecond");
+const recordingStatus = el<HTMLElement>("#recording-status");
 
 const authPanel = el<HTMLElement>("#auth-panel");
 const authLoading = el<HTMLElement>("#auth-loading");
@@ -142,6 +151,18 @@ let stage: Stage = "idle";
 
 /** Set once config.js names a gateway (SPEC §15.5); stays null in legacy mode. */
 let gateway: { auth: Auth; signer: Signer } | null = null;
+/**
+ * Gateway mode's encoder choices (SPEC §15.5), and this session's source of
+ * truth for them: a browser that refuses to store a choice still has to record
+ * with it. Legacy mode ignores this and reads the settings form instead — and
+ * must not so much as read `videoshare.recording` (SPEC §9), so these start as
+ * the plain defaults and only `initRecordingPanel()` loads the stored ones.
+ */
+let recordingPrefs: RecordingPrefs = {
+  quality: DEFAULT_QUALITY,
+  codec: DEFAULT_CODEC,
+  videoBitsPerSecond: DEFAULT_VIDEO_BITS_PER_SECOND,
+};
 /** This browser can capture and encode at all — decided once by checkSupport(). */
 let captureSupported = true;
 /** Gateway mode with no usable ID token: recording must not start. */
@@ -365,6 +386,90 @@ settingsForm.addEventListener("submit", (event) => {
   }, 2000);
 });
 
+// --- Recording options (gateway mode, SPEC §15.5) ----------------------------
+
+/**
+ * The floor the field itself declares, read from the input so the two can never
+ * drift. The legacy form carries the identical `min`, and the browser enforces
+ * it there by refusing the submit; this panel has no form and saves on change,
+ * so no constraint validation ever runs and the same rule has to be applied
+ * here — otherwise a typed `500` reaches MediaRecorder as 500 bits/s and
+ * uploads an unwatchable file.
+ */
+const MIN_FALLBACK_BITRATE = Number(recordingBitrate.min) || 1;
+
+/** Raises a below-minimum bitrate rather than refusing it: there is no Save
+ * button to refuse at, and the caller writes the taken value back into the
+ * field, so the correction is visible where the browser's own message would be. */
+function clampBitrate(bits: number): number {
+  return Math.max(MIN_FALLBACK_BITRATE, Math.round(bits));
+}
+
+/** Blank, or anything else the number input will hand back, still has to encode. */
+function readBitrate(value: string): number {
+  const bits = Number(value);
+  return Number.isFinite(bits) && bits >= 1 ? clampBitrate(bits) : DEFAULT_VIDEO_BITS_PER_SECOND;
+}
+
+function fillRecordingPanel(prefs: RecordingPrefs): void {
+  recordingQuality.value = prefs.quality;
+  recordingCodec.value = prefs.codec;
+  recordingBitrate.value = String(prefs.videoBitsPerSecond);
+}
+
+/** Cleared on each change so a fast second choice cannot wipe its own confirmation. */
+let recordingStatusTimer = 0;
+
+function showRecordingStatus(text: string, isError: boolean): void {
+  recordingStatus.textContent = text;
+  recordingStatus.classList.toggle("error", isError);
+  recordingStatus.classList.toggle("muted", !isError);
+}
+
+/**
+ * There is no Save button: the panel writes on change and says so. Storage that
+ * refuses the write is a note, never a failure — `recordingPrefs` is what the
+ * next recording encodes with either way (SPEC §15.5).
+ */
+function onRecordingChange(): void {
+  recordingPrefs = {
+    quality: readQuality(recordingQuality.value),
+    codec: readCodec(recordingCodec.value),
+    videoBitsPerSecond: readBitrate(recordingBitrate.value),
+  };
+  // Shows what was actually taken, e.g. the default reappearing in a bitrate
+  // field left empty.
+  fillRecordingPanel(recordingPrefs);
+
+  window.clearTimeout(recordingStatusTimer);
+  if (!saveRecordingPrefs(recordingPrefs)) {
+    showRecordingStatus(
+      "This browser is blocking localStorage, so this choice only lasts until you reload. " +
+        "Recording is unaffected.",
+      true,
+    );
+    return;
+  }
+  showRecordingStatus("Saved.", false);
+  recordingStatusTimer = window.setTimeout(() => {
+    showRecordingStatus("", false);
+  }, 2000);
+}
+
+function initRecordingPanel(): void {
+  // The one and only read of `videoshare.recording`, so legacy mode leaves the
+  // key untouched (SPEC §9). The stored bitrate goes through the field's own
+  // minimum on the way in as well: a value written under it (hand-edited, or by
+  // a build without the clamp above) would otherwise be shown and recorded with.
+  const stored = loadRecordingPrefs();
+  recordingPrefs = { ...stored, videoBitsPerSecond: clampBitrate(stored.videoBitsPerSecond) };
+  fillRecordingPanel(recordingPrefs);
+  for (const node of [recordingQuality, recordingCodec, recordingBitrate]) {
+    node.addEventListener("change", onRecordingChange);
+  }
+  recordingPanel.classList.remove("hidden");
+}
+
 // --- Sign-in (gateway mode, SPEC §15.5) --------------------------------------
 
 /** Where the gateway lives, or null for legacy mode. Read once: config.js cannot change. */
@@ -441,8 +546,9 @@ function gatewayBaseUrlWarning(config: GatewayConfig): string | null {
 }
 
 /**
- * Gateway mode: the settings panel is removed outright (there are no credentials
- * for it to hold), Google's script is loaded, and recording waits for a token.
+ * Gateway mode: the storage settings panel is removed outright (there are no
+ * credentials for it to hold), the recording options it used to carry get a
+ * panel of their own, Google's script is loaded, and recording waits for a token.
  */
 async function initGateway(base: string): Promise<void> {
   settingsPanel.remove();
@@ -458,6 +564,10 @@ async function initGateway(base: string): Promise<void> {
     showAuthStatus(describe(err), true);
     return;
   }
+
+  // Before sign-in, and independent of it: which codec this machine records with
+  // is the operator's choice, not something the gateway authorizes (SPEC §15.5).
+  initRecordingPanel();
 
   const warning = gatewayBaseUrlWarning(config);
   if (warning) {
@@ -761,13 +871,13 @@ function uploadPlan(): UploadPlan | null {
       demandSignIn("Sign in with Google before recording — the upload starts as you record.");
       return null;
     }
-    // There is no settings panel in gateway mode (SPEC §15.5), so the encoder
-    // runs on the same defaults a fresh install would use.
+    // The recording panel, not the (removed) settings form, holds the encoder
+    // choices here — from memory, so an unstorable change still counts (SPEC §15.5).
     return {
       signer: gateway.signer,
-      quality: DEFAULT_QUALITY,
-      codec: DEFAULT_CODEC,
-      videoBitsPerSecond: DEFAULT_VIDEO_BITS_PER_SECOND,
+      quality: recordingPrefs.quality,
+      codec: recordingPrefs.codec,
+      videoBitsPerSecond: recordingPrefs.videoBitsPerSecond,
     };
   }
 
@@ -1253,7 +1363,7 @@ function checkSupport(): void {
 
 setStage("idle");
 // One or the other, never both: a gateway means credentials live server-side, so
-// the settings panel is not just hidden but removed (SPEC §15.5).
+// the storage settings panel is not just hidden but removed (SPEC §15.5).
 if (gatewayBase) void initGateway(gatewayBase);
 else initSettings();
 renderLibrary();

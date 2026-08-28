@@ -19,8 +19,8 @@
 
       <!--
         Gateway mode only (SPEC §15.5). record.ts unhides this when config.js
-        sets gatewayUrl, and removes the settings panel below in the same breath —
-        the two are mutually exclusive by design.
+        sets gatewayUrl, and removes the storage settings panel below in the same
+        breath — the two are mutually exclusive by design.
       -->
       <section id="auth-panel" class="card auth hidden" aria-label="Sign in">
         <p id="auth-loading" class="muted hint">Loading Google sign-in…</p>
@@ -43,6 +43,61 @@
         <p id="auth-status" class="muted hint" role="status" aria-live="polite"></p>
         <p id="auth-warning" class="hint error hidden"></p>
       </section>
+
+      <!--
+        Gateway mode only (SPEC §15.5), unhidden by record.ts alongside the
+        sign-in panel above: the storage settings panel below is removed there,
+        but these three choices belong to whoever is recording, not to the
+        deployment, so they outlive it under their own localStorage key. Same
+        values and same copy as the matching fields in the settings form —
+        distinct ids because both panels exist in this document.
+      -->
+      <details id="recording-panel" class="card settings hidden">
+        <summary>Recording options</summary>
+
+        <div class="fields">
+          <div class="field">
+            <label for="rec-quality">Recording quality</label>
+            <select id="rec-quality">
+              <option value="smaller">Smaller — smallest files</option>
+              <option value="standard" selected>Standard — crisp text</option>
+              <option value="sharper">Sharper — largest files</option>
+            </select>
+            <p class="muted hint">Constant quality, so busy screens cost more bytes than still ones.</p>
+          </div>
+
+          <div class="field">
+            <label for="rec-videoBitsPerSecond">Fallback bitrate (bits/s)</label>
+            <input id="rec-videoBitsPerSecond" type="number" min="100000" step="100000" value="2500000" />
+            <p class="muted hint">
+              Only used where recording falls back to the browser's own MediaRecorder — Firefox,
+              and anything else without the WebCodecs pieces this app needs. Normally ignored in
+              Chrome and Edge, which encode through WebCodecs, but they use it too if no WebCodecs
+              configuration works.
+            </p>
+          </div>
+
+          <div class="field wide">
+            <label for="rec-codec">Video codec</label>
+            <select id="rec-codec">
+              <option value="auto" selected>Auto — hardware H.264 when available (recommended)</option>
+              <option value="h264">H.264 — hardware where available, larger files, widest playback</option>
+              <option value="vp9">VP9 — smallest files, software, may drop frames at high resolution</option>
+              <option value="av1">AV1 — smallest, some Safari viewers can't play</option>
+            </select>
+            <p class="muted hint">
+              Chrome and Edge only. Hardware H.264 encodes 4K without dropping frames; the software
+              codecs trade that for smaller uploads. If the codec you pick isn't available here, the
+              recorder falls back and says which one it used — H.264 itself falls back to a software
+              H.264 encoder, which is slower and no smaller. For Safari viewers, H.264 also needs a
+              recording machine with an AAC encoder: without one (desktop Linux) the MP4 carries
+              Opus audio, which Safari cannot play.
+            </p>
+          </div>
+        </div>
+
+        <p id="recording-status" class="muted hint" role="status" aria-live="polite"></p>
+      </details>
 
       <details id="settings-panel" class="card settings">
         <summary id="settings-summary">Storage settings</summary>

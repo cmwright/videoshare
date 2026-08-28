@@ -1,6 +1,14 @@
-import type { CodecChoice, GatewayConfig, LibraryEntry, Quality, Settings } from "./types";
+import type {
+  CodecChoice,
+  GatewayConfig,
+  LibraryEntry,
+  Quality,
+  RecordingPrefs,
+  Settings,
+} from "./types";
 
 const SETTINGS_KEY = "videoshare.settings";
+const RECORDING_KEY = "videoshare.recording";
 const LIBRARY_KEY = "videoshare.library";
 const GATEWAY_DOCS = "docs/gateway-setup.md";
 
@@ -47,6 +55,35 @@ export function saveSettings(s: Settings): void {
   }
 }
 
+/**
+ * Gateway mode's encoder choices (SPEC §15.5). Never null, unlike
+ * `loadSettings`: there is nothing here a recording cannot start without, so an
+ * empty, unreadable or malformed key reads as the defaults a fresh install
+ * records with.
+ */
+export function loadRecordingPrefs(): RecordingPrefs {
+  const raw = readJson(RECORDING_KEY);
+  const stored = raw !== null && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+  return normalizeRecordingPrefs(stored as Raw<RecordingPrefs>);
+}
+
+/**
+ * Stores the normalized choices, answering whether they were actually written.
+ * Like the library, and unlike credentials, these are a convenience: a browser
+ * that refuses storage must not fail a recording over them, so the caller only
+ * has to say that the choice lasts until reload (SPEC §15.5).
+ */
+export function saveRecordingPrefs(p: RecordingPrefs): boolean {
+  const store = storage();
+  if (!store) return false;
+  try {
+    store.setItem(RECORDING_KEY, JSON.stringify(normalizeRecordingPrefs(p)));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function loadLibrary(): LibraryEntry[] {
   const raw = readJson(LIBRARY_KEY);
   if (!Array.isArray(raw)) return [];
@@ -84,9 +121,10 @@ export function publicBaseUrl(): string {
 
 /**
  * Where the optional gateway lives, from config.js — absolute, or same-origin
- * relative like `"/api"` (SPEC §15.5). Present → gateway mode: no settings
- * panel, no credentials in this browser, Google sign-in required. Absent (the
- * shipped default) → legacy mode, §9 unchanged.
+ * relative like `"/api"` (SPEC §15.5). Present → gateway mode: no storage
+ * settings panel, no credentials in this browser, Google sign-in required —
+ * only the recording options survive, under their own key. Absent (the shipped
+ * default) → legacy mode, §9 unchanged.
  */
 export function gatewayUrl(): string | null {
   const value = deployConfig()?.gatewayUrl;
@@ -172,6 +210,16 @@ function normalizeSettings(raw: StoredSettings): Settings {
     // fall back to their defaults rather than failing the load (SPEC §9).
     quality: quality(raw.quality),
     codec: codec(raw.codec, raw.preferAv1),
+    videoBitsPerSecond: wholeNumber(raw.videoBitsPerSecond, DEFAULT_VIDEO_BITS_PER_SECOND, 1),
+  };
+}
+
+function normalizeRecordingPrefs(raw: Raw<RecordingPrefs>): RecordingPrefs {
+  return {
+    quality: quality(raw.quality),
+    // This key is newer than the two-engine rewrite, so it never held a
+    // `preferAv1` boolean and there is nothing to migrate (SPEC §9).
+    codec: codec(raw.codec, undefined),
     videoBitsPerSecond: wholeNumber(raw.videoBitsPerSecond, DEFAULT_VIDEO_BITS_PER_SECOND, 1),
   };
 }

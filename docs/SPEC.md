@@ -274,6 +274,10 @@ player and storage format are unaffected. `meta.json` remains a single PUT.
   MediaRecorder engine only, default 2_500_000). Loading settings stored by
   older versions must not error — fill defaults; a stored `preferAv1: true`
   migrates to `codec: "av1"`.
+- `videoshare.recording` (JSON): `{ quality, codec, videoBitsPerSecond }` — the
+  same three fields, defaults and normalization, stored separately for gateway
+  mode, which has no storage settings panel to keep them in (§15.5). Legacy mode
+  neither reads nor writes it.
 - `videoshare.library` (JSON array of): `{ id, title, createdAt, durationMs,
   link, sizeBytes? }` — newest first; list in UI with copy-link and
   delete-from-list (delete only removes the local entry in v1, it does not
@@ -300,6 +304,8 @@ export interface VideoMeta { v: 1; title: string; mimeType: string; durationMs: 
 export interface Settings { endpoint: string; region: string; bucket: string;
   accessKeyId: string; secretAccessKey: string; publicBaseUrl: string;
   quality: Quality; codec: CodecChoice; videoBitsPerSecond: number; }
+export interface RecordingPrefs { quality: Quality; codec: CodecChoice;
+  videoBitsPerSecond: number; }                           // §15.5, gateway mode
 export interface LibraryEntry { id: string; title: string; createdAt: string;
   durationMs: number; link: string; }
 ```
@@ -332,6 +338,8 @@ export function decryptChunkRange(index: number, chunkCount: number, meta: Video
 ```ts
 export function loadSettings(): Settings | null;          // null if unconfigured/invalid
 export function saveSettings(s: Settings): void;
+export function loadRecordingPrefs(): RecordingPrefs;     // never null — defaults fill the gaps
+export function saveRecordingPrefs(p: RecordingPrefs): boolean;  // false = storage refused, not fatal
 export function loadLibrary(): LibraryEntry[];
 export function addToLibrary(e: LibraryEntry): void;
 export function removeFromLibrary(id: string): void;
@@ -366,6 +374,11 @@ tokens and base styles in `src/app.css`.
   bitrate tables, and the codec/engine selection matrix — every CodecChoice x
   capability combination incl. hardware-rejected H.264 — given injected
   capability flags) in `tests/encoder.test.ts`.
+- `tests/settings.test.ts` (vitest, against a stand-in `localStorage`): the
+  `videoshare.recording` key (§15.5) — defaults from an empty, unparseable or
+  non-object value, per-field fallback for an invalid quality/codec/bitrate,
+  save/load round-trip, no `preferAv1` migration, and a blocked or refusing
+  store reported rather than thrown.
 - `tests/crypto.test.ts` (vitest, Node WebCrypto): key export/import round-trip;
   block round-trip; tampered byte → throws; wrong AAD (reordered chunk index) →
   throws; chunked encrypt/decrypt round-trip across ≥3 chunks incl. short
@@ -485,10 +498,20 @@ token itself must never be logged.
 
 - `public/config.js` gains optional `gatewayUrl` (absolute, or relative like
   `"/api"` for same-origin deployments). Present → **gateway mode**: the
-  settings panel is not rendered; client fetches `{gatewayUrl}/config`;
-  recording requires Google sign-in (Google Identity Services script, ID token
-  kept in memory only — never localStorage). Absent → **legacy mode**, §9
-  unchanged.
+  **storage** settings panel is not rendered (credentials never live in this
+  browser); client fetches `{gatewayUrl}/config`; recording requires Google
+  sign-in (Google Identity Services script, ID token kept in memory only —
+  never localStorage). Absent → **legacy mode**, §9 unchanged.
+- What gateway mode does keep is the encoder half of §9, in a **Recording
+  options** panel of its own: `quality`, `codec` and `videoBitsPerSecond` with
+  the same values, defaults and normalization, persisted at
+  `videoshare.recording` (a key newer than `preferAv1`, so nothing to migrate).
+  It appears once `/config` answers, before and independently of sign-in — which
+  codec this machine can encode is the operator's business, not the gateway's —
+  and saves on change, with no Save button. A browser that refuses localStorage
+  keeps the choice in memory for the session and says so; it never blocks a
+  recording. Legacy mode leaves these three fields where they are, inside the
+  storage settings form.
 - `upload.ts` grows a `Signer` seam: `LocalSigner` (aws4fetch with settings
   creds — legacy mode, current behavior) and `GatewaySigner` (calls
   `/api/sign`; batches part URLs ahead of need, e.g. 8 at a time, so signing

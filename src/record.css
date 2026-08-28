@@ -132,6 +132,12 @@
   gap: var(--space-3);
 }
 
+/* The recording panel saves on change, so its confirmation is a line of its own
+   rather than a row beside a button — and nothing at all until there is one. */
+#recording-status:empty {
+  display: none;
+}
+
 /* Recorder ------------------------------------------------------------------ */
 
 .stage {

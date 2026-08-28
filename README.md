@@ -150,8 +150,10 @@ and answers with **presigned URLs**. The browser then uploads to those URLs
 directly. The gateway signs; it never carries a byte of video, by design and by
 test, so it stays cheap and small no matter how much you record.
 
-Turning it on is one line in `public/config.js`. The recorder drops its settings
-panel and asks you to sign in instead; everything else — browser-side
+Turning it on is one line in `public/config.js`. The recorder drops its storage
+settings panel and asks you to sign in instead, keeping a small **Recording
+options** panel for the quality, codec and fallback-bitrate choices — those are
+yours, not the bucket's. Everything else — browser-side
 encryption, the key in the fragment, the anonymous player — is untouched, and
 existing share links keep working. It runs as a Cloudflare Worker, a Lambda
 function URL, or a Node process next to your bucket.
@@ -321,8 +323,8 @@ npm run dev        # vite dev server
 npm run build      # tsc --noEmit && vite build  ->  dist/
 npm run preview    # serve the built dist/
 npm test           # unit tests (crypto format, offset math, base64url, codec strings and
-                   #             the codec-selection matrix, and the gateway's token
-                   #             verification and validation)
+                   #             the codec-selection matrix, stored-settings normalization,
+                   #             and the gateway's token verification and validation)
 ```
 
 The end-to-end tests drive the real streaming multipart upload against the
