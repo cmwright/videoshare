@@ -119,8 +119,8 @@ function settingsFor(creds: Credentials): Settings {
     secretAccessKey: creds.secretAccessKey,
     publicBaseUrl: PUBLIC_BASE_URL,
     quality: "standard",
-    preferAv1: false,
-    videoBitsPerSecond: 1_200_000,
+    codec: "auto",
+    videoBitsPerSecond: 2_500_000,
   };
 }
 

@@ -4,21 +4,36 @@
  * Node has no WebCodecs, so the engines themselves are exercised by hand in a
  * browser. What is testable here is the arithmetic and the decisions made
  * *before* any encoder object exists: which codec string describes the frames
- * we are about to feed it, what quantizer a quality setting means, and which
- * engine to build at all. That only works if `encoder.ts` keeps those decisions
- * in exported pure functions instead of inlining them in the engine classes.
+ * we are about to feed it, what quantizer (or bitrate) a quality setting means,
+ * and — since §6 made the codec a user setting — which codec, container, audio
+ * codec and engine a given browser plus a given `Settings.codec` add up to. That
+ * only works if `encoder.ts` keeps those decisions in exported pure functions
+ * instead of inlining them in the engine classes.
  *
  * The surface these tests expect — all pure, none of it touching a global:
  *
  * ```ts
+ * export type CodecChoice = "auto" | "h264" | "vp9" | "av1";  // §9 Settings.codec
+ * export type VideoCodec = "h264" | "vp9" | "av1";            // what an engine encodes
+ * export type Container = "mp4" | "webm";
+ * export type AudioCodec = "aac" | "opus";
  * export type EngineKind = "webcodecs" | "mediarecorder";
- * export type VideoCodec = "vp9" | "av1";
+ *
  * export interface EngineCapabilities {
  *   videoEncoder: boolean;     // typeof VideoEncoder !== "undefined"
  *   audioEncoder: boolean;     // typeof AudioEncoder !== "undefined"
  *   trackProcessor: boolean;   // typeof MediaStreamTrackProcessor !== "undefined"
  *   mediaRecorder: boolean;    // typeof MediaRecorder !== "undefined"
  * }
+ * // What isConfigSupported() answered, as plain flags. `h264Hardware` is
+ * // H.264 accepted with hardwareAcceleration: "prefer-hardware"; `h264` is
+ * // H.264 accepted at all (Chrome's bundled software encoder counts).
+ * // `h264Hardware` implies `h264`.
+ * export interface CodecSupport {
+ *   h264Hardware: boolean; h264: boolean; vp9: boolean; av1: boolean;
+ *   aac: boolean;          // AudioEncoder can produce AAC-LC (mp4a.40.2)
+ * }
+ *
  * export const OPUS_BITRATE: number;            // 48_000, WebCodecs engine (§6)
  * export const FALLBACK_AUDIO_BITRATE: number;  // 64_000, MediaRecorder engine (§6)
  * export const KEYFRAME_INTERVAL_US: number;    // 8_000_000 — a keyframe every 8 s (§6)
@@ -33,14 +48,59 @@
  * export const MAX_SILENCE_CATCHUP_US: number;  // widest jump that clock may take
  * export function silenceCatchUpUs(silenceUs: number, targetUs: number): number;
  * export const FALLBACK_MIME_TYPES: readonly string[];
+ *
+ * // Rate control. Quantizer mode is the primary path for every codec; the
+ * // bitrate table is the §6 fallback for a (hardware) H.264 encoder that
+ * // refuses bitrateMode: "quantizer".
  * export const QUANTIZERS: Record<VideoCodec, Record<Quality, number>>;
  * export function quantizerFor(codec: VideoCodec, quality: Quality): number;
- * export function selectEngineKind(caps: EngineCapabilities): EngineKind | null;
- * export function selectVideoCodec(preferAv1: boolean, av1Supported: boolean): VideoCodec;
+ * export const BITRATE_REFERENCE_PIXELS: number;   // 1920 * 1080 — where BITRATES is quoted
+ * export const BITRATES: Record<Quality, number>;  // bits/s at that frame size
+ * // Linear in pixel count, with a floor so a small shared window still gets
+ * // enough bits for legible text. No ceiling below 4K/`sharper`.
+ * export function bitrateFor(quality: Quality, width: number, height: number): number;
+ *
+ * // Codec strings. H.264 is High profile with no constraint flags —
+ * // `avc1.6400` + level_idc as two uppercase hex digits (§6).
+ * export function avcCodecString(width: number, height: number, frameRate?: number): string;
+ * export function vp9CodecString(width: number, height: number, frameRate?: number): string;
+ * export function av1CodecString(width: number, height: number, frameRate?: number): string;
  * export function videoCodecString(codec: VideoCodec, width: number, height: number,
- *   frameRate: number): string;
- * export function containerMimeType(videoCodec: string): string;
+ *   frameRate?: number): string;
+ *
+ * export const AUDIO_CODEC_STRINGS: Record<AudioCodec, string>;  // aac → "mp4a.40.2"
+ * export function containerFor(codec: VideoCodec): Container;    // h264 → mp4, else webm
+ * export function containerMimeType(container: Container, videoCodecString: string,
+ *   audioCodec: AudioCodec | null): string;
+ *
+ * export function selectEngineKind(caps: EngineCapabilities): EngineKind | null;
+ * export function selectVideoCodec(choice: CodecChoice, support: CodecSupport): VideoCodec | null;
+ * export function selectAudioCodec(container: Container, aacSupported: boolean): AudioCodec;
  * export function selectFallbackMimeType(isSupported: (type: string) => boolean): string | null;
+ *
+ * // The whole decision in one place: what will actually be recorded.
+ * export interface EncodingRequest {
+ *   codec: CodecChoice; caps: EngineCapabilities; support: CodecSupport;
+ *   width: number; height: number; frameRate: number; hasAudio: boolean;
+ *   fallbackMimeType: string | null;   // selectFallbackMimeType(), injected
+ * }
+ * export interface EncodingPlan {
+ *   engine: EngineKind;
+ *   videoCodec: VideoCodec | null;   // null ⇒ the browser's recorder picked
+ *   container: Container | null;
+ *   audioCodec: AudioCodec | null;   // null ⇒ no audio, or the browser picked
+ *   mimeType: string;                // exactly what meta.mimeType will carry (§5)
+ *   substituted: boolean;            // the request could not be honoured (§6 UI note)
+ * }
+ * export function selectEncoding(request: EncodingRequest): EncodingPlan | null;
+ *
+ * // What a configured video encoder falls back to when it rejects the config
+ * // isConfigSupported() approved (§6 rate-control and hardware rungs).
+ * export interface VideoSetup {
+ *   codec: VideoCodec; hardware: boolean;
+ *   rateControl: "quantizer" | "variable"; contentHint: boolean;
+ * }
+ * export function videoFallbackSetups(setup: VideoSetup): VideoSetup[];
  * ```
  *
  * `createEngine()` itself is not covered: it reads globals and constructs an
@@ -49,7 +109,17 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  AUDIO_CODEC_STRINGS,
+  avcCodecString,
+  BITRATE_REFERENCE_PIXELS,
+  BITRATES,
+  bitrateFor,
+  type CodecChoice,
+  type CodecSupport,
+  containerFor,
   containerMimeType,
+  type EncodingPlan,
+  type EngineCapabilities,
   FALLBACK_AUDIO_BITRATE,
   FALLBACK_MIME_TYPES,
   HEARTBEAT_IDLE_MS,
@@ -63,18 +133,56 @@ import {
   OPUS_BITRATE,
   QUANTIZERS,
   quantizerFor,
+  selectAudioCodec,
+  selectEncoding,
   selectEngineKind,
   selectFallbackMimeType,
   selectVideoCodec,
   SILENCE_FRAME_US,
   SILENCE_LEAD_US,
   silenceCatchUpUs,
+  type VideoCodec,
   videoCodecString,
+  videoFallbackSetups,
+  type VideoSetup,
 } from "../src/encoder";
 import { DEFAULT_VIDEO_BITS_PER_SECOND, QUALITIES } from "../src/settings";
 import type { Quality } from "../src/types";
 
-const CODECS = ["vp9", "av1"] as const;
+/** Every codec the WebCodecs engine can produce (SPEC §6). */
+const CODECS = ["h264", "vp9", "av1"] as const satisfies readonly VideoCodec[];
+
+/** Every value `Settings.codec` may hold (SPEC §9). */
+const CHOICES = ["auto", "h264", "vp9", "av1"] as const satisfies readonly CodecChoice[];
+
+/**
+ * H.264 level limits (ITU-T H.264 Annex A, Table A-1), as
+ * `[level_idc in hex — the two digits the codec string carries, MaxMBPS
+ *   (macroblocks per second), MaxFS (frame size in macroblocks)]`, ascending.
+ * level_idc is the level number × 10, so level 4.0 is 40 = `28` and level 5.1
+ * is 51 = `33`.
+ */
+const H264_LEVELS = [
+  ["0A", 1_485, 99], //          level 1
+  ["0B", 3_000, 396], //         level 1.1
+  ["0C", 6_000, 396], //         level 1.2
+  ["0D", 11_880, 396], //        level 1.3
+  ["14", 11_880, 396], //        level 2
+  ["15", 19_800, 792], //        level 2.1
+  ["16", 20_250, 1_620], //      level 2.2
+  ["1E", 40_500, 1_620], //      level 3
+  ["1F", 108_000, 3_600], //     level 3.1
+  ["20", 216_000, 5_120], //     level 3.2
+  ["28", 245_760, 8_192], //     level 4
+  ["29", 245_760, 8_192], //     level 4.1
+  ["2A", 522_240, 8_704], //     level 4.2
+  ["32", 589_824, 22_080], //    level 5
+  ["33", 983_040, 36_864], //    level 5.1
+  ["34", 2_073_600, 36_864], //  level 5.2
+  ["3C", 4_177_920, 139_264], // level 6
+  ["3D", 8_355_840, 139_264], // level 6.1
+  ["3E", 16_711_680, 139_264], // level 6.2
+] as const satisfies readonly (readonly [string, number, number])[];
 
 /**
  * VP9 level limits, from https://www.webmproject.org/vp9/levels/.
@@ -115,6 +223,35 @@ const AV1_LEVELS = [
   ["13", 534_773_760, 8_912_896, 8_192, 4_352],
 ] as const satisfies readonly (readonly [string, number, number, number, number])[];
 
+/** Each codec's level ladder, keyed the way its codec string spells the level. */
+const LEVEL_TABLES: Record<VideoCodec, readonly (readonly [string, ...number[]])[]> = {
+  h264: H264_LEVELS,
+  vp9: VP9_LEVELS,
+  av1: AV1_LEVELS,
+};
+
+/** Macroblocks are 16×16, and a partial one still has to be coded. */
+function macroblocks(pixels: number): number {
+  return Math.ceil(pixels / 16);
+}
+
+/** The smallest H.264 level_idc whose limits cover this frame, per Annex A. */
+function smallestH264Level(width: number, height: number, frameRate: number): string {
+  const wide = macroblocks(width);
+  const tall = macroblocks(height);
+  const size = wide * tall;
+  const level = H264_LEVELS.find(
+    ([, maxMbps, maxFs]) =>
+      size <= maxFs &&
+      size * frameRate <= maxMbps &&
+      // Annex A.3.1: neither dimension may exceed sqrt(MaxFS × 8) macroblocks,
+      // which is what stops a level covering an absurdly wide 1-MB-tall frame.
+      Math.max(wide, tall) <= Math.sqrt(maxFs * 8),
+  );
+  if (!level) throw new Error(`no H.264 level covers ${width}x${height}@${frameRate}`);
+  return level[0];
+}
+
 /** The smallest VP9 level whose limits cover this frame, per the table above. */
 function smallestVp9Level(width: number, height: number, frameRate: number): string {
   const pixels = width * height;
@@ -139,37 +276,116 @@ function smallestAv1Level(width: number, height: number, frameRate: number): str
   return level[0];
 }
 
+function smallestLevel(codec: VideoCodec, width: number, height: number, frameRate: number): string {
+  if (codec === "h264") return smallestH264Level(width, height, frameRate);
+  if (codec === "vp9") return smallestVp9Level(width, height, frameRate);
+  return smallestAv1Level(width, height, frameRate);
+}
+
 /**
- * Sizes a screen capture actually produces. The last one is over the SPEC §6
- * 1080p cap: the cap is a constraint, not a guarantee, and a browser that
- * ignores it must still get a truthful codec string.
+ * `avc1.6400XX` → `XX`, uppercased.
+ *
+ * RFC 6381 spells the three bytes as hex digits without saying which case, and
+ * both spellings are in the wild (`avc1.42E01E`, `avc1.42e01e`), so everything
+ * that only cares *which level was declared* goes through here. Exactly one
+ * test below pins the case VideoShare writes.
+ */
+function avcLevelHex(codecString: string): string {
+  const match = /^avc1\.6400([0-9a-fA-F]{2})$/.exec(codecString);
+  if (!match) throw new Error(`not an avc1 High-profile codec string: ${codecString}`);
+  return (match[1] as string).toUpperCase();
+}
+
+/** The level field of a codec string, spelled the way its level table keys it. */
+function levelOf(codec: VideoCodec, codecString: string): string {
+  if (codec === "h264") return avcLevelHex(codecString);
+  const level = codecString.split(".")[2] as string;
+  // `av01.0.08M.08` carries the tier letter in the same field; VP9 does not.
+  return codec === "vp9" ? level : level.slice(0, -1);
+}
+
+/**
+ * Sizes a screen capture actually produces. §6 caps capture at 4K and drops to
+ * 20 fps above QHD, so the ladder runs all the way up — a 4K capture is the
+ * whole reason the H.264 path exists.
  */
 const CAPTURE_SIZES = [
   { label: "a small shared window", width: 640, height: 360, frameRate: 30 },
   { label: "720p", width: 1280, height: 720, frameRate: 30 },
   { label: "a 1440x900 laptop display", width: 1440, height: 900, frameRate: 30 },
-  { label: "the 1080p capture cap", width: 1920, height: 1080, frameRate: 30 },
-  { label: "1440p, over the cap", width: 2560, height: 1440, frameRate: 30 },
+  { label: "1080p", width: 1920, height: 1080, frameRate: 30 },
+  { label: "1440p (QHD)", width: 2560, height: 1440, frameRate: 30 },
+  { label: "4K, the §6 capture cap", width: 3840, height: 2160, frameRate: 30 },
 ] as const;
 
-/** Grammar from the ISO-BMFF codecs-parameter bindings for VP9 and AV1. */
+/** Grammar from the ISO-BMFF codecs-parameter bindings (RFC 6381 §3.3/§3.4). */
+const AVC_CODEC_STRING = /^avc1\.[0-9A-Fa-f]{6}$/;
 const VP9_CODEC_STRING = /^vp09\.\d{2}\.\d{2}\.\d{2}$/;
 const AV1_CODEC_STRING = /^av01\.[0-2]\.\d{2}[MH]\.\d{2}$/;
 
-/** WebCodecs quantizer ranges — they differ per codec, which is the trap. */
-const QUANTIZER_MAX = { vp9: 63, av1: 255 } as const;
+/**
+ * WebCodecs quantizer ranges — they differ per codec, which is the trap. VP9's
+ * registration puts the threshold at 0–63, AV1's uses a 0–255 qindex, and AVC's
+ * is H.264's own 0–51 QP.
+ */
+const QUANTIZER_MAX = { h264: 51, vp9: 63, av1: 255 } as const;
 
 describe("video codec strings", () => {
+  it("builds H.264 High-profile strings for real capture sizes", () => {
+    const built = CAPTURE_SIZES.map(({ width, height, frameRate }) =>
+      avcLevelHex(avcCodecString(width, height, frameRate)),
+    );
+
+    // 4K30 is level 5.1 = `avc1.640033`, the string named in SPEC §6.
+    expect(built).toEqual(["1E", "1F", "28", "28", "32", "33"]);
+  });
+
+  it("names the levels SPEC §6 promises at 1080p, 1440p and 4K", () => {
+    // These three carry no hex letters, so they pin the whole string without
+    // depending on which case the level digits are written in.
+    expect(avcCodecString(1920, 1080, 30)).toBe("avc1.640028"); // level 4.0
+    expect(avcCodecString(2560, 1440, 30)).toBe("avc1.640032"); // level 5.0
+    expect(avcCodecString(3840, 2160, 30)).toBe("avc1.640033"); // level 5.1
+  });
+
+  it("keeps the 4K level honest at the 20 fps §6 applies above QHD", () => {
+    // Above QHD the capture is constrained to 20 fps, which lowers MaxMBPS but
+    // not MaxFS — 4K still needs level 5.1, because 32400 macroblocks per frame
+    // do not fit in level 5.0's 22080 at any frame rate.
+    expect(avcCodecString(3840, 2160, 20)).toBe("avc1.640033");
+    expect(avcCodecString(2560, 1440, 20)).toBe("avc1.640032");
+  });
+
+  it("spells the level in uppercase hex", () => {
+    // RFC 6381 does not say, and MediaSource accepts either; VideoShare writes
+    // the spelling the platform strings use (`avc1.42E01E`) so meta.mimeType
+    // reads the same everywhere. The only place the case is pinned.
+    expect(avcCodecString(1280, 720, 30)).toBe("avc1.64001F");
+  });
+
+  it("declares H.264 High profile with no constraint flags", () => {
+    // `avc1.PPCCLL`: PP = profile_idc, CC = constraint flags, LL = level_idc.
+    // High profile is 0x64, and setting a constraint flag we do not honour
+    // would be a lie a strict decoder is entitled to act on.
+    for (const { label, width, height, frameRate } of CAPTURE_SIZES) {
+      const built = avcCodecString(width, height, frameRate);
+      expect(built, `avc at ${label}`).toMatch(AVC_CODEC_STRING);
+      expect(built.slice(0, 9).toLowerCase(), `profile+constraints at ${label}`).toBe("avc1.6400");
+    }
+  });
+
   it("builds VP9 profile-0 8-bit strings for real capture sizes", () => {
     const built = CAPTURE_SIZES.map(({ width, height, frameRate }) =>
       videoCodecString("vp9", width, height, frameRate),
     );
 
+    // 4K30 is `vp09.00.50.08`, the string named in SPEC §5.
     expect(built).toEqual([
       "vp09.00.21.08",
       "vp09.00.31.08",
       "vp09.00.40.08",
       "vp09.00.40.08",
+      "vp09.00.50.08",
       "vp09.00.50.08",
     ]);
   });
@@ -179,18 +395,22 @@ describe("video codec strings", () => {
       videoCodecString("av1", width, height, frameRate),
     );
 
-    // 1080p30 is `av01.0.08M.08` — level 4.0, the string named in SPEC §6.
+    // 1080p30 is `av01.0.08M.08` — level 4.0.
     expect(built).toEqual([
       "av01.0.01M.08",
       "av01.0.05M.08",
       "av01.0.08M.08",
       "av01.0.08M.08",
       "av01.0.12M.08",
+      "av01.0.12M.08",
     ]);
   });
 
-  it("matches the codecs-parameter grammar for both codecs", () => {
+  it("matches the codecs-parameter grammar for every codec", () => {
     for (const { label, width, height, frameRate } of CAPTURE_SIZES) {
+      expect(videoCodecString("h264", width, height, frameRate), `h264 at ${label}`).toMatch(
+        AVC_CODEC_STRING,
+      );
       expect(videoCodecString("vp9", width, height, frameRate), `vp9 at ${label}`).toMatch(
         VP9_CODEC_STRING,
       );
@@ -200,7 +420,17 @@ describe("video codec strings", () => {
     }
   });
 
-  it("declares 8-bit 4:2:0 — profile 0 for both codecs", () => {
+  it("routes videoCodecString to the same string as each codec's own builder", () => {
+    // The engine reaches for `videoCodecString(codec, …)`; the per-codec
+    // builders are what the tables above are written against.
+    for (const { width, height, frameRate } of CAPTURE_SIZES) {
+      expect(videoCodecString("h264", width, height, frameRate)).toBe(
+        avcCodecString(width, height, frameRate),
+      );
+    }
+  });
+
+  it("declares 8-bit 4:2:0 — profile 0 for VP9 and AV1", () => {
     // We only ever encode 8-bit screen content, and VP9 profile 0 / AV1 Main
     // are the profiles every WebM decoder in the support matrix implements.
     for (const { width, height, frameRate } of CAPTURE_SIZES) {
@@ -217,18 +447,20 @@ describe("video codec strings", () => {
     // Understating the level lies to the decoder; overstating it can make a
     // conservative player refuse a stream it could have played.
     for (const { label, width, height, frameRate } of CAPTURE_SIZES) {
-      expect(videoCodecString("vp9", width, height, frameRate), `vp9 at ${label}`).toBe(
-        `vp09.00.${smallestVp9Level(width, height, frameRate)}.08`,
-      );
-      expect(videoCodecString("av1", width, height, frameRate), `av1 at ${label}`).toBe(
-        `av01.0.${smallestAv1Level(width, height, frameRate)}M.08`,
-      );
+      for (const codec of CODECS) {
+        expect(
+          levelOf(codec, videoCodecString(codec, width, height, frameRate)),
+          `${codec} at ${label}`,
+        ).toBe(smallestLevel(codec, width, height, frameRate));
+      }
     }
   });
 
   it("keeps the level sufficient across a sweep of odd window sizes", () => {
     // Shared windows are whatever the user dragged them to, so the level has to
     // come out of the numbers rather than a lookup of the usual suspects.
+    // Sufficiency, not minimality: rounding up to a level a table happens to
+    // skip is legal, understating one is not.
     const sizes = [
       [320, 180],
       [854, 480],
@@ -239,21 +471,20 @@ describe("video codec strings", () => {
       [1920, 1200],
       [2048, 1080],
       [3440, 1440],
+      [3024, 1964],
     ] as const;
 
     for (const [width, height] of sizes) {
-      const vp9Level = videoCodecString("vp9", width, height, 30).split(".")[2];
-      // `av01.0.08M.08` → the level is the third field with the tier letter dropped.
-      const av1Level = videoCodecString("av1", width, height, 30).split(".")[2]?.slice(0, -1);
+      for (const codec of CODECS) {
+        const table = LEVEL_TABLES[codec];
+        const declared = levelOf(codec, videoCodecString(codec, width, height, 30));
+        const needed = smallestLevel(codec, width, height, 30);
 
-      expect(VP9_LEVELS.findIndex(([code]) => code === vp9Level), `${width}x${height} vp9`)
-        .toBeGreaterThanOrEqual(
-          VP9_LEVELS.findIndex(([code]) => code === smallestVp9Level(width, height, 30)),
-        );
-      expect(AV1_LEVELS.findIndex(([code]) => code === av1Level), `${width}x${height} av1`)
-        .toBeGreaterThanOrEqual(
-          AV1_LEVELS.findIndex(([code]) => code === smallestAv1Level(width, height, 30)),
-        );
+        expect(
+          table.findIndex(([code]) => code === declared),
+          `${width}x${height} ${codec} declares a known level`,
+        ).toBeGreaterThanOrEqual(table.findIndex(([code]) => code === needed));
+      }
     }
   });
 
@@ -267,13 +498,10 @@ describe("video codec strings", () => {
     ] as const;
 
     for (const codec of CODECS) {
-      const levels = ladder.map(([width, height]) => {
-        const parts = videoCodecString(codec, width, height, 30).split(".");
-        return codec === "vp9" ? parts[2] : parts[2]?.slice(0, -1);
-      });
-      const table: readonly (readonly [string, ...number[]])[] =
-        codec === "vp9" ? VP9_LEVELS : AV1_LEVELS;
-      const indices = levels.map((code) => table.findIndex(([entry]) => entry === code));
+      const table = LEVEL_TABLES[codec];
+      const indices = ladder.map(([width, height]) =>
+        table.findIndex(([code]) => code === levelOf(codec, videoCodecString(codec, width, height, 30))),
+      );
 
       expect(indices, `${codec} levels are all known`).not.toContain(-1);
       for (let i = 1; i < indices.length; i++) {
@@ -286,7 +514,9 @@ describe("video codec strings", () => {
 
   it("raises the level for a higher frame rate at the same size", () => {
     // VideoShare caps capture at 30 fps, so this is the helper being correct
-    // rather than a path we take: 1080p60 needs level 4.1, not 4.0.
+    // rather than a path we take: 1080p60 needs H.264 level 4.2 and VP9 4.1.
+    expect(avcCodecString(1920, 1080, 30)).toBe("avc1.640028");
+    expect(avcLevelHex(avcCodecString(1920, 1080, 60))).toBe("2A");
     expect(videoCodecString("vp9", 1920, 1080, 30)).toBe("vp09.00.40.08");
     expect(videoCodecString("vp9", 1920, 1080, 60)).toBe("vp09.00.41.08");
     expect(videoCodecString("av1", 1920, 1080, 30)).toBe("av01.0.08M.08");
@@ -294,27 +524,88 @@ describe("video codec strings", () => {
   });
 });
 
-describe("containerMimeType", () => {
-  it("wraps a video codec string in the WebM type the player will see", () => {
-    // SPEC §5: meta.mimeType is exactly this string, and SPEC §8 feeds it
-    // straight to MediaSource.isTypeSupported.
-    expect(containerMimeType(videoCodecString("vp9", 1920, 1080, 30))).toBe(
-      "video/webm;codecs=vp09.00.40.08,opus",
+describe("containers and mime types", () => {
+  it("puts H.264 in MP4 and everything else in WebM", () => {
+    // SPEC §6: H.264 is muxed as fragmented MP4 (mp4-muxer); VP9 and AV1 keep
+    // the WebM path (webm-muxer). WebM cannot carry H.264 at all.
+    expect(containerFor("h264")).toBe("mp4");
+    expect(containerFor("vp9")).toBe("webm");
+    expect(containerFor("av1")).toBe("webm");
+  });
+
+  it("names AAC by its ISO-BMFF object type, and Opus by its own name", () => {
+    expect(AUDIO_CODEC_STRINGS.aac).toBe("mp4a.40.2");
+    expect(AUDIO_CODEC_STRINGS.opus).toBe("opus");
+  });
+
+  it("builds the exact strings SPEC §5 and §6 name", () => {
+    // meta.mimeType is this string verbatim, and SPEC §8 feeds it straight to
+    // MediaSource.isTypeSupported.
+    expect(containerMimeType("mp4", avcCodecString(3840, 2160, 30), "aac")).toBe(
+      "video/mp4;codecs=avc1.640033,mp4a.40.2",
     );
-    expect(containerMimeType(videoCodecString("av1", 1920, 1080, 30))).toBe(
+    expect(containerMimeType("webm", videoCodecString("vp9", 3840, 2160, 30), "opus")).toBe(
+      "video/webm;codecs=vp09.00.50.08,opus",
+    );
+    expect(containerMimeType("webm", videoCodecString("av1", 1920, 1080, 30), "opus")).toBe(
       "video/webm;codecs=av01.0.08M.08,opus",
     );
   });
 
-  it("always names WebM and Opus, with no quoting MediaSource has to unpick", () => {
-    for (const codec of CODECS) {
-      const mimeType = containerMimeType(videoCodecString(codec, 1280, 720, 30));
+  it("carries Opus in MP4 where AAC is unavailable", () => {
+    // SPEC §6's fallback: Chrome on desktop Linux has no AAC encoder, and an
+    // MP4 with an Opus track still plays through MSE in Chrome and Firefox.
+    expect(containerMimeType("mp4", avcCodecString(1920, 1080, 30), "opus")).toBe(
+      "video/mp4;codecs=avc1.640028,opus",
+    );
+  });
 
-      expect(mimeType.startsWith("video/webm;codecs=")).toBe(true);
-      expect(mimeType.endsWith(",opus")).toBe(true);
-      expect(mimeType).not.toContain('"');
-      expect(mimeType).not.toContain(" ");
+  it("omits the audio codec entirely when there is no audio track", () => {
+    // A display capture the user shared without audio and with the mic off:
+    // claiming a track that is not in the file makes MSE reject the buffer.
+    expect(containerMimeType("mp4", avcCodecString(1920, 1080, 30), null)).toBe(
+      "video/mp4;codecs=avc1.640028",
+    );
+    expect(containerMimeType("webm", videoCodecString("vp9", 1920, 1080, 30), null)).toBe(
+      "video/webm;codecs=vp09.00.40.08",
+    );
+  });
+
+  it("never emits quoting or whitespace MediaSource has to unpick", () => {
+    for (const codec of CODECS) {
+      const container = containerFor(codec);
+      for (const audio of ["aac", "opus", null] as const) {
+        // AAC only ever rides in MP4; skip the combination that cannot occur.
+        if (audio === "aac" && container !== "mp4") continue;
+        const mimeType = containerMimeType(
+          container,
+          videoCodecString(codec, 1280, 720, 30),
+          audio,
+        );
+
+        expect(mimeType.startsWith(`video/${container};codecs=`), mimeType).toBe(true);
+        expect(mimeType).not.toContain('"');
+        expect(mimeType).not.toContain(" ");
+      }
     }
+  });
+});
+
+describe("audio codec selection", () => {
+  it("uses AAC in MP4 when the browser can encode it", () => {
+    expect(selectAudioCodec("mp4", true)).toBe("aac");
+  });
+
+  it("falls back to Opus-in-MP4 where there is no AAC encoder", () => {
+    // AAC encoding is missing in Firefox everywhere and in every browser on
+    // desktop Linux, so this is a real machine, not a hypothetical one.
+    expect(selectAudioCodec("mp4", false)).toBe("opus");
+  });
+
+  it("always uses Opus in WebM, AAC encoder or not", () => {
+    // WebM's codec list does not include AAC; Matroska's does, WebM's does not.
+    expect(selectAudioCodec("webm", true)).toBe("opus");
+    expect(selectAudioCodec("webm", false)).toBe("opus");
   });
 });
 
@@ -328,13 +619,14 @@ describe("quality → quantizer table", () => {
 
   it("stays inside each codec's WebCodecs quantizer range", () => {
     // The ranges are not the same: the WebCodecs registrations put VP9 at
-    // 0-63 (quantizer threshold) and AV1 at 0-255 (quantizer index).
+    // 0-63 (quantizer threshold), AV1 at 0-255 (quantizer index) and AVC at
+    // 0-51 (H.264 QP).
     for (const codec of CODECS) {
       for (const quality of QUALITIES) {
         const q = QUANTIZERS[codec][quality];
         expect(Number.isInteger(q), `${codec}/${quality} is an integer`).toBe(true);
         expect(q, `${codec}/${quality} above the floor`).toBeGreaterThan(0);
-        expect(q, `${codec}/${quality} under ${QUANTIZER_MAX[codec]}`).toBeLessThan(
+        expect(q, `${codec}/${quality} within ${QUANTIZER_MAX[codec]}`).toBeLessThanOrEqual(
           QUANTIZER_MAX[codec],
         );
       }
@@ -347,8 +639,28 @@ describe("quality → quantizer table", () => {
     expect(QUANTIZERS.av1.smaller).toBeGreaterThan(QUANTIZER_MAX.vp9);
   });
 
+  it("keeps H.264 clear of its own scale's degenerate ends", () => {
+    // Reusing a VP9 number here is the mirror of the AV1 trap: QP 63 does not
+    // exist in H.264 and QP 51 is the blocky worst case, while QP 0 is lossless
+    // and would defeat the compression this whole engine is for.
+    expect(QUANTIZERS.h264.smaller).toBeLessThan(QUANTIZER_MAX.h264);
+    expect(QUANTIZERS.h264.sharper).toBeGreaterThan(0);
+  });
+
+  it("asks all three codecs for comparable quality at the same setting", () => {
+    // Each codec's quantizer means something different, so the only way to
+    // compare them is as a fraction of the codec's own range. Switching codec
+    // must change the file size and the CPU cost, not what the recording looks
+    // like — a user who flips to H.264 for smooth 4K should not also silently
+    // get a different picture.
+    for (const quality of QUALITIES) {
+      const normalized = CODECS.map((codec) => quantizerFor(codec, quality) / QUANTIZER_MAX[codec]);
+      expect(Math.max(...normalized) - Math.min(...normalized), quality).toBeLessThan(0.15);
+    }
+  });
+
   it("lowers the quantizer as the quality setting rises", () => {
-    // Lower quantizer = finer quality = bigger file, for both codecs.
+    // Lower quantizer = finer quality = bigger file, for every codec.
     for (const codec of CODECS) {
       const { smaller, standard, sharper } = QUANTIZERS[codec];
       expect(smaller, `${codec}: smaller is coarser than standard`).toBeGreaterThan(standard);
@@ -375,6 +687,88 @@ describe("quality → quantizer table", () => {
       const values = QUALITIES.map((q) => quantizerFor(codec, q));
       expect(Math.max(...values), codec).toBe(quantizerFor(codec, "smaller"));
       expect(Math.min(...values), codec).toBe(quantizerFor(codec, "sharper"));
+    }
+  });
+});
+
+/**
+ * SPEC §6's other rate-control path: a hardware H.264 encoder that refuses
+ * `bitrateMode: "quantizer"` gets `"variable"` and a bitrate instead. Per-frame
+ * QP is a young WebCodecs feature and platform encoders vary, so this table is
+ * the one that keeps a 4K recording legible when the fast path is unavailable.
+ */
+describe("quality → bitrate table (the H.264 variable-bitrate fallback)", () => {
+  const pixelsOf = ({ width, height }: { width: number; height: number }) => width * height;
+
+  it("covers every quality and nothing else", () => {
+    expect(Object.keys(BITRATES).sort()).toEqual([...QUALITIES].sort());
+  });
+
+  it("is quoted at 1080p, the size the numbers are legible at", () => {
+    expect(BITRATE_REFERENCE_PIXELS).toBe(1920 * 1080);
+    for (const quality of QUALITIES) {
+      expect(bitrateFor(quality, 1920, 1080), quality).toBe(BITRATES[quality]);
+    }
+  });
+
+  it("raises the bitrate as the quality setting rises", () => {
+    // The opposite direction from the quantizer table, and easy to get backwards.
+    expect(BITRATES.smaller).toBeLessThan(BITRATES.standard);
+    expect(BITRATES.standard).toBeLessThan(BITRATES.sharper);
+  });
+
+  it("scales linearly with pixel count above the reference frame", () => {
+    // SPEC §6: "a quality→bitrate table scaled by pixel count". A 4K frame is
+    // four times the pixels of 1080p and needs the bits to match, or the whole
+    // reason to record at 4K is thrown away in the encoder.
+    for (const quality of QUALITIES) {
+      for (const size of [
+        { width: 2560, height: 1440 },
+        { width: 3440, height: 1440 },
+        { width: 3840, height: 2160 },
+      ]) {
+        const expected = Math.round(
+          (BITRATES[quality] * pixelsOf(size)) / BITRATE_REFERENCE_PIXELS,
+        );
+        expect(
+          bitrateFor(quality, size.width, size.height),
+          `${quality} at ${size.width}x${size.height}`,
+        ).toBe(expected);
+      }
+    }
+    expect(bitrateFor("standard", 3840, 2160)).toBe(4 * BITRATES.standard);
+  });
+
+  it("keeps a floor under small windows rather than scaling to nothing", () => {
+    // Linear scaling alone would give a 640x360 shared terminal an eighth of
+    // the 1080p bitrate. Screen text does not cost proportionally fewer bits
+    // than a photo does — the glyphs are the same size in pixels.
+    expect(bitrateFor("standard", 640, 360)).toBeGreaterThanOrEqual(400_000);
+    expect(bitrateFor("smaller", 320, 180)).toBeGreaterThanOrEqual(250_000);
+  });
+
+  it("never falls as the frame grows, at any quality", () => {
+    for (const quality of QUALITIES) {
+      const ladder = [...CAPTURE_SIZES]
+        .sort((a, b) => pixelsOf(a) - pixelsOf(b))
+        .map((size) => bitrateFor(quality, size.width, size.height));
+
+      for (let i = 1; i < ladder.length; i++) {
+        expect(ladder[i], `${quality} step ${i}`).toBeGreaterThanOrEqual(ladder[i - 1] as number);
+      }
+    }
+  });
+
+  it("returns whole bits per second, and nothing absurd at 4K", () => {
+    // `VideoEncoderConfig.bitrate` is an unsigned long long; a fraction is a
+    // TypeError waiting to happen, and a 100 Mbps screen recording is a bug.
+    for (const quality of QUALITIES) {
+      for (const { width, height } of CAPTURE_SIZES) {
+        const bitrate = bitrateFor(quality, width, height);
+        expect(Number.isInteger(bitrate), `${quality} ${width}x${height}`).toBe(true);
+        expect(bitrate, `${quality} ${width}x${height}`).toBeGreaterThan(0);
+        expect(bitrate, `${quality} ${width}x${height}`).toBeLessThan(100_000_000);
+      }
     }
   });
 });
@@ -433,22 +827,364 @@ describe("engine selection", () => {
   });
 });
 
-describe("video codec choice", () => {
-  it("uses AV1 only when it is both asked for and supported", () => {
-    expect(selectVideoCodec(true, true)).toBe("av1");
+/**
+ * `Settings.codec` (SPEC §9) against what a browser can actually encode
+ * (SPEC §6). The rule, stated once:
+ *
+ * - `"auto"` takes hardware H.264 if it is there, else VP9. Software H.264 is
+ *   *not* preferred over VP9 — it is CPU-bound like VP9 and produces bigger
+ *   files, so it wins nothing.
+ * - An explicit choice is tried first, hardware or software, and if it cannot
+ *   be encoded it falls down the `"auto"` chain and then onto whatever is left.
+ */
+describe("codec choice", () => {
+  const ALL: CodecSupport = {
+    h264Hardware: true,
+    h264: true,
+    vp9: true,
+    av1: true,
+    aac: true,
+  };
+  const NONE: CodecSupport = {
+    h264Hardware: false,
+    h264: false,
+    vp9: false,
+    av1: false,
+    aac: false,
+  };
+
+  it("prefers hardware H.264 on auto — the reason §6 changed at all", () => {
+    // Software VP9 drops frames at native Retina resolution; a hardware H.264
+    // encoder does 4K without touching the CPU budget.
+    expect(selectVideoCodec("auto", ALL)).toBe("h264");
   });
 
-  it("falls back to VP9 when AV1 is asked for but cannot be encoded", () => {
-    // preferAv1 is a preference, not a promise: no AV1 encoder means VP9,
-    // silently, rather than a failed recording.
-    expect(selectVideoCodec(true, false)).toBe("vp9");
+  it("stays on VP9 on auto when H.264 would only run in software", () => {
+    // Chrome ships a software H.264 encoder (openh264). Choosing it here would
+    // trade VP9's smaller files for nothing at all: both are CPU-bound.
+    expect(selectVideoCodec("auto", { ...ALL, h264Hardware: false })).toBe("vp9");
   });
 
-  it("stays on VP9 by default even where AV1 would encode", () => {
-    // SPEC §9: preferAv1 defaults to false because Safari viewers without
-    // hardware AV1 decode cannot play the result.
-    expect(selectVideoCodec(false, true)).toBe("vp9");
-    expect(selectVideoCodec(false, false)).toBe("vp9");
+  it("honours an explicit codec even where auto would not have chosen it", () => {
+    expect(selectVideoCodec("h264", ALL)).toBe("h264");
+    expect(selectVideoCodec("vp9", ALL)).toBe("vp9");
+    expect(selectVideoCodec("av1", ALL)).toBe("av1");
+  });
+
+  it("accepts software H.264 when H.264 is what the user asked for", () => {
+    // "prefer-hardware" falling back to no-preference (§6): the user asked for
+    // a file that plays everywhere, and software H.264 still produces one.
+    expect(selectVideoCodec("h264", { ...ALL, h264Hardware: false })).toBe("h264");
+  });
+
+  it("falls down the auto chain when the chosen codec cannot be encoded", () => {
+    // Every one of these is a real browser: no H.264 encoder, no AV1 encoder,
+    // an encoder that answered `supported: false` for the config we need.
+    expect(selectVideoCodec("h264", { ...ALL, h264: false, h264Hardware: false })).toBe("vp9");
+    expect(selectVideoCodec("av1", { ...ALL, av1: false })).toBe("h264");
+    expect(selectVideoCodec("av1", { ...ALL, av1: false, h264Hardware: false })).toBe("vp9");
+    expect(selectVideoCodec("vp9", { ...ALL, vp9: false })).toBe("h264");
+  });
+
+  it("takes the last codec standing rather than giving up early", () => {
+    expect(selectVideoCodec("h264", { ...NONE, av1: true })).toBe("av1");
+    expect(selectVideoCodec("auto", { ...NONE, av1: true })).toBe("av1");
+    expect(selectVideoCodec("vp9", { ...NONE, h264: true })).toBe("h264");
+  });
+
+  it("reports no codec at all when WebCodecs can encode none of them", () => {
+    // Not a failure — the caller drops to the MediaRecorder engine (§6.2).
+    for (const choice of CHOICES) {
+      expect(selectVideoCodec(choice, NONE), choice).toBeNull();
+    }
+  });
+
+  it("treats hardware H.264 as implying H.264", () => {
+    // The two flags come from two isConfigSupported() calls, and a browser that
+    // accepts "prefer-hardware" but not the plain config is not a thing. Belt
+    // and braces so a malformed capability probe cannot lose the codec.
+    expect(selectVideoCodec("auto", { ...NONE, h264Hardware: true })).toBe("h264");
+  });
+});
+
+/**
+ * The whole §6 decision as one table: every `Settings.codec` value against
+ * every capability shape a real browser presents, asserting exactly what
+ * `meta.mimeType` will say (§5) and therefore what the player will feed MSE
+ * (§8). This is the test that has to fail if the fallback chain moves.
+ */
+describe("the encoding selection matrix", () => {
+  const WEBCODECS: EngineCapabilities = {
+    videoEncoder: true,
+    audioEncoder: true,
+    trackProcessor: true,
+    mediaRecorder: true,
+  };
+  /** Firefox: MediaRecorder only, as far as this engine is concerned. */
+  const NO_WEBCODECS: EngineCapabilities = {
+    videoEncoder: false,
+    audioEncoder: false,
+    trackProcessor: false,
+    mediaRecorder: true,
+  };
+
+  const SUPPORT = {
+    /** Chrome on a Mac or a Windows laptop: hardware H.264, AAC, the lot. */
+    hardwareH264: { h264Hardware: true, h264: true, vp9: true, av1: true, aac: true },
+    /** Chrome on desktop Linux: openh264 in software, and no AAC encoder. */
+    softwareH264: { h264Hardware: false, h264: true, vp9: true, av1: true, aac: false },
+    /** A build with no H.264 encoder at all (some Chromium distributions). */
+    noH264: { h264Hardware: false, h264: false, vp9: true, av1: true, aac: true },
+    /** Hardware H.264, no AAC encoder: the Opus-in-MP4 path, and no AV1. */
+    noAac: { h264Hardware: true, h264: true, vp9: true, av1: false, aac: false },
+    /** An older Chrome: VP9 and nothing else. */
+    vp9Only: { h264Hardware: false, h264: false, vp9: true, av1: false, aac: false },
+    /** WebCodecs is present but every config probe said no. */
+    none: { h264Hardware: false, h264: false, vp9: false, av1: false, aac: false },
+  } as const satisfies Record<string, CodecSupport>;
+
+  type Profile = keyof typeof SUPPORT;
+
+  /** What §6.2's candidate list yields on a browser that supports all of it. */
+  const FALLBACK = "video/webm;codecs=vp9,opus";
+
+  const H264_MP4_AAC = "video/mp4;codecs=avc1.640028,mp4a.40.2";
+  const H264_MP4_OPUS = "video/mp4;codecs=avc1.640028,opus";
+  const VP9_WEBM = "video/webm;codecs=vp09.00.40.08,opus";
+  const AV1_WEBM = "video/webm;codecs=av01.0.08M.08,opus";
+
+  /** 1080p30 with audio, so the codec strings above are the expected ones. */
+  const plan = (codec: CodecChoice, profile: Profile, caps = WEBCODECS): EncodingPlan | null =>
+    selectEncoding({
+      codec,
+      caps,
+      support: SUPPORT[profile],
+      width: 1920,
+      height: 1080,
+      frameRate: 30,
+      hasAudio: true,
+      fallbackMimeType: FALLBACK,
+    });
+
+  interface Row {
+    choice: CodecChoice;
+    profile: Profile;
+    videoCodec: VideoCodec | null;
+    container: "mp4" | "webm" | null;
+    audioCodec: "aac" | "opus" | null;
+    mimeType: string;
+    substituted: boolean;
+  }
+
+  const MATRIX: readonly Row[] = [
+    // "auto" — hardware H.264 first, then VP9. Never a substitution: auto
+    // promised nothing, so there is nothing for the UI to apologise for.
+    { choice: "auto", profile: "hardwareH264", videoCodec: "h264", container: "mp4", audioCodec: "aac", mimeType: H264_MP4_AAC, substituted: false },
+    { choice: "auto", profile: "softwareH264", videoCodec: "vp9", container: "webm", audioCodec: "opus", mimeType: VP9_WEBM, substituted: false },
+    { choice: "auto", profile: "noH264", videoCodec: "vp9", container: "webm", audioCodec: "opus", mimeType: VP9_WEBM, substituted: false },
+    { choice: "auto", profile: "noAac", videoCodec: "h264", container: "mp4", audioCodec: "opus", mimeType: H264_MP4_OPUS, substituted: false },
+    { choice: "auto", profile: "vp9Only", videoCodec: "vp9", container: "webm", audioCodec: "opus", mimeType: VP9_WEBM, substituted: false },
+    { choice: "auto", profile: "none", videoCodec: null, container: "webm", audioCodec: null, mimeType: FALLBACK, substituted: false },
+
+    // "h264" — taken in software too, and the audio codec is whatever the
+    // machine can encode.
+    { choice: "h264", profile: "hardwareH264", videoCodec: "h264", container: "mp4", audioCodec: "aac", mimeType: H264_MP4_AAC, substituted: false },
+    { choice: "h264", profile: "softwareH264", videoCodec: "h264", container: "mp4", audioCodec: "opus", mimeType: H264_MP4_OPUS, substituted: false },
+    { choice: "h264", profile: "noH264", videoCodec: "vp9", container: "webm", audioCodec: "opus", mimeType: VP9_WEBM, substituted: true },
+    { choice: "h264", profile: "noAac", videoCodec: "h264", container: "mp4", audioCodec: "opus", mimeType: H264_MP4_OPUS, substituted: false },
+    { choice: "h264", profile: "vp9Only", videoCodec: "vp9", container: "webm", audioCodec: "opus", mimeType: VP9_WEBM, substituted: true },
+    { choice: "h264", profile: "none", videoCodec: null, container: "webm", audioCodec: null, mimeType: FALLBACK, substituted: true },
+
+    // "vp9" — the pre-§6 behaviour, unchanged wherever VP9 encodes.
+    { choice: "vp9", profile: "hardwareH264", videoCodec: "vp9", container: "webm", audioCodec: "opus", mimeType: VP9_WEBM, substituted: false },
+    { choice: "vp9", profile: "softwareH264", videoCodec: "vp9", container: "webm", audioCodec: "opus", mimeType: VP9_WEBM, substituted: false },
+    { choice: "vp9", profile: "noH264", videoCodec: "vp9", container: "webm", audioCodec: "opus", mimeType: VP9_WEBM, substituted: false },
+    { choice: "vp9", profile: "noAac", videoCodec: "vp9", container: "webm", audioCodec: "opus", mimeType: VP9_WEBM, substituted: false },
+    { choice: "vp9", profile: "vp9Only", videoCodec: "vp9", container: "webm", audioCodec: "opus", mimeType: VP9_WEBM, substituted: false },
+    { choice: "vp9", profile: "none", videoCodec: null, container: "webm", audioCodec: null, mimeType: FALLBACK, substituted: true },
+
+    // "av1" — and where it cannot be encoded, down the auto chain.
+    { choice: "av1", profile: "hardwareH264", videoCodec: "av1", container: "webm", audioCodec: "opus", mimeType: AV1_WEBM, substituted: false },
+    { choice: "av1", profile: "softwareH264", videoCodec: "av1", container: "webm", audioCodec: "opus", mimeType: AV1_WEBM, substituted: false },
+    { choice: "av1", profile: "noH264", videoCodec: "av1", container: "webm", audioCodec: "opus", mimeType: AV1_WEBM, substituted: false },
+    { choice: "av1", profile: "noAac", videoCodec: "h264", container: "mp4", audioCodec: "opus", mimeType: H264_MP4_OPUS, substituted: true },
+    { choice: "av1", profile: "vp9Only", videoCodec: "vp9", container: "webm", audioCodec: "opus", mimeType: VP9_WEBM, substituted: true },
+    { choice: "av1", profile: "none", videoCodec: null, container: "webm", audioCodec: null, mimeType: FALLBACK, substituted: true },
+  ];
+
+  it("covers every codec choice against every capability profile", () => {
+    // The matrix is only worth what it covers, and a row quietly dropped in a
+    // merge is invisible otherwise.
+    const seen = MATRIX.map((row) => `${row.choice}/${row.profile}`);
+    const expected = CHOICES.flatMap((choice) =>
+      (Object.keys(SUPPORT) as Profile[]).map((profile) => `${choice}/${profile}`),
+    );
+
+    expect(seen.slice().sort()).toEqual(expected.slice().sort());
+    expect(new Set(seen).size, "no duplicated rows").toBe(seen.length);
+  });
+
+  for (const row of MATRIX) {
+    it(`records ${row.choice} on ${row.profile} as ${row.mimeType}`, () => {
+      expect(plan(row.choice, row.profile)).toEqual({
+        engine: row.videoCodec ? "webcodecs" : "mediarecorder",
+        videoCodec: row.videoCodec,
+        container: row.container,
+        audioCodec: row.audioCodec,
+        mimeType: row.mimeType,
+        substituted: row.substituted,
+      } satisfies EncodingPlan);
+    });
+  }
+
+  it("hands every browser without WebCodecs to MediaRecorder, whatever was asked", () => {
+    // Firefox: `Settings.codec` cannot be honoured at all, because the fallback
+    // engine's format is the browser's to choose (§6.2).
+    for (const choice of CHOICES) {
+      expect(plan(choice, "hardwareH264", NO_WEBCODECS), choice).toEqual({
+        engine: "mediarecorder",
+        videoCodec: null,
+        container: "webm",
+        audioCodec: null,
+        mimeType: FALLBACK,
+        // "auto" asked for nothing in particular, so nothing was substituted.
+        substituted: choice !== "auto",
+      } satisfies EncodingPlan);
+    }
+  });
+
+  it("reports the fallback engine's own mime type, not a guess at it", () => {
+    // meta.mimeType has to be the string the recorder really produced (§6), and
+    // a browser that only does VP8 must not be described as producing VP9.
+    const vp8 = selectEncoding({
+      codec: "auto",
+      caps: NO_WEBCODECS,
+      support: SUPPORT.none,
+      width: 1920,
+      height: 1080,
+      frameRate: 30,
+      hasAudio: true,
+      fallbackMimeType: "video/webm;codecs=vp8,opus",
+    });
+
+    expect(vp8?.mimeType).toBe("video/webm;codecs=vp8,opus");
+    expect(vp8?.engine).toBe("mediarecorder");
+  });
+
+  it("reports no plan at all where nothing can record", () => {
+    // Safari: no WebCodecs, and a MediaRecorder that never produces WebM, so
+    // selectFallbackMimeType() came back null. The page has to say so.
+    expect(
+      selectEncoding({
+        codec: "auto",
+        caps: NO_WEBCODECS,
+        support: SUPPORT.none,
+        width: 1920,
+        height: 1080,
+        frameRate: 30,
+        hasAudio: true,
+        fallbackMimeType: null,
+      }),
+    ).toBeNull();
+
+    expect(
+      selectEncoding({
+        codec: "auto",
+        caps: { videoEncoder: false, audioEncoder: false, trackProcessor: false, mediaRecorder: false },
+        support: SUPPORT.hardwareH264,
+        width: 1920,
+        height: 1080,
+        frameRate: 30,
+        hasAudio: true,
+        fallbackMimeType: null,
+      }),
+    ).toBeNull();
+  });
+
+  it("drops the audio codec from the type when the capture has no audio", () => {
+    // Display capture with no system audio and the mic toggled off. Both
+    // containers have to stop claiming an audio track, or MSE rejects the
+    // first buffer the player appends.
+    for (const [profile, mimeType] of [
+      ["hardwareH264", "video/mp4;codecs=avc1.640028"],
+      ["vp9Only", "video/webm;codecs=vp09.00.40.08"],
+    ] as const) {
+      const silent = selectEncoding({
+        codec: "auto",
+        caps: WEBCODECS,
+        support: SUPPORT[profile],
+        width: 1920,
+        height: 1080,
+        frameRate: 30,
+        hasAudio: false,
+        fallbackMimeType: FALLBACK,
+      });
+
+      expect(silent?.audioCodec, profile).toBeNull();
+      expect(silent?.mimeType, profile).toBe(mimeType);
+    }
+  });
+
+  it("carries the real capture size into the level, at 4K as at 1080p", () => {
+    // The plan's mime type is meta.mimeType verbatim, so the level digits in it
+    // are the ones the player hands to MediaSource.isTypeSupported (§8).
+    const uhd = selectEncoding({
+      codec: "h264",
+      caps: WEBCODECS,
+      support: SUPPORT.hardwareH264,
+      width: 3840,
+      height: 2160,
+      // §6 constrains capture above QHD to 20 fps.
+      frameRate: 20,
+      hasAudio: true,
+      fallbackMimeType: FALLBACK,
+    });
+
+    expect(uhd?.mimeType).toBe("video/mp4;codecs=avc1.640033,mp4a.40.2");
+    expect(uhd?.container).toBe("mp4");
+  });
+
+  it("keeps the plan's mime type consistent with its own parts", () => {
+    // The four fields are what the recorder page reports and what the muxer is
+    // configured from; a mime type that disagreed with them would put one
+    // string in meta.json and different bytes in the file.
+    for (const choice of CHOICES) {
+      for (const profile of Object.keys(SUPPORT) as Profile[]) {
+        const built = plan(choice, profile);
+        if (!built?.videoCodec || !built.container) continue;
+
+        expect(built.container, `${choice}/${profile}`).toBe(containerFor(built.videoCodec));
+        expect(built.mimeType, `${choice}/${profile}`).toBe(
+          containerMimeType(
+            built.container,
+            videoCodecString(built.videoCodec, 1920, 1080, 30),
+            built.audioCodec,
+          ),
+        );
+      }
+    }
+  });
+
+  it("only ever reports AAC inside MP4", () => {
+    for (const choice of CHOICES) {
+      for (const profile of Object.keys(SUPPORT) as Profile[]) {
+        const built = plan(choice, profile);
+        if (built?.audioCodec !== "aac") continue;
+        expect(built.container, `${choice}/${profile}`).toBe("mp4");
+        expect(SUPPORT[profile].aac, `${choice}/${profile} probed AAC`).toBe(true);
+      }
+    }
+  });
+
+  it("flags a substitution exactly when the requested codec was not used", () => {
+    // What §6's "the UI shows a note naming what was used" hangs off.
+    for (const choice of CHOICES) {
+      for (const profile of Object.keys(SUPPORT) as Profile[]) {
+        const built = plan(choice, profile);
+        const honoured = choice === "auto" || built?.videoCodec === choice;
+        expect(built?.substituted, `${choice}/${profile}`).toBe(!honoured);
+      }
+    }
   });
 });
 
@@ -475,7 +1211,9 @@ describe("MediaRecorder fallback mime types", () => {
   });
 
   it("returns null where no WebM flavour is supported", () => {
-    // Safari's MediaRecorder: it records, just never WebM.
+    // Safari's MediaRecorder: it records, just never WebM. The fallback engine
+    // has no MP4 path — mp4-muxer is the WebCodecs engine's, and Safari has no
+    // MediaStreamTrackProcessor to feed it.
     expect(selectFallbackMimeType(supports("video/mp4;codecs=avc1.42E01E"))).toBeNull();
     expect(selectFallbackMimeType(() => false)).toBeNull();
   });
@@ -622,6 +1360,9 @@ describe("heartbeat", () => {
  * as a video hole does (§8). The heartbeat makes this sharp: it moves the video
  * clock in strides of up to 1.5 s, which the catch-up ceiling has to be able to
  * absorb, or every heartbeat on a still screen would punch a fresh hole.
+ *
+ * Container-independent: fMP4 fragments are cut on the same interleaving rule
+ * WebM clusters are, so the H.264 path inherits this unchanged.
  */
 describe("silence catch-up after the audio track ends", () => {
   it("fills a heartbeat-wide gap frame by frame instead of jumping it", () => {
@@ -695,6 +1436,82 @@ describe("silence catch-up after the audio track ends", () => {
   });
 });
 
+/**
+ * SPEC §6: an `isConfigSupported()` yes is an opinion, not a reservation. A
+ * hardware H.264 encoder can approve a config in a probe and then refuse it —
+ * every GPU encode session already taken, per-frame QP the platform does not
+ * really honour — and WebCodecs delivers that refusal asynchronously, through
+ * the encoder's error callback. These are the rungs the engine drops to instead
+ * of ending the recording: the same two axes `probeCandidate` walks, and never
+ * a different codec, because by then the muxer has declared the track and the
+ * container, audio codec and `meta.mimeType` are already in uploaded bytes (§7).
+ */
+describe("video encoder fallback rungs", () => {
+  const setup = (over: Partial<VideoSetup> = {}): VideoSetup => ({
+    codec: "h264",
+    hardware: true,
+    rateControl: "quantizer",
+    contentHint: true,
+    ...over,
+  });
+
+  const shape = (rungs: readonly VideoSetup[]): string[] =>
+    rungs.map((s) => `${s.codec}/${s.hardware ? "hw" : "sw"}/${s.rateControl}`);
+
+  it("drops per-frame quantizer before it gives up the hardware encoder", () => {
+    // Constant quality is what keeps screen text legible, but a variable-bitrate
+    // recording on the GPU still beats a software one, and both beat no
+    // recording at all.
+    expect(shape(videoFallbackSetups(setup()))).toEqual([
+      "h264/hw/variable",
+      "h264/sw/quantizer",
+      "h264/sw/variable",
+    ]);
+  });
+
+  it("skips the quantizer rung when the setup never had one", () => {
+    expect(shape(videoFallbackSetups(setup({ rateControl: "variable" })))).toEqual([
+      "h264/sw/variable",
+    ]);
+  });
+
+  it("has only the rate-control rung left once it is already in software", () => {
+    expect(shape(videoFallbackSetups(setup({ hardware: false })))).toEqual(["h264/sw/variable"]);
+    expect(videoFallbackSetups(setup({ hardware: false, rateControl: "variable" }))).toEqual([]);
+  });
+
+  it("offers nothing for VP9 or AV1", () => {
+    // Neither has a §6 bitrate table to fall back on, and neither is ever the
+    // hardware rung — so their behaviour is exactly what it was before.
+    for (const codec of ["vp9", "av1"] as const) {
+      expect(videoFallbackSetups(setup({ codec, hardware: false })), codec).toEqual([]);
+    }
+  });
+
+  it("never changes the codec, and so never the container", () => {
+    for (const codec of CODECS) {
+      for (const hardware of [true, false]) {
+        for (const rateControl of ["quantizer", "variable"] as const) {
+          const from = setup({ codec, hardware, rateControl });
+          for (const rung of videoFallbackSetups(from)) {
+            expect(rung.codec, `${codec}/${hardware}/${rateControl}`).toBe(codec);
+            expect(containerFor(rung.codec)).toBe(containerFor(codec));
+          }
+        }
+      }
+    }
+  });
+
+  it("terminates: every rung's own fallbacks are shorter than its parent's", () => {
+    const walk = (from: VideoSetup, depth = 0): number => {
+      expect(depth, "the fallback chain is bounded").toBeLessThan(8);
+      const rungs = videoFallbackSetups(from);
+      return rungs.length === 0 ? depth : Math.max(...rungs.map((r) => walk(r, depth + 1)));
+    };
+    expect(walk(setup())).toBeLessThanOrEqual(3);
+  });
+});
+
 describe("encoder constants", () => {
   it("matches the SPEC §6 audio bitrates", () => {
     expect(OPUS_BITRATE).toBe(48_000);
@@ -702,15 +1519,16 @@ describe("encoder constants", () => {
   });
 
   it("forces a keyframe every 8 seconds of media time", () => {
-    // Bounds cluster size so MSE seeking works and a mid-stream chunk boundary
-    // is never far from a decodable point (SPEC §6, §8).
+    // Bounds cluster and fragment size so MSE seeking works and a mid-stream
+    // chunk boundary is never far from a decodable point (SPEC §6, §8).
     expect(KEYFRAME_INTERVAL_US).toBe(8_000_000);
     expect(KEYFRAME_INTERVAL_US / 1_000_000).toBe(8);
   });
 
   it("defaults the fallback engine to 2.5 Mbps", () => {
-    // videoBitsPerSecond only reaches the MediaRecorder engine now; the
-    // WebCodecs engine is constant-quality and ignores it (SPEC §6, §9).
+    // videoBitsPerSecond only reaches the MediaRecorder engine; the WebCodecs
+    // engine is quantizer-driven, and where it cannot be it uses the §6 bitrate
+    // table above rather than this setting (SPEC §6, §9).
     expect(DEFAULT_VIDEO_BITS_PER_SECOND).toBe(2_500_000);
   });
 });

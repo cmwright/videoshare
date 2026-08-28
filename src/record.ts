@@ -20,7 +20,8 @@ import {
 } from "./encoder";
 import {
   addToLibrary,
-  DEFAULT_PREFER_AV1,
+  CODECS,
+  DEFAULT_CODEC,
   DEFAULT_QUALITY,
   DEFAULT_VIDEO_BITS_PER_SECOND,
   fetchGatewayConfig,
@@ -32,7 +33,14 @@ import {
   removeFromLibrary,
   saveSettings,
 } from "./settings";
-import type { GatewayConfig, LibraryEntry, Quality, Settings, VideoMeta } from "./types";
+import type {
+  CodecChoice,
+  GatewayConfig,
+  LibraryEntry,
+  Quality,
+  Settings,
+  VideoMeta,
+} from "./types";
 import {
   createGatewaySigner,
   createLocalSigner,
@@ -147,6 +155,8 @@ let engine: RecorderEngine | null = null;
 let stopping = false;
 /** The engine reported a mid-recording failure and its message is already on screen. */
 let engineFailure: Error | null = null;
+/** Whether this recording has already been checked against the requested codec. */
+let codecNoted = false;
 
 let session: UploadSession | null = null;
 let videoId = "";
@@ -251,6 +261,10 @@ function readQuality(value: string): Quality {
   return QUALITIES.find((allowed) => allowed === value) ?? DEFAULT_QUALITY;
 }
 
+function readCodec(value: string): CodecChoice {
+  return CODECS.find((allowed) => allowed === value) ?? DEFAULT_CODEC;
+}
+
 function fillSettingsForm(saved: Settings): void {
   field("endpoint").value = saved.endpoint;
   field("region").value = saved.region;
@@ -259,7 +273,7 @@ function fillSettingsForm(saved: Settings): void {
   field("secretAccessKey").value = saved.secretAccessKey;
   field("publicBaseUrl").value = saved.publicBaseUrl;
   select("quality").value = saved.quality;
-  field("preferAv1").checked = saved.preferAv1;
+  select("codec").value = saved.codec;
   field("videoBitsPerSecond").value = String(saved.videoBitsPerSecond);
 }
 
@@ -327,7 +341,7 @@ settingsForm.addEventListener("submit", (event) => {
       secretAccessKey: field("secretAccessKey").value,
       publicBaseUrl: field("publicBaseUrl").value,
       quality: readQuality(select("quality").value),
-      preferAv1: field("preferAv1").checked,
+      codec: readCodec(select("codec").value),
       videoBitsPerSecond: Number(field("videoBitsPerSecond").value),
     });
   } catch (err) {
@@ -676,11 +690,59 @@ function showUploaded(uploadedBytes: number): void {
 
 // --- Recording ---------------------------------------------------------------
 
+// --- Codec fallback note (SPEC §6) -------------------------------------------
+
+/** The codecs a recording can come back as, including the fallback engine's VP8. */
+type RecordedCodec = "h264" | "vp9" | "av1" | "vp8";
+
+const CODEC_NAMES: Record<RecordedCodec, string> = {
+  h264: "H.264",
+  vp9: "VP9",
+  av1: "AV1",
+  vp8: "VP8",
+};
+
+/**
+ * Which codec the engine's own mime type says it settled on — the one field
+ * that is guaranteed to describe what was really written (SPEC §6), whichever
+ * engine and container produced it. Both registrations appear: `avc1`/`avc3`
+ * for H.264 in MP4, `vp09`/`av01`/`vp08` in WebM, and MediaRecorder's shorter
+ * `vp9`/`vp8` spelling. `null` for a bare `video/webm`, which names nothing.
+ */
+function recordedCodec(mimeType: string): RecordedCodec | null {
+  const type = mimeType.toLowerCase();
+  if (/\b(?:avc1|avc3|h264)\b/.test(type)) return "h264";
+  if (/\b(?:vp09|vp9)\b/.test(type)) return "vp9";
+  if (/\b(?:av01|av1)\b/.test(type)) return "av1";
+  if (/\b(?:vp08|vp8)\b/.test(type)) return "vp8";
+  return null;
+}
+
+/**
+ * A codec the user picked outright is still only a request: one this browser
+ * cannot encode falls down the same chain `"auto"` uses (SPEC §6). That is a
+ * working recording, not an error — but it is not what was asked for, so it is
+ * said out loud rather than discovered later in the file's mime type.
+ */
+function noteCodecFallback(actualMimeType: string, requested: CodecChoice): void {
+  if (requested === "auto") return;
+  const actual = recordedCodec(actualMimeType);
+  if (actual === requested) return;
+  showNote(
+    `This browser can't encode ${CODEC_NAMES[requested]} — the recording uses ` +
+      // A bare `video/webm` names no codec at all: the last MediaRecorder
+      // candidate, where the browser picked for itself and did not say what.
+      // Saying so is still the note SPEC §6 asks for; pretending the request
+      // was honoured is not.
+      (actual === null ? "the browser's own WebM codec instead." : `${CODEC_NAMES[actual]} instead.`),
+  );
+}
+
 /** What a recording needs from whichever mode this deployment is in. */
 interface UploadPlan {
   signer: Signer;
   quality: Quality;
-  preferAv1: boolean;
+  codec: CodecChoice;
   videoBitsPerSecond: number;
 }
 
@@ -704,7 +766,7 @@ function uploadPlan(): UploadPlan | null {
     return {
       signer: gateway.signer,
       quality: DEFAULT_QUALITY,
-      preferAv1: DEFAULT_PREFER_AV1,
+      codec: DEFAULT_CODEC,
       videoBitsPerSecond: DEFAULT_VIDEO_BITS_PER_SECOND,
     };
   }
@@ -718,7 +780,7 @@ function uploadPlan(): UploadPlan | null {
     return {
       signer: createLocalSigner(settings),
       quality: settings.quality,
-      preferAv1: settings.preferAv1,
+      codec: settings.codec,
       videoBitsPerSecond: settings.videoBitsPerSecond,
     };
   } catch (err) {
@@ -771,7 +833,7 @@ async function startRecording(): Promise<void> {
   try {
     started = createEngine({
       quality: plan.quality,
-      preferAv1: plan.preferAv1,
+      codec: plan.codec,
       fallbackVideoBitsPerSecond: plan.videoBitsPerSecond,
     });
   } catch (err) {
@@ -814,6 +876,7 @@ async function startRecording(): Promise<void> {
   engine = started;
   stopping = false;
   engineFailure = null;
+  codecNoted = false;
   recordedParts = [];
   recordedBytes = 0;
   assembly = [];
@@ -823,6 +886,14 @@ async function startRecording(): Promise<void> {
 
   started.ondata = (bytes: Uint8Array) => {
     if (bytes.byteLength === 0) return;
+    // The engine's mime type is final by the time it emits bytes (SPEC §6), so
+    // this is the first moment a codec fallback can be named — early enough
+    // that the user can still stop, change the setting and record again. Not
+    // after a failure: that message says what happens next and must stand.
+    if (!codecNoted && !engineFailure) {
+      codecNoted = true;
+      noteCodecFallback(started.mimeType, plan.codec);
+    }
     // The Blob constructor copies the bytes synchronously, so the engine is free
     // to reuse the buffer once this returns, and Blob parts let the browser spill
     // the retained recording to disk (SPEC §6). The cast only drops the
@@ -983,14 +1054,22 @@ function previewEvent(types: readonly string[]): Promise<void> {
 }
 
 /**
- * Neither engine writes a duration into the WebM header, and it is not patched
- * in (SPEC §6: chunk 0 may already be uploaded), so the element reports Infinity
- * and shows no seek bar. Seeking far past the end makes the browser scan for the
- * real duration; the element is paused throughout, so nothing starts playing.
+ * No engine writes a duration into the container header, and none is patched in
+ * afterwards (SPEC §6: chunk 0 may already be uploaded), so the element has no
+ * duration to report and shows no seek bar. Seeking far past the end makes the
+ * browser scan for the real one; the element is paused throughout, so nothing
+ * starts playing.
+ *
+ * "No duration" looks different in each container, which is why the test below
+ * is a positive one rather than a comparison against `Infinity`: streamed WebM
+ * has no duration element at all and reports `Infinity`, while a fragmented MP4
+ * does carry an `mvhd` — with its duration field left at **0**, along with every
+ * `tkhd` and `mdhd`, and no `mehd` to override them. An `!== Infinity` test
+ * passes on that 0 and skips the probe, leaving H.264 previews unseekable.
  */
 async function ensureDuration(): Promise<void> {
   await previewEvent(["loadedmetadata", "error"]);
-  if (previewVideo.duration !== Infinity) return;
+  if (Number.isFinite(previewVideo.duration) && previewVideo.duration > 0) return;
 
   const probed = previewEvent(["durationchange", "error"]);
   try {
@@ -1016,7 +1095,10 @@ function setDownloadSource(blob: Blob | null): void {
   downloadUrl = blob ? URL.createObjectURL(blob) : null;
   if (downloadUrl) {
     downloadLink.href = downloadUrl;
-    downloadLink.download = `videoshare-${videoId}.webm`;
+    // The container is whatever the engine settled on — fragmented MP4 for
+    // H.264, WebM otherwise (SPEC §6) — and a .webm name on an MP4 is what
+    // stops the OS from opening the file this link exists to hand back.
+    downloadLink.download = `videoshare-${videoId}.${mimeType.startsWith("video/mp4") ? "mp4" : "webm"}`;
   } else {
     downloadLink.removeAttribute("href");
   }
@@ -1028,6 +1110,7 @@ function resetRecording(): void {
   engine = null;
   stopping = false;
   engineFailure = null;
+  codecNoted = false;
   recordedParts = [];
   recordedBytes = 0;
   assembly = [];
@@ -1151,6 +1234,9 @@ function checkSupport(): void {
   // only in containers this app cannot chunk, encrypt and play back, and the
   // user should learn that now rather than after picking a screen.
   const kind = selectEngineKind();
+  // The WebCodecs engine brings its own container (MP4 for H.264, WebM
+  // otherwise, SPEC §6); the fallback engine only ever records WebM, so it
+  // additionally needs a WebM type MediaRecorder will accept.
   const canEncode =
     kind === "webcodecs" || (kind === "mediarecorder" && selectFallbackMimeType() !== null);
   captureSupported = canEncode && typeof navigator.mediaDevices?.getDisplayMedia === "function";
@@ -1160,8 +1246,8 @@ function checkSupport(): void {
   showError(
     canEncode
       ? "This browser cannot capture the screen. Try Chrome, Edge, or Firefox on a desktop."
-      : "This browser cannot record WebM video. Try Chrome, Edge, or Firefox on a desktop — " +
-          "you can still watch shared links here.",
+      : "This browser cannot record video in a format this app can share. Try Chrome, Edge, " +
+          "or Firefox on a desktop — you can still watch shared links here.",
   );
 }
 

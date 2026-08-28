@@ -71,7 +71,7 @@ Two objects per video, under the id as prefix:
 {
   "v": 1,                      // format version, integer
   "title": "Sprint demo",      // user-entered, may be ""
-  "mimeType": "video/webm;codecs=vp09.00.10.08,opus",  // exact string from the recording engine
+  "mimeType": "video/webm;codecs=vp09.00.50.08,opus",  // exact engine string; H.264 recordings use video/mp4;codecs=avc1...,
   "durationMs": 93250,         // integer, from recording timer
   "totalBytes": 19381222,      // plaintext (pre-encryption) video byte length
   "chunkSize": 8388608,        // plaintext chunk size used
@@ -100,7 +100,8 @@ Two objects per video, under the id as prefix:
 - **Encoding engines** — one interface, two implementations (`src/encoder.ts`):
 
   ```ts
-  export interface EngineOptions { quality: Quality; preferAv1: boolean;
+  export type CodecChoice = "auto" | "h264" | "vp9" | "av1";
+  export interface EngineOptions { quality: Quality; codec: CodecChoice;
     fallbackVideoBitsPerSecond: number; }
   export interface RecorderEngine {
     readonly mimeType: string;   // exact container/codec string actually in use,
@@ -116,28 +117,38 @@ Two objects per video, under the id as prefix:
   ```
 
   1. **Primary — WebCodecs engine** (when `VideoEncoder`, `AudioEncoder` and
-     `MediaStreamTrackProcessor` all exist; Chrome/Edge): `VideoEncoder` in
-     **quantizer (constant-quality) mode**, `latencyMode: "realtime"` (the
-     "quality" tuning cannot encode native-resolution capture at speed; same
-     quantizer keeps text equally sharp at a modest file-size cost). Captures
-     above QHD (2560x1440 pixels) additionally apply a 20fps track constraint
-     after acquisition — native text detail beats 30fps for screencasts. Codec:
-     AV1 when `preferAv1` and encode support, else VP9 (proper codec strings,
-     e.g. `av01.0.08M.08` / `vp09.00.10.08`; the exact string used flows into
-     `meta.mimeType`). `quality` maps to a per-codec quantizer table (implementer
-     picks sane values ~"visually clean text" for `standard`; document them in
-     code). Backpressure: if `encodeQueueSize` exceeds a small bound, drop
-     incoming **delta** frames. Force a keyframe at least every **8 s** of media
-     time so clusters stay bounded and MSE seeking works. **Heartbeat**: screen
-     capture is VFR (static screens deliver no frames) and backpressure drops
-     frames under load, but holes in the video timeline split MSE buffered
-     ranges and stall playback (§8) — so if ~1 s of wall clock passes with no
-     frame encoded, re-encode a retained clone of the last frame at the current
-     timestamp (near-free in quantizer mode; skip while the encoder queue is
-     over the backpressure bound). Audio: `AudioEncoder`
-     Opus, mono, **48 kbps**. Muxing: the `webm-muxer` npm package (MIT) in
-     streaming mode — its output callback feeds `ondata`. No in-container
-     duration (the duration bullet below is unchanged).
+     `MediaStreamTrackProcessor` all exist; Chrome/Edge). **Codec selection**
+     from `opts.codec`, feature-detected via `isConfigSupported`:
+     - `"h264"` → H.264 with `hardwareAcceleration: "prefer-hardware"`
+       (falling back to no-preference if rejected), muxed as **fragmented MP4**
+       via the `mp4-muxer` npm package (MIT, streaming/fragmented mode).
+       Profile/level string derived from resolution (High profile,
+       `avc1.6400XX`). Rate control: per-frame quantizer when the encoder
+       accepts `bitrateMode: "quantizer"` with H.264 per-frame QP; otherwise
+       `bitrateMode: "variable"` with a quality→bitrate table scaled by pixel
+       count (implementer documents both tables in code). Audio in MP4: AAC
+       (`mp4a.40.2`) via `AudioEncoder` when supported, else Opus-in-MP4; the
+       actual audio codec flows into `meta.mimeType`.
+     - `"vp9"` (and `"av1"`) → the existing path: quantizer mode, WebM via
+       `webm-muxer` (streaming mode), Opus 48 kbps mono audio.
+     - `"auto"` (default) → hardware H.264 when its config is supported with
+       hardware acceleration, else VP9. A user-selected codec that turns out
+       unsupported falls back down this same chain and the UI shows a note
+       naming what was used.
+     Common to all codecs: `latencyMode: "realtime"`; captures above QHD
+     (2560x1440 pixels) apply a 20fps track constraint after acquisition;
+     `quality` maps to per-codec quantizer (or bitrate) tables; backpressure
+     (drop incoming **delta** frames when `encodeQueueSize` exceeds a small
+     bound); forced keyframe at least every **8 s** of media time; the
+     **heartbeat** (re-encode a retained clone of the last frame after ~1 s
+     with none, skipped while the queue is over the backpressure bound) — the
+     muxing layer sits behind one internal adapter interface so keyframe,
+     heartbeat, and audio silence-fill logic exist exactly once. The exact
+     container/codec string used flows into `meta.mimeType`
+     (e.g. `video/mp4;codecs=avc1.640033,mp4a.40.2` /
+     `video/webm;codecs=vp09.00.50.08,opus`). No in-container duration
+     (the duration bullet below is unchanged) — for fMP4 this means no
+     authoritative `mvhd` duration is required; fragments stream as produced.
   2. **Fallback — MediaRecorder engine** (Firefox etc.): first supported of
      `video/webm;codecs=vp9,opus`, `vp8,opus`, `video/webm`;
      `videoBitsPerSecond` from settings (default **2_500_000**),
@@ -255,11 +266,14 @@ player and storage format are unaffected. `meta.json` remains a single PUT.
   `accessKeyId`, `secretAccessKey`, `publicBaseUrl` (base URL where the bucket
   is readable, e.g. `http://localhost:9000/videoshare` or a CDN domain),
   `quality` (`"smaller" | "standard" | "sharper"`, default `"standard"`),
-  `preferAv1` (boolean, default `false` — AV1 shrinks files ~30-50% but viewers
-  on Safari without AV1 hardware decode can't play; the settings UI must say
-  this), `videoBitsPerSecond` (fallback MediaRecorder engine only, default
-  2_500_000). Loading settings stored by older versions (no quality/preferAv1,
-  old bitrate default) must not error — fill defaults.
+  `codec` (`"auto" | "h264" | "vp9" | "av1"`, default `"auto"` — the settings
+  UI presents this as a select with honest labels: Auto picks hardware H.264
+  when available; H.264 = smooth/hardware/larger files/plays everywhere; VP9 =
+  software/smallest files/may drop frames at high resolution; AV1 = smallest
+  but some Safari viewers can't play), `videoBitsPerSecond` (fallback
+  MediaRecorder engine only, default 2_500_000). Loading settings stored by
+  older versions must not error — fill defaults; a stored `preferAv1: true`
+  migrates to `codec: "av1"`.
 - `videoshare.library` (JSON array of): `{ id, title, createdAt, durationMs,
   link, sizeBytes? }` — newest first; list in UI with copy-link and
   delete-from-list (delete only removes the local entry in v1, it does not
@@ -285,7 +299,7 @@ export interface VideoMeta { v: 1; title: string; mimeType: string; durationMs: 
   totalBytes: number; chunkSize: number; chunkCount: number; createdAt: string; }
 export interface Settings { endpoint: string; region: string; bucket: string;
   accessKeyId: string; secretAccessKey: string; publicBaseUrl: string;
-  quality: Quality; preferAv1: boolean; videoBitsPerSecond: number; }
+  quality: Quality; codec: CodecChoice; videoBitsPerSecond: number; }
 export interface LibraryEntry { id: string; title: string; createdAt: string;
   durationMs: number; link: string; }
 ```
@@ -336,7 +350,7 @@ tokens and base styles in `src/app.css`.
 
 ## 12. Build & tooling
 
-- `package.json`: deps `aws4fetch`, `webm-muxer`; devDeps `typescript`,
+- `package.json`: deps `aws4fetch`, `webm-muxer`, `mp4-muxer`; devDeps `typescript`,
   `vite`, `vitest`. Scripts: `dev` (vite), `build` (`tsc --noEmit && vite build`),
   `preview`, `test` (`vitest run`), `test:e2e` (`vitest run --config vitest.e2e.config.ts`,
   only meaningful with MinIO up).
@@ -348,8 +362,10 @@ tokens and base styles in `src/app.css`.
 
 - Node cannot run WebCodecs, so the encoder's browser paths are exercised only
   manually; unit tests cover the pure parts of `encoder.ts` (codec-string
-  construction, quantizer tables, engine selection given injected capability
-  flags) in `tests/encoder.test.ts`.
+  construction for VP9/AV1/H.264 at representative resolutions, quantizer and
+  bitrate tables, and the codec/engine selection matrix — every CodecChoice x
+  capability combination incl. hardware-rejected H.264 — given injected
+  capability flags) in `tests/encoder.test.ts`.
 - `tests/crypto.test.ts` (vitest, Node WebCrypto): key export/import round-trip;
   block round-trip; tampered byte → throws; wrong AAD (reordered chunk index) →
   throws; chunked encrypt/decrypt round-trip across ≥3 chunks incl. short

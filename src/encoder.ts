@@ -5,32 +5,51 @@
  *
  * 1. `WebCodecsEngine` (Chrome/Edge) — frames come off the capture tracks
  *    through `MediaStreamTrackProcessor`, go into a `VideoEncoder` running in
- *    quantizer (constant-quality) mode, and are muxed by `webm-muxer` in
- *    streaming mode. Constant quality is what makes screen text legible: bits
- *    follow the content instead of a fixed bitrate.
+ *    quantizer (constant-quality) mode wherever the encoder allows it, and are
+ *    muxed as they are produced. Constant quality is what makes screen text
+ *    legible: bits follow the content instead of a fixed bitrate.
  * 2. `MediaRecorderEngine` (Firefox, Safari, anything older) — the browser's
  *    own recorder, at the configured fallback bitrate.
  *
- * Both hand muxed WebM bytes to `ondata`, strictly in order, exactly like
- * MediaRecorder's `dataavailable` used to: the recorder page slices those bytes
- * into 8 MiB plaintext chunks and streams them to S3 (§7), so nothing
- * downstream — crypto, upload, player — knows which engine produced them.
+ * The WebCodecs engine encodes whichever codec `EngineOptions.codec` asks for
+ * and this browser can actually produce (§6): H.264 — hardware-accelerated where
+ * the machine has an encoder — muxed as **fragmented MP4** by `mp4-muxer`, or
+ * VP9/AV1 muxed as WebM by `webm-muxer`. The two muxers sit behind one internal
+ * `MuxerAdapter`, so the keyframe clock, the heartbeat, the backpressure valve,
+ * the timestamp rebase and the audio silence fill exist exactly once, above it.
+ *
+ * Both engines hand muxed container bytes to `ondata`, strictly in order,
+ * exactly like MediaRecorder's `dataavailable` used to: the recorder page slices
+ * those bytes into 8 MiB plaintext chunks and streams them to S3 (§7), so
+ * nothing downstream — crypto, upload, player — knows which engine or which
+ * container produced them. The player reads `meta.mimeType` and nothing else.
  *
  * Nothing here touches a browser global at import time, so the pure parts
- * (codec strings, quantizer table, engine selection) run under Node in tests.
+ * (codec strings, the rate-control tables, the selection matrix) run under Node
+ * in tests.
  */
 
-import { Muxer, StreamTarget } from "webm-muxer";
-import type { Quality } from "./types";
+import { Muxer as Mp4Muxer, StreamTarget as Mp4StreamTarget } from "mp4-muxer";
+import { Muxer as WebmMuxer, StreamTarget as WebmStreamTarget } from "webm-muxer";
+import type { CodecChoice, Quality } from "./types";
 
 // --- Public API (SPEC §6) ----------------------------------------------------
 
-/** Re-exported so §6's engine API reads on its own; the union lives in types.ts. */
-export type { Quality };
+/**
+ * Re-exported so §6's engine API reads on its own; both unions live in types.ts
+ * because `Settings` is written in terms of them (§9, §11).
+ *
+ * `CodecChoice` is what the user asked for. `"auto"` is the default and the
+ * only value that promises nothing: it takes hardware H.264 where there is one
+ * and VP9 otherwise. The other three are honoured wherever the browser can
+ * encode them and fall down the same chain where it cannot — a recording that
+ * happens in a different codec, never one that does not happen.
+ */
+export type { CodecChoice, Quality };
 
 export interface EngineOptions {
   quality: Quality;
-  preferAv1: boolean;
+  codec: CodecChoice;
   /** MediaRecorder fallback only — the WebCodecs engine is constant-quality. */
   fallbackVideoBitsPerSecond: number;
 }
@@ -65,8 +84,14 @@ export interface RecorderEngine {
   stop(): Promise<void>;
 }
 
-/** Video codecs the WebCodecs engine can produce. */
-export type VideoCodec = "vp9" | "av1";
+/** Video codecs the WebCodecs engine can produce (§6). */
+export type VideoCodec = "h264" | "vp9" | "av1";
+
+/** Which muxer carries a codec: H.264 goes in fragmented MP4, the rest in WebM. */
+export type Container = "mp4" | "webm";
+
+/** Audio codecs this engine encodes. AAC only ever rides in MP4 (§6). */
+export type AudioCodec = "aac" | "opus";
 
 export type EngineKind = "webcodecs" | "mediarecorder";
 
@@ -160,6 +185,12 @@ export function heartbeatTimestampUs(
 export const OPUS_BITRATE = 48_000;
 
 /**
+ * AAC-LC for the same track when the file is an MP4 (§6). A little more than
+ * Opus, because AAC needs it to sound the same at these rates.
+ */
+export const AAC_BITRATE = 64_000;
+
+/**
  * Silence synthesised after the audio track ends mid-recording, in 20 ms
  * frames — Opus's own frame size, so the encoder packetizes them one for one.
  * See `fillAudioGap()` for why the audio clock may not be allowed to stop.
@@ -214,24 +245,35 @@ export function silenceCatchUpUs(silenceUs: number, targetUs: number): number {
 export const FALLBACK_AUDIO_BITRATE = 64_000;
 const FALLBACK_TIMESLICE_MS = 1000;
 
-/** Used when settings carry no usable fallback bitrate (§9 default). */
-const FALLBACK_VIDEO_BITS_PER_SECOND = 1_200_000;
+/** Used when settings carry no usable fallback bitrate (§6.2/§9 default). */
+const FALLBACK_VIDEO_BITS_PER_SECOND = 2_500_000;
 
 /** What §6 caps capture at, and what we assume before the first frame arrives. */
 const NOMINAL_WIDTH = 1920;
 const NOMINAL_HEIGHT = 1080;
 const NOMINAL_FRAME_RATE = 30;
+/** What the §6 mixing graph produces, and what the AAC probe asks about. */
+const NOMINAL_SAMPLE_RATE = 48_000;
 
 /**
- * quality → per-frame quantizer. In `bitrateMode: "quantizer"` this is the only
- * quality knob: higher is coarser and smaller, and the encoder spends whatever
- * bitrate that costs.
+ * Rate control, table 1 of 2 — quality → per-frame quantizer. In
+ * `bitrateMode: "quantizer"` this is the only quality knob: higher is coarser
+ * and smaller, and the encoder spends whatever bitrate that costs. It is the
+ * primary path for every codec; `BITRATES` below is the fallback for encoders
+ * that refuse quantizer mode.
  *
- * VP9 takes libvpx's quantizer directly (0–63). AV1 takes an AV1 qindex
- * (0–255), which Chromium divides by 4 to reach the same internal 0–63 scale —
- * so the AV1 column is exactly 4× the VP9 column, both codecs land on the same
- * internal quantizer, and AV1's better tools show up as a smaller file rather
- * than a different-looking picture.
+ * Each codec's quantizer means something different, so the three columns are
+ * the *same fraction of each codec's own range* — switching codec changes the
+ * file size and the CPU cost, not what the recording looks like:
+ *
+ * - VP9 takes libvpx's quantizer directly (0–63).
+ * - AV1 takes an AV1 qindex (0–255), which Chromium divides by 4 to reach the
+ *   same internal 0–63 scale — so the AV1 column is exactly 4× the VP9 column
+ *   and AV1's better tools show up as a smaller file, not a different picture.
+ * - H.264 takes its own QP (0–51, per the WebCodecs AVC registration), so the
+ *   column is the VP9 one rescaled by 51/63 and rounded: 38→31, 28→23, 20→16.
+ *   Same picture again; H.264's weaker tools show up as a bigger file, which is
+ *   the trade a user makes by choosing it for a smooth 4K capture.
  *
  * - `smaller` — visibly compressed photos and video, UI text still legible;
  *   for long recordings where upload size is what hurts.
@@ -241,6 +283,7 @@ const NOMINAL_FRAME_RATE = 30;
  *   fonts), at roughly double the bytes of `standard`.
  */
 export const QUANTIZERS: Record<VideoCodec, Record<Quality, number>> = {
+  h264: { smaller: 31, standard: 23, sharper: 16 },
   vp9: { smaller: 38, standard: 28, sharper: 20 },
   av1: { smaller: 152, standard: 112, sharper: 80 },
 };
@@ -248,6 +291,50 @@ export const QUANTIZERS: Record<VideoCodec, Record<Quality, number>> = {
 export function quantizerFor(codec: VideoCodec, quality: Quality): number {
   const table = QUANTIZERS[codec];
   return table[quality] ?? table.standard;
+}
+
+/** The frame size {@link BITRATES} is quoted at: 1080p, where the numbers read. */
+export const BITRATE_REFERENCE_PIXELS = 1920 * 1080;
+
+/**
+ * Rate control, table 2 of 2 — quality → bitrate at {@link
+ * BITRATE_REFERENCE_PIXELS}, for `bitrateMode: "variable"`.
+ *
+ * Per-frame quantizer is a young WebCodecs feature (Chrome 117) and platform
+ * encoders vary, so a hardware H.264 encoder may well refuse it. Then there is
+ * no way to say "this quality whatever it costs" and the encoder has to be
+ * given a number of bits instead — these, scaled by pixel count
+ * ({@link bitrateFor}).
+ *
+ * They are H.264 numbers for screen content: roughly what a `standard`
+ * quantizer costs on a busy 1080p desktop, doubled for `sharper` and halved for
+ * `smaller`, which is the same spacing the quantizer table has. Screen capture
+ * is mostly still, so a variable-bitrate encoder spends well under these except
+ * while something is actually moving — which is exactly when it should.
+ */
+export const BITRATES: Record<Quality, number> = {
+  smaller: 2_000_000,
+  standard: 4_000_000,
+  sharper: 8_000_000,
+};
+
+/**
+ * Below this a small shared window would be starved: linear scaling alone gives
+ * a 320×180 terminal a thirty-sixth of the 1080p bitrate, and screen glyphs do
+ * not cost proportionally fewer bits than a photo does — they are the same size
+ * in pixels either way.
+ */
+export const MIN_BITRATE = 250_000;
+
+/**
+ * {@link BITRATES} scaled by pixel count (§6), with that floor and no ceiling:
+ * a 4K frame really does need four times the bits of a 1080p one, and clamping
+ * there would throw away the whole reason for recording at 4K.
+ */
+export function bitrateFor(quality: Quality, width: number, height: number): number {
+  const pixels = Math.max(1, width) * Math.max(1, height);
+  const base = BITRATES[quality] ?? BITRATES.standard;
+  return Math.max(MIN_BITRATE, Math.round((base * pixels) / BITRATE_REFERENCE_PIXELS));
 }
 
 // --- Codec strings -----------------------------------------------------------
@@ -267,6 +354,43 @@ interface CodecLevel {
   readonly maxWidth?: number;
   readonly maxHeight?: number;
 }
+
+/**
+ * H.264 levels (ITU-T H.264 Annex A, Table A-1), keyed by `level_idc` — the
+ * last byte of the codec string, and the level number × 10 (level 4.0 → 40 →
+ * `28` in hex). H.264 counts in 16×16 macroblocks rather than luma samples, and
+ * a partial macroblock still has to be coded, which is why 1080p is 68 rows of
+ * them and not 67.5.
+ */
+interface H264Level {
+  readonly id: number;
+  /** MaxFS: macroblocks per frame. */
+  readonly maxFrameMacroblocks: number;
+  /** MaxMBPS: macroblocks per second. */
+  readonly maxMacroblocksPerSecond: number;
+}
+
+const H264_LEVELS: readonly H264Level[] = [
+  { id: 0x0a, maxMacroblocksPerSecond: 1_485, maxFrameMacroblocks: 99 }, //          1
+  { id: 0x0b, maxMacroblocksPerSecond: 3_000, maxFrameMacroblocks: 396 }, //         1.1
+  { id: 0x0c, maxMacroblocksPerSecond: 6_000, maxFrameMacroblocks: 396 }, //         1.2
+  { id: 0x0d, maxMacroblocksPerSecond: 11_880, maxFrameMacroblocks: 396 }, //        1.3
+  { id: 0x14, maxMacroblocksPerSecond: 11_880, maxFrameMacroblocks: 396 }, //        2
+  { id: 0x15, maxMacroblocksPerSecond: 19_800, maxFrameMacroblocks: 792 }, //        2.1
+  { id: 0x16, maxMacroblocksPerSecond: 20_250, maxFrameMacroblocks: 1_620 }, //      2.2
+  { id: 0x1e, maxMacroblocksPerSecond: 40_500, maxFrameMacroblocks: 1_620 }, //      3
+  { id: 0x1f, maxMacroblocksPerSecond: 108_000, maxFrameMacroblocks: 3_600 }, //     3.1
+  { id: 0x20, maxMacroblocksPerSecond: 216_000, maxFrameMacroblocks: 5_120 }, //     3.2
+  { id: 0x28, maxMacroblocksPerSecond: 245_760, maxFrameMacroblocks: 8_192 }, //     4
+  { id: 0x29, maxMacroblocksPerSecond: 245_760, maxFrameMacroblocks: 8_192 }, //     4.1
+  { id: 0x2a, maxMacroblocksPerSecond: 522_240, maxFrameMacroblocks: 8_704 }, //     4.2
+  { id: 0x32, maxMacroblocksPerSecond: 589_824, maxFrameMacroblocks: 22_080 }, //    5
+  { id: 0x33, maxMacroblocksPerSecond: 983_040, maxFrameMacroblocks: 36_864 }, //    5.1
+  { id: 0x34, maxMacroblocksPerSecond: 2_073_600, maxFrameMacroblocks: 36_864 }, //  5.2
+  { id: 0x3c, maxMacroblocksPerSecond: 4_177_920, maxFrameMacroblocks: 139_264 }, // 6
+  { id: 0x3d, maxMacroblocksPerSecond: 8_355_840, maxFrameMacroblocks: 139_264 }, // 6.1
+  { id: 0x3e, maxMacroblocksPerSecond: 16_711_680, maxFrameMacroblocks: 139_264 }, // 6.2
+];
 
 /** VP9 levels (https://www.webmproject.org/vp9/levels/). */
 const VP9_LEVELS: readonly CodecLevel[] = [
@@ -327,6 +451,44 @@ function pad2(n: number): string {
   return String(n).padStart(2, "0");
 }
 
+/** Macroblocks are 16×16 and a partial one still has to be coded. */
+function macroblocks(pixels: number): number {
+  return Math.ceil(Math.max(1, pixels) / 16);
+}
+
+function pickH264Level(width: number, height: number, frameRate: number): H264Level {
+  const wide = macroblocks(width);
+  const tall = macroblocks(height);
+  const size = wide * tall;
+  const rate = size * Math.max(1, frameRate);
+  const fits = H264_LEVELS.find(
+    (level) =>
+      size <= level.maxFrameMacroblocks &&
+      rate <= level.maxMacroblocksPerSecond &&
+      // Annex A.3.1: neither dimension may exceed sqrt(MaxFS × 8) macroblocks,
+      // which is what stops a level covering an absurdly wide, 1-mb-tall frame.
+      Math.max(wide, tall) <= Math.sqrt(level.maxFrameMacroblocks * 8),
+  );
+  return fits ?? (H264_LEVELS[H264_LEVELS.length - 1] as H264Level);
+}
+
+/**
+ * e.g. 1920×1080@30 → `avc1.640028` (High profile, no constraint flags, level
+ * 4.0); 4K → `avc1.640033` (level 5.1), the string SPEC §6 names.
+ *
+ * `avc1.PPCCLL`, all hex: profile_idc, the constraint-flags byte, level_idc.
+ * High profile is 0x64 — it is what every hardware encoder in the support
+ * matrix produces and every decoder since 2010 reads. The constraint byte stays
+ * 0x00: setting a flag we do not actually honour is a lie a strict decoder is
+ * entitled to act on. RFC 6381 does not say which case the digits are in, and
+ * MediaSource accepts either; uppercase is what the platform strings use
+ * (`avc1.42E01E`), so `meta.mimeType` reads the same everywhere.
+ */
+export function avcCodecString(width: number, height: number, frameRate = NOMINAL_FRAME_RATE): string {
+  const level = pickH264Level(width, height, frameRate).id;
+  return `avc1.6400${level.toString(16).padStart(2, "0").toUpperCase()}`;
+}
+
 /** e.g. 1920×1080@30 → `vp09.00.40.08` (profile 0, level 4.0, 8-bit). */
 export function vp9CodecString(width: number, height: number, frameRate = NOMINAL_FRAME_RATE): string {
   return `vp09.00.${pad2(pickLevel(VP9_LEVELS, width, height, frameRate).id)}.08`;
@@ -343,22 +505,44 @@ export function videoCodecString(
   height: number,
   frameRate = NOMINAL_FRAME_RATE,
 ): string {
+  if (codec === "h264") return avcCodecString(width, height, frameRate);
   return codec === "av1"
     ? av1CodecString(width, height, frameRate)
     : vp9CodecString(width, height, frameRate);
 }
 
+/** How each audio codec is spelled in a `codecs=` parameter. */
+export const AUDIO_CODEC_STRINGS: Record<AudioCodec, string> = {
+  /** MPEG-4 audio, object type 2 — AAC-LC. */
+  aac: "mp4a.40.2",
+  opus: "opus",
+};
+
 /**
- * AV1 is a preference, not a promise (§9): a browser that cannot encode it
- * quietly records VP9 rather than failing.
+ * WebM cannot carry H.264 at all, and MP4 is where hardware H.264 belongs
+ * anyway: the fragmented-MP4 path exists for exactly one codec (§6).
  */
-export function selectVideoCodec(preferAv1: boolean, av1Supported: boolean): VideoCodec {
-  return preferAv1 && av1Supported ? "av1" : "vp9";
+export function containerFor(codec: VideoCodec): Container {
+  return codec === "h264" ? "mp4" : "webm";
 }
 
-/** The MSE-facing type for a WebM of `videoCodec` (+ Opus when there is audio). */
-export function containerMimeType(videoCodec: string, hasAudio = true): string {
-  return hasAudio ? `video/webm;codecs=${videoCodec},opus` : `video/webm;codecs=${videoCodec}`;
+/**
+ * The MSE-facing type for a file of these codecs — `meta.mimeType` verbatim
+ * (§5), and what the player hands to `MediaSource.isTypeSupported` (§8).
+ *
+ * `audioCodec` is null when the capture had no audio: claiming a track the file
+ * does not contain makes MSE reject the first buffer appended. Unquoted and
+ * unspaced, which every MSE implementation parses — WebKit's content-type
+ * parser reads an unquoted parameter value up to the next `;`, so the comma
+ * between two codecs survives there as it does in Chrome.
+ */
+export function containerMimeType(
+  container: Container,
+  videoCodec: string,
+  audioCodec: AudioCodec | null,
+): string {
+  const codecs = audioCodec ? `${videoCodec},${AUDIO_CODEC_STRINGS[audioCodec]}` : videoCodec;
+  return `video/${container};codecs=${codecs}`;
 }
 
 // --- Engine selection --------------------------------------------------------
@@ -392,6 +576,85 @@ export function selectEngineKind(caps: EngineCapabilities = detectCapabilities()
   return caps.mediaRecorder ? "mediarecorder" : null;
 }
 
+/**
+ * What `isConfigSupported()` answered, as plain flags so the whole selection
+ * matrix is testable without a browser (§13).
+ *
+ * `h264Hardware` is H.264 accepted with `hardwareAcceleration:
+ * "prefer-hardware"`; `h264` is H.264 accepted at all, which includes Chrome's
+ * bundled software encoder. The first implies the second.
+ */
+export interface CodecSupport {
+  h264Hardware: boolean;
+  h264: boolean;
+  vp9: boolean;
+  av1: boolean;
+  /** `AudioEncoder` can produce AAC-LC (`mp4a.40.2`). */
+  aac: boolean;
+}
+
+/** One rung of the fallback chain: a codec, and whether it must be hardware. */
+export interface CodecCandidate {
+  codec: VideoCodec;
+  /** Only satisfied by `h264Hardware`; meaningless for the software codecs. */
+  hardware: boolean;
+}
+
+/**
+ * The chain §6 walks, for a given setting: the chosen codec first — in hardware
+ * if it can be, in software if not — and then the `"auto"` chain with that
+ * codec removed.
+ *
+ * The `"auto"` chain is hardware H.264, VP9, AV1, software H.264. Hardware
+ * H.264 leads because it is the only encoder that keeps up with a
+ * native-resolution capture; software H.264 trails everything because it is
+ * CPU-bound like VP9 and produces bigger files, so it wins nothing — it is
+ * there only so a browser with nothing else still records.
+ */
+export function codecCandidates(choice: CodecChoice): readonly CodecCandidate[] {
+  const auto: readonly CodecCandidate[] = [
+    { codec: "h264", hardware: true },
+    { codec: "vp9", hardware: false },
+    { codec: "av1", hardware: false },
+    { codec: "h264", hardware: false },
+  ];
+  if (choice === "auto") return auto;
+  const chosen: readonly CodecCandidate[] =
+    choice === "h264"
+      ? [{ codec: "h264", hardware: true }, { codec: "h264", hardware: false }]
+      : [{ codec: choice, hardware: false }];
+  return [...chosen, ...auto.filter((candidate) => candidate.codec !== choice)];
+}
+
+/** Whether this browser answered yes to the exact config a candidate needs. */
+export function candidateSupported(candidate: CodecCandidate, support: CodecSupport): boolean {
+  if (candidate.codec !== "h264") return support[candidate.codec];
+  // A browser that accepts "prefer-hardware" but not the plain config is not a
+  // thing; belt and braces so a malformed probe cannot lose the codec.
+  return candidate.hardware ? support.h264Hardware : support.h264 || support.h264Hardware;
+}
+
+/**
+ * The first rung of {@link codecCandidates} this browser can actually encode,
+ * or null when it can encode none of them — which is not a failure, it just
+ * means the MediaRecorder engine records instead (§6.2).
+ */
+export function selectVideoCodec(choice: CodecChoice, support: CodecSupport): VideoCodec | null {
+  return codecCandidates(choice).find((c) => candidateSupported(c, support))?.codec ?? null;
+}
+
+/**
+ * AAC in MP4 where the browser can encode it, Opus everywhere else (§6).
+ *
+ * WebM's codec list does not include AAC — Matroska's does, WebM's does not —
+ * so the WebM path is Opus whatever the machine can do. In MP4, AAC is what
+ * Safari and every hardware decoder want; Opus-in-MP4 is the fallback for
+ * Firefox and for Chrome on desktop Linux, neither of which has an AAC encoder.
+ */
+export function selectAudioCodec(container: Container, aacSupported: boolean): AudioCodec {
+  return container === "mp4" && aacSupported ? "aac" : "opus";
+}
+
 /** First supported wins (§6). */
 export const FALLBACK_MIME_TYPES: readonly string[] = [
   "video/webm;codecs=vp9,opus",
@@ -403,6 +666,88 @@ export function selectFallbackMimeType(
   isSupported: (type: string) => boolean = mediaRecorderSupports,
 ): string | null {
   return FALLBACK_MIME_TYPES.find((type) => isSupported(type)) ?? null;
+}
+
+/** Everything the §6 decision looks at, as plain values (§13). */
+export interface EncodingRequest {
+  /** `Settings.codec` (§9). */
+  codec: CodecChoice;
+  caps: EngineCapabilities;
+  support: CodecSupport;
+  width: number;
+  height: number;
+  frameRate: number;
+  hasAudio: boolean;
+  /** `selectFallbackMimeType()`, injected — null where nothing WebM records. */
+  fallbackMimeType: string | null;
+}
+
+/** What will actually be recorded. */
+export interface EncodingPlan {
+  engine: EngineKind;
+  /** null ⇒ the browser's own recorder picked, and it does not say what. */
+  videoCodec: VideoCodec | null;
+  container: Container | null;
+  /** null ⇒ no audio track, or the browser's recorder picked. */
+  audioCodec: AudioCodec | null;
+  /** Exactly what `meta.mimeType` will carry (§5). */
+  mimeType: string;
+  /** The requested codec could not be honoured — the §6 UI note hangs off this. */
+  substituted: boolean;
+}
+
+/**
+ * The whole §6 decision in one pure place: which engine, which codec, which
+ * container, which audio codec, and therefore the one string that describes the
+ * file. Returns null when this browser cannot record at all.
+ *
+ * The engine below makes the same decision with real `isConfigSupported()`
+ * answers rather than injected ones, by filling a {@link CodecSupport} as it
+ * probes down {@link codecCandidates} and then calling this — so there is one
+ * rule, not two that have to be kept in step.
+ */
+export function selectEncoding(request: EncodingRequest): EncodingPlan | null {
+  const kind = selectEngineKind(request.caps);
+  if (kind === null) return null;
+
+  if (kind === "webcodecs") {
+    const videoCodec = selectVideoCodec(request.codec, request.support);
+    if (videoCodec) {
+      const container = containerFor(videoCodec);
+      const audioCodec = request.hasAudio
+        ? selectAudioCodec(container, request.support.aac)
+        : null;
+      return {
+        engine: "webcodecs",
+        videoCodec,
+        container,
+        audioCodec,
+        mimeType: containerMimeType(
+          container,
+          videoCodecString(videoCodec, request.width, request.height, request.frameRate),
+          audioCodec,
+        ),
+        // "auto" asked for nothing in particular, so nothing was substituted.
+        substituted: request.codec !== "auto" && videoCodec !== request.codec,
+      };
+    }
+    // WebCodecs is present but could encode nothing we asked of it; the
+    // browser's own recorder is still a recorder.
+  }
+
+  if (!request.fallbackMimeType) return null;
+  return {
+    engine: "mediarecorder",
+    videoCodec: null,
+    // The fallback engine only ever records WebM (§6.2) — Safari's MP4
+    // MediaRecorder is not a path here, because there is no
+    // MediaStreamTrackProcessor to feed the WebCodecs engine on Safari anyway.
+    container: "webm",
+    audioCodec: null,
+    // Whatever MediaRecorder really produces, never a guess at it (§6).
+    mimeType: request.fallbackMimeType,
+    substituted: request.codec !== "auto",
+  };
 }
 
 /** Picks the best engine this browser can run (§6). Throws if it can run none. */
@@ -432,12 +777,25 @@ function trackProcessorCtor(): TrackProcessorCtor | null {
 }
 
 /**
- * lib.dom only carries the AVC extension of the per-frame encode options; the
- * VP9 and AV1 registrations add these (quantizer 0–63 and 0–255 respectively).
+ * lib.dom only carries the AVC extension of the per-frame encode options (`avc:
+ * { quantizer }`, 0–51); the VP9 and AV1 registrations add these, at 0–63 and
+ * 0–255 respectively. Three names for one idea, and each range is its own.
  */
 interface QuantizerEncodeOptions extends VideoEncoderEncodeOptions {
   vp9?: { quantizer: number };
   av1?: { quantizer: number };
+}
+
+/**
+ * The AAC registration's encoder extension, which lib.dom does not carry.
+ * `"aac"` is the default and the one MP4 wants — raw AAC frames, with the
+ * AudioSpecificConfig arriving separately as `decoderConfig.description`; ADTS
+ * frames carry their own headers and would have to be stripped before muxing.
+ * Named explicitly rather than left to the default, because an unknown
+ * dictionary member is ignored by WebIDL while a wrong one is not.
+ */
+interface AacAudioEncoderConfig extends AudioEncoderConfig {
+  aac?: { format: "aac" | "adts" };
 }
 
 function mediaRecorderSupports(type: string): boolean {
@@ -470,6 +828,13 @@ function even(n: number): number {
   return Math.max(2, n - (n % 2));
 }
 
+/** One encoded chunk's bytes, copied out of the codec's own buffer. */
+function chunkBytes(chunk: EncodedVideoChunk | EncodedAudioChunk): Uint8Array {
+  const data = new Uint8Array(chunk.byteLength);
+  chunk.copyTo(data);
+  return data;
+}
+
 /**
  * Monotonic wall clock. The same one capture timestamps are measured against,
  * which is what lets the heartbeat carry the media clock forward by elapsed
@@ -479,32 +844,347 @@ function nowMs(): number {
   return typeof performance !== "undefined" ? performance.now() : Date.now();
 }
 
+// --- Muxing adapter ----------------------------------------------------------
+
+/**
+ * The two muxers behind one door (§6).
+ *
+ * Everything that was hard to get right — the keyframe clock, the heartbeat,
+ * the backpressure valve, the shared zero point and the monotonicity guard, the
+ * audio silence fill — lives above this interface, in the engine, exactly once.
+ * All that differs below it is which library writes which boxes.
+ *
+ * Both implementations are append-only: they hand over bytes at increasing file
+ * offsets and never rewrite one, because the §7 upload has already shipped them.
+ */
+interface MuxerAdapter {
+  addVideo(
+    chunk: EncodedVideoChunk,
+    meta: EncodedVideoChunkMetadata | undefined,
+    timestampUs: number,
+  ): void;
+  addAudio(
+    chunk: EncodedAudioChunk,
+    meta: EncodedAudioChunkMetadata | undefined,
+    timestampUs: number,
+  ): void;
+  finalize(): void;
+}
+
+/**
+ * The tracks as the encoders turned out to describe them, which is why the
+ * muxer is built late: both decoder configs have to be in hand first.
+ */
+interface MuxerInit {
+  video: { codec: VideoCodec; width: number; height: number; frameRate: number };
+  audio: { codec: AudioCodec; sampleRate: number; numberOfChannels: number } | null;
+  /** Muxed bytes and the file offset they belong at. */
+  onData: (data: Uint8Array, position: number) => void;
+}
+
+function createMuxer(init: MuxerInit): MuxerAdapter {
+  return containerFor(init.video.codec) === "mp4"
+    ? new Mp4MuxerAdapter(init)
+    : new WebmMuxerAdapter(init);
+}
+
+/** VP9 and AV1 in WebM, Opus audio — the original path, byte for byte (§6). */
+class WebmMuxerAdapter implements MuxerAdapter {
+  private readonly muxer: WebmMuxer<WebmStreamTarget>;
+
+  constructor(init: MuxerInit) {
+    this.muxer = new WebmMuxer({
+      target: new WebmStreamTarget({ onData: init.onData }),
+      video: {
+        // H.264 never reaches here: WebM cannot carry it and `createMuxer`
+        // routes it to the MP4 adapter.
+        codec: init.video.codec === "av1" ? "V_AV1" : "V_VP9",
+        width: init.video.width,
+        height: init.video.height,
+        frameRate: init.video.frameRate,
+      },
+      audio: init.audio
+        ? {
+            // WebM's codec list has no AAC, so this track is always Opus.
+            codec: "A_OPUS",
+            numberOfChannels: init.audio.numberOfChannels,
+            sampleRate: init.audio.sampleRate,
+          }
+        : undefined,
+      // Monotonic, append-only output: the bytes are uploaded as they appear and
+      // can never be rewritten (§7). This also drops the container duration,
+      // which meta.durationMs carries instead (§6).
+      streaming: true,
+      type: "webm",
+      // Timestamps are already rebased against the engine's shared zero point.
+      firstTimestampBehavior: "permissive",
+    });
+  }
+
+  addVideo(
+    chunk: EncodedVideoChunk,
+    meta: EncodedVideoChunkMetadata | undefined,
+    timestampUs: number,
+  ): void {
+    this.muxer.addVideoChunk(chunk, meta, timestampUs);
+  }
+
+  addAudio(
+    chunk: EncodedAudioChunk,
+    meta: EncodedAudioChunkMetadata | undefined,
+    timestampUs: number,
+  ): void {
+    this.muxer.addAudioChunk(chunk, meta, timestampUs);
+  }
+
+  finalize(): void {
+    this.muxer.finalize();
+  }
+}
+
+/**
+ * H.264 in fragmented MP4 (§6), with AAC or Opus audio.
+ *
+ * `fastStart: "fragmented"` is the fMP4 mode: `ftyp` goes out immediately, the
+ * `moov` (with its `mvex`) rides out with the first fragment, and from then on
+ * the file is a sequence of self-describing `moof`+`mdat` pairs — an MSE
+ * initialization segment followed by media segments, which is exactly what the
+ * player appends (§8). Nothing is ever seeked back over: mp4-muxer does patch
+ * box sizes in place, but only inside the fragment it is still assembling, and
+ * `StreamTarget` coalesces each batch into one contiguous write before it
+ * reaches `onData`. The engine's own position check proves it.
+ *
+ * A fragment is cut when the video track takes a keyframe, so `onData` arrives
+ * once per GOP — at most every {@link KEYFRAME_INTERVAL_US} — rather than per
+ * block as WebM's streaming mode does. That is the one behavioural difference
+ * between the two containers, and it costs one GOP of buffering.
+ *
+ * The encoder must be configured with `avc: { format: "avc" }` (it is, below):
+ * MP4 wants the SPS/PPS in an `avcC` box rather than inline in the bitstream,
+ * and that box is `decoderConfig.description`, which the encoder only emits in
+ * "avc" format. In "annexb" there is no description and the track would have no
+ * decoder configuration at all.
+ */
+class Mp4MuxerAdapter implements MuxerAdapter {
+  private readonly muxer: Mp4Muxer<Mp4StreamTarget>;
+  /**
+   * Whether each track has had its first sample yet — see {@link firstSampleUs}
+   * for why the first one is special.
+   */
+  private started = { video: false, audio: false };
+
+  constructor(init: MuxerInit) {
+    this.muxer = new Mp4Muxer({
+      target: new Mp4StreamTarget({ onData: init.onData }),
+      video: {
+        codec: "avc",
+        width: init.video.width,
+        height: init.video.height,
+        // `frameRate` is deliberately not passed: mp4-muxer would make it the
+        // track timescale and round every sample onto a fixed frame grid.
+        // Screen capture is variable frame rate — a still screen delivers
+        // nothing at all, and the heartbeat lands wherever it lands — so the
+        // default 57600 timescale (~17 µs) is what keeps those timestamps.
+      },
+      audio: init.audio
+        ? {
+            codec: init.audio.codec,
+            numberOfChannels: init.audio.numberOfChannels,
+            sampleRate: init.audio.sampleRate,
+          }
+        : undefined,
+      fastStart: "fragmented",
+      // mp4-muxer has no "permissive": its strict default rejects any track
+      // whose first chunk is not exactly 0, and the second track never is.
+      // "cross-track-offset" shifts *both* tracks by the earlier of the two
+      // first timestamps, which is what the engine's shared zero point already
+      // did — so it is a no-op here, and never the per-track "offset" that
+      // would slide the tracks against each other and break sync.
+      firstTimestampBehavior: "cross-track-offset",
+    });
+  }
+
+  /**
+   * The timestamp to hand mp4-muxer, which is the real one except for the very
+   * first sample of each track, where it is 0.
+   *
+   * mp4-muxer 5.2.2 assumes every track's first sample decodes at 0: on that
+   * sample it sets the track's running clock to 0 outright rather than to where
+   * the sample actually is, and then measures the *next* sample's delta against
+   * that. The first sample's duration therefore comes out too long by exactly
+   * the track's start offset, the running clock stays that far ahead of the
+   * `tfdt` each fragment writes from the real timestamps, and the next fragment
+   * begins with the audio timeline stepping *backwards*.
+   *
+   * Only one track can satisfy that assumption here. The engine rebases both
+   * tracks against one shared zero (see `noteBase`) precisely so they do not
+   * slide against each other, which puts the earlier track at 0 and leaves the
+   * later one wherever capture actually started it — and capture always starts
+   * them a few tens of milliseconds apart. Measured with a 37 ms skew: the
+   * first audio sample claimed a 58 ms duration instead of 21 ms, and the
+   * second fragment opened 16 ms behind the end of the first.
+   *
+   * So the later track's first sample is declared to start at the shared zero.
+   * Its duration then absorbs the offset — one frame plays at most a capture
+   * skew early, which is inaudible — and every sample after it keeps its true
+   * timestamp, so A/V sync is untouched and the running clock is honest from
+   * the start. The alternative, `firstTimestampBehavior: "offset"`, would rebase
+   * each track to its own zero and desynchronise the whole recording instead.
+   *
+   * webm-muxer has no such assumption and needs none of this.
+   */
+  private firstSampleUs(track: "video" | "audio", timestampUs: number): number {
+    if (this.started[track]) return timestampUs;
+    this.started[track] = true;
+    return 0;
+  }
+
+  /**
+   * The `…Raw` methods rather than the convenience ones, because of the
+   * duration.
+   *
+   * `EncodedVideoChunk.duration` is nullable — it mirrors the source
+   * `VideoFrame`'s own nullable duration, which is exactly what a
+   * `MediaStreamTrackProcessor` frame may have (and what the letterbox path
+   * hands on as `duration: frame.duration ?? undefined`). mp4-muxer's
+   * `addVideoChunk` passes that straight into `addVideoChunkRaw`, which
+   * validates `Number.isFinite(duration)` and throws a TypeError on null —
+   * ending the recording through `write()`'s catch. webm-muxer never reads
+   * chunk duration at all, which is why only the fMP4 path ever hit this.
+   *
+   * Zero is a safe stand-in: mp4-muxer only uses the duration as the
+   * *provisional* length of a sample, and refines it the moment the next sample
+   * of that track arrives — which happens before the fragment holding it is
+   * written. Only the very last sample of the file keeps it, and this container
+   * carries no authoritative duration anyway (§6): `meta.durationMs` does.
+   */
+  addVideo(
+    chunk: EncodedVideoChunk,
+    meta: EncodedVideoChunkMetadata | undefined,
+    timestampUs: number,
+  ): void {
+    this.muxer.addVideoChunkRaw(
+      chunkBytes(chunk),
+      chunk.type,
+      this.firstSampleUs("video", timestampUs),
+      chunk.duration ?? 0,
+      meta,
+    );
+  }
+
+  addAudio(
+    chunk: EncodedAudioChunk,
+    meta: EncodedAudioChunkMetadata | undefined,
+    timestampUs: number,
+  ): void {
+    this.muxer.addAudioChunkRaw(
+      chunkBytes(chunk),
+      chunk.type,
+      this.firstSampleUs("audio", timestampUs),
+      chunk.duration ?? 0,
+      meta,
+    );
+  }
+
+  finalize(): void {
+    this.muxer.finalize();
+  }
+}
+
 // --- WebCodecs engine --------------------------------------------------------
 
 type PendingChunk =
   | { track: "video"; chunk: EncodedVideoChunk; meta: EncodedVideoChunkMetadata | undefined }
   | { track: "audio"; chunk: EncodedAudioChunk; meta: EncodedAudioChunkMetadata | undefined };
 
+/**
+ * Everything the video encoder was configured with, decided once by `setup()`
+ * and then read all over the engine: which codec is running, whether it is the
+ * hardware one, how it is being told what quality to aim for, and whether it
+ * accepted the screen-content hint.
+ */
+export interface VideoSetup {
+  codec: VideoCodec;
+  /** Configured with `hardwareAcceleration: "prefer-hardware"`. */
+  hardware: boolean;
+  /**
+   * `"quantizer"` is constant quality, the path this engine is built around;
+   * `"variable"` is the §6 fallback for an encoder that refuses per-frame QP,
+   * and takes a bitrate from {@link bitrateFor} instead.
+   */
+  rateControl: "quantizer" | "variable";
+  /** The probed config carried `contentHint: "text"` (§6 screen-content tuning). */
+  contentHint: boolean;
+}
+
+/**
+ * What is left to try when a video encoder that `isConfigSupported()` approved
+ * turns out to reject its config for real, in the order to try it.
+ *
+ * `isConfigSupported()` is an opinion, not a reservation. A hardware encoder can
+ * answer yes and then refuse the session anyway — every NVENC slot taken by
+ * another capture app, a GPU driver reset — and per-frame QP in particular is
+ * young enough (Chrome 117) that a platform encoder may accept `bitrateMode:
+ * "quantizer"` in a probe and reject it once frames arrive. WebCodecs reports
+ * both asynchronously, through the encoder's error callback rather than out of
+ * `configure()`, so without this the recording simply ended.
+ *
+ * Only the degradations {@link WebCodecsEngine.probeCandidate} itself models,
+ * and only the ones that keep the codec: by the time an encoder can fail this
+ * way the muxer has usually already declared the video track — it opens on the
+ * first chunk of every declared track, and audio normally gets there first — and
+ * a different codec means a different container, a different audio codec and a
+ * different `meta.mimeType`, none of which can be taken back once a byte has
+ * been uploaded (§7). So per-frame quantizer goes first (H.264 has §6's bitrate
+ * table to fall back on; VP9 and AV1 have no such table, so they get no rung
+ * here and behave exactly as they did before), then the hardware encoder.
+ */
+/** A setup in words, for the one console line a fallback is worth. */
+function describeSetup(setup: VideoSetup): string {
+  return `${setup.codec} ${setup.hardware ? "hardware" : "software"} ${setup.rateControl}`;
+}
+
+export function videoFallbackSetups(setup: VideoSetup): VideoSetup[] {
+  if (setup.codec !== "h264") return [];
+  const variable = (s: VideoSetup): VideoSetup => ({ ...s, rateControl: "variable" });
+  const rungs: VideoSetup[] = [];
+  if (setup.rateControl === "quantizer") rungs.push(variable(setup));
+  if (setup.hardware) {
+    const software: VideoSetup = { ...setup, hardware: false };
+    rungs.push(software);
+    if (software.rateControl === "quantizer") rungs.push(variable(software));
+  }
+  return rungs;
+}
+
 class WebCodecsEngine implements RecorderEngine {
   ondata: (bytes: Uint8Array) => void = () => undefined;
   onerror: (err: Error) => void = () => undefined;
 
-  private videoCodec: VideoCodec;
+  private videoSetup: VideoSetup;
+  private container: Container;
+  private audioCodec: AudioCodec = "opus";
   private codecString: string;
   private type: string;
   private hasAudio = true;
   private frameRate = NOMINAL_FRAME_RATE;
-  /** Whether the probed config carried `contentHint` (§6 screen-content tuning). */
-  private contentHint = true;
 
   private stream: MediaStream | null = null;
   /** Set when this browser turned out not to support any WebCodecs config. */
   private delegate: MediaRecorderEngine | null = null;
 
-  private muxer: Muxer<StreamTarget> | null = null;
+  private muxer: MuxerAdapter | null = null;
   private videoEncoder: VideoEncoder | null = null;
   private audioEncoder: AudioEncoder | null = null;
   private videoSize: { width: number; height: number } | null = null;
+  /**
+   * The video encoder has produced at least one chunk, so its config is not
+   * merely approved but working — after which an error really is a failure and
+   * not a late rejection to fall back from (see {@link videoFallbackSetups}).
+   */
+  private videoStarted = false;
+  /** Setups still to try if this one turns out to be rejected. Filled by `setup()`. */
+  private videoFallback: VideoSetup[] = [];
   private audioInput: { sampleRate: number; numberOfChannels: number } | null = null;
   /** The encoded audio format, straight from the encoder's `decoderConfig`. */
   private audioOutput: { sampleRate: number; numberOfChannels: number } | null = null;
@@ -555,9 +1235,20 @@ class WebCodecsEngine implements RecorderEngine {
   private context: OffscreenCanvasRenderingContext2D | null = null;
 
   constructor(private readonly opts: EngineOptions) {
-    this.videoCodec = selectVideoCodec(opts.preferAv1, true);
-    this.codecString = videoCodecString(this.videoCodec, NOMINAL_WIDTH, NOMINAL_HEIGHT);
-    this.type = containerMimeType(this.codecString, this.hasAudio);
+    // The best guess available before anything has been probed: the first rung
+    // of this setting's own chain, which on a desktop Chrome is what setup()
+    // will confirm anyway. Nothing is committed until then.
+    const first = codecCandidates(opts.codec)[0] as CodecCandidate;
+    this.videoSetup = {
+      codec: first.codec,
+      hardware: first.hardware,
+      rateControl: "quantizer",
+      contentHint: true,
+    };
+    this.container = containerFor(first.codec);
+    this.audioCodec = selectAudioCodec(this.container, true);
+    this.codecString = videoCodecString(first.codec, NOMINAL_WIDTH, NOMINAL_HEIGHT);
+    this.type = containerMimeType(this.container, this.codecString, this.audioCodec);
   }
 
   get mimeType(): string {
@@ -581,7 +1272,7 @@ class WebCodecsEngine implements RecorderEngine {
     this.frameRate = Math.max(1, Math.round(settings.frameRate ?? NOMINAL_FRAME_RATE));
     this.retype(
       videoCodecString(
-        this.videoCodec,
+        this.videoSetup.codec,
         settings.width ?? NOMINAL_WIDTH,
         settings.height ?? NOMINAL_HEIGHT,
         this.frameRate,
@@ -619,11 +1310,16 @@ class WebCodecsEngine implements RecorderEngine {
   }
 
   /**
-   * Picks the codec: AV1 when it was asked for and this browser can encode it,
-   * else VP9, else the browser's own recorder (§6). A codec only wins if the
-   * encoder can produce it *and* the player could feed the result to MSE —
-   * otherwise every viewer would fall back to downloading the whole file, and
-   * MediaRecorder's VP9 is the better trade.
+   * Decides what will be recorded (§6): walks this setting's fallback chain,
+   * asking `isConfigSupported()` about each rung until one answers yes, then
+   * hands the answers to `selectEncoding()` so the decision itself is made in
+   * exactly one place — the pure one the tests drive.
+   *
+   * A codec only wins if the encoder can produce it *and* the player could feed
+   * the result to MSE; otherwise every viewer would fall back to downloading
+   * the whole file, and another codec is the better trade. Probing stops at the
+   * first rung that passes, so the common case (hardware H.264 on `"auto"`) is
+   * one probe, not four.
    *
    * The size used here is the track's, which is what the capture constraints
    * asked for; the first frame gets the final say on the level digits.
@@ -632,62 +1328,188 @@ class WebCodecsEngine implements RecorderEngine {
     const width = settings.width ?? NOMINAL_WIDTH;
     const height = settings.height ?? NOMINAL_HEIGHT;
 
-    const av1Supported = this.opts.preferAv1 && (await this.codecUsable("av1", width, height));
-    const codec = selectVideoCodec(this.opts.preferAv1, av1Supported);
-    if (codec === "av1" || (await this.codecUsable("vp9", width, height))) {
-      this.videoCodec = codec;
-      this.retype(videoCodecString(codec, width, height, this.frameRate));
+    // Probed first, because it decides which audio codec goes in the mime type
+    // the video probes below have to be playable as.
+    const support: CodecSupport = {
+      h264Hardware: false,
+      h264: false,
+      vp9: false,
+      av1: false,
+      aac: this.hasAudio && (await this.aacUsable()),
+    };
+
+    // In chain order, so the flags this fills in are exactly the ones
+    // `selectVideoCodec` needs: everything before the winner is a known no.
+    let winner: VideoSetup | null = null;
+    for (const candidate of codecCandidates(this.opts.codec)) {
+      const probed = await this.probeCandidate(candidate, width, height, support.aac);
+      if (!probed) continue;
+      winner = probed;
+      if (candidate.codec === "h264") {
+        support.h264 = true;
+        support.h264Hardware = candidate.hardware;
+      } else {
+        support[candidate.codec] = true;
+      }
+      break;
+    }
+
+    const plan = selectEncoding({
+      codec: this.opts.codec,
+      caps: detectCapabilities(),
+      support,
+      width,
+      height,
+      frameRate: this.frameRate,
+      hasAudio: this.hasAudio,
+      fallbackMimeType: selectFallbackMimeType(),
+    });
+
+    if (!winner || plan?.engine !== "webcodecs" || !plan.container) {
+      this.startDelegate("no supported WebCodecs configuration");
       return;
     }
 
-    this.startDelegate("no supported WebCodecs configuration");
+    this.videoSetup = winner;
+    // What to drop to if the encoder rejects this config for real, once frames
+    // are flowing and `isConfigSupported()`'s opinion is behind us.
+    this.videoFallback = videoFallbackSetups(winner);
+    this.container = plan.container;
+    this.audioCodec = plan.audioCodec ?? selectAudioCodec(plan.container, support.aac);
+    // `plan.substituted` is deliberately not surfaced on the engine: §6's
+    // interface carries `mimeType` and nothing else, and the page names the
+    // fallback from that one string — which is also the only answer that stays
+    // right when the MediaRecorder engine happens to record the very codec that
+    // was asked for.
+    this.retype(videoCodecString(winner.codec, width, height, this.frameRate));
   }
 
-  /** Encodable here *and* playable through MSE there. Records the winning shape. */
-  private async codecUsable(codec: VideoCodec, width: number, height: number): Promise<boolean> {
-    const codecString = videoCodecString(codec, width, height, this.frameRate);
-    if (!mseSupported(containerMimeType(codecString, this.hasAudio))) return false;
+  /**
+   * Encodable here *and* playable through MSE there, at one rung of the chain.
+   * Returns the exact shape that worked, because "supported" is not one answer
+   * but four: the codec, the acceleration, how rate control is expressed, and
+   * whether the screen-content hint was accepted.
+   */
+  private async probeCandidate(
+    candidate: CodecCandidate,
+    width: number,
+    height: number,
+    aac: boolean,
+  ): Promise<VideoSetup | null> {
+    const container = containerFor(candidate.codec);
+    const codecString = videoCodecString(candidate.codec, width, height, this.frameRate);
+    const mimeType = containerMimeType(
+      container,
+      codecString,
+      this.hasAudio ? selectAudioCodec(container, aac) : null,
+    );
+    if (!mseSupported(mimeType)) return null;
 
-    // contentHint is young enough that a browser may know the field and refuse
-    // the value, which is no reason to give up a whole codec.
-    for (const contentHint of [true, false]) {
-      try {
-        const support = await VideoEncoder.isConfigSupported(
-          this.videoConfig(codecString, even(width), even(height), contentHint),
-        );
-        if (support.supported !== true) continue;
-      } catch {
-        // A browser that rejects the config outright is telling us the same
-        // thing as `supported: false`.
-        continue;
+    // Rate control first: constant quality is the whole point of this engine,
+    // and a bitrate with the content hint is a worse recording than a quantizer
+    // without it. Per-frame QP is young (Chrome 117) and platform encoders
+    // vary, so a hardware H.264 encoder refusing it is an expected answer, not
+    // a broken one — but only H.264 has the §6 bitrate table to fall back on.
+    const modes: readonly VideoSetup["rateControl"][] =
+      candidate.codec === "h264" ? ["quantizer", "variable"] : ["quantizer"];
+
+    for (const rateControl of modes) {
+      // contentHint is young enough that a browser may know the field and
+      // refuse the value, which is no reason to give up a whole codec.
+      for (const contentHint of [true, false]) {
+        const setup: VideoSetup = { ...candidate, rateControl, contentHint };
+        try {
+          const support = await VideoEncoder.isConfigSupported(
+            this.videoConfig(setup, codecString, even(width), even(height)),
+          );
+          if (support.supported !== true) continue;
+        } catch {
+          // A browser that rejects the config outright is telling us the same
+          // thing as `supported: false`.
+          continue;
+        }
+        return setup;
       }
-      this.contentHint = contentHint;
-      return true;
     }
-    return false;
+    return null;
+  }
+
+  /**
+   * Whether this browser has an AAC encoder for a given audio format (§6).
+   *
+   * Asked twice. First at the §6 mix's own shape — 48 kHz mono — before any
+   * audio has arrived, so the answer is in hand when the video probes need to
+   * know which mime type to check; then again at whatever format the capture
+   * actually delivers, because that is the config the encoder will be handed
+   * and a probe of a different one proves nothing about it. Missing in Firefox
+   * everywhere and in every browser on desktop Linux, where MP4 gets an Opus
+   * track instead.
+   */
+  private async aacUsable(sampleRate = NOMINAL_SAMPLE_RATE, numberOfChannels = 1): Promise<boolean> {
+    if (typeof AudioEncoder?.isConfigSupported !== "function") return false;
+    try {
+      const support = await AudioEncoder.isConfigSupported(
+        this.audioConfig("aac", sampleRate, numberOfChannels),
+      );
+      return support.supported === true;
+    } catch {
+      return false;
+    }
   }
 
   private videoConfig(
+    setup: VideoSetup,
     codec: string,
     width: number,
     height: number,
-    contentHint: boolean,
   ): VideoEncoderConfig {
     const config: VideoEncoderConfig = {
       codec,
       width,
       height,
       framerate: this.frameRate,
-      // Constant quality: `bitrate` is ignored, every frame carries its own
-      // quantizer instead (§6).
-      bitrateMode: "quantizer",
-      // "realtime" runs libvpx's fast motion search — 5-10x faster than
-      // "quality", which cannot keep up with native-resolution capture (§6).
-      // Same quantizer, so text stays as sharp; files run somewhat larger.
+      bitrateMode: setup.rateControl,
+      // "realtime" runs the fast motion search — 5-10x faster than "quality",
+      // which cannot keep up with native-resolution capture (§6). Same
+      // quantizer, so text stays as sharp; files run somewhat larger.
       latencyMode: "realtime",
     };
+    // In quantizer mode `bitrate` is ignored — every frame carries its own
+    // quantizer instead (§6). Only where the encoder refused that does the
+    // config carry a number of bits, scaled to the frame.
+    if (setup.rateControl === "variable") {
+      config.bitrate = bitrateFor(this.opts.quality, width, height);
+    }
+    if (setup.codec === "h264") {
+      // A preference, not a promise — the spec has no "require-hardware", so
+      // this is as close as a config gets to asking for the GPU encoder that
+      // makes 4K capture free. "no-preference" is the second rung of the H.264
+      // chain, where the software encoder is accepted.
+      config.hardwareAcceleration = setup.hardware ? "prefer-hardware" : "no-preference";
+      // MP4 keeps the SPS/PPS in an `avcC` box, not inline in the bitstream:
+      // "avc" is what makes the encoder hand them over as
+      // `decoderConfig.description`, which is that box (see `Mp4MuxerAdapter`).
+      config.avc = { format: "avc" };
+    }
     // Screen content: keep text edges crisp rather than smoothing for motion.
-    if (contentHint) config.contentHint = "text";
+    if (setup.contentHint) config.contentHint = "text";
+    return config;
+  }
+
+  /** The audio encoder's config, shared by the AAC probe and the real one. */
+  private audioConfig(
+    codec: AudioCodec,
+    sampleRate: number,
+    numberOfChannels: number,
+  ): AacAudioEncoderConfig {
+    const config: AacAudioEncoderConfig = {
+      codec: AUDIO_CODEC_STRINGS[codec],
+      sampleRate,
+      numberOfChannels,
+      bitrate: codec === "aac" ? AAC_BITRATE : OPUS_BITRATE,
+    };
+    // Raw AAC frames; the AudioSpecificConfig arrives as decoderConfig instead.
+    if (codec === "aac") config.aac = { format: "aac" };
     return config;
   }
 
@@ -707,7 +1529,11 @@ class WebCodecsEngine implements RecorderEngine {
 
   private retype(codecString: string): void {
     this.codecString = codecString;
-    this.type = containerMimeType(codecString, this.hasAudio);
+    this.type = containerMimeType(
+      this.container,
+      codecString,
+      this.hasAudio ? this.audioCodec : null,
+    );
   }
 
   // --- Video -----------------------------------------------------------------
@@ -754,10 +1580,15 @@ class WebCodecsEngine implements RecorderEngine {
   }
 
   private configureVideo(frame: VideoFrame): void {
-    const width = even(frame.displayWidth);
-    const height = even(frame.displayHeight);
+    // Decided once, from the first frame ever seen: a retry after a rejected
+    // config must configure the encoder at the size the muxer already declared,
+    // and a window resized in between goes through `fit()` like any other.
+    const size = this.videoSize ?? {
+      width: even(frame.displayWidth),
+      height: even(frame.displayHeight),
+    };
     // The real frame size, so the level in the codec string is honest (§5).
-    this.retype(videoCodecString(this.videoCodec, width, height, this.frameRate));
+    this.retype(videoCodecString(this.videoSetup.codec, size.width, size.height, this.frameRate));
 
     // Before openMuxer() below, never after: with no audio track the muxer opens
     // on this very call, and it freezes the zero point. Leaving that until
@@ -766,11 +1597,11 @@ class WebCodecsEngine implements RecorderEngine {
 
     const encoder = new VideoEncoder({
       output: (chunk, meta) => this.onVideoChunk(chunk, meta),
-      error: (err) => this.fail(err),
+      error: (err) => this.onVideoEncoderError(encoder, err),
     });
-    encoder.configure(this.videoConfig(this.codecString, width, height, this.contentHint));
+    encoder.configure(this.videoConfig(this.videoSetup, this.codecString, size.width, size.height));
     this.videoEncoder = encoder;
-    this.videoSize = { width, height };
+    this.videoSize = size;
     this.openMuxer();
     // There is a picture to repeat from here on, so start watching for
     // stillness. Nothing catches a throw out of a timer callback the way the
@@ -813,9 +1644,15 @@ class WebCodecsEngine implements RecorderEngine {
     if (!keyFrame && droppable && encoder.encodeQueueSize > MAX_ENCODE_QUEUE) return;
 
     const options: QuantizerEncodeOptions = { keyFrame };
-    const quantizer = quantizerFor(this.videoCodec, this.opts.quality);
-    if (this.videoCodec === "av1") options.av1 = { quantizer };
-    else options.vp9 = { quantizer };
+    // Each codec's per-frame quantizer has its own name and its own range, and
+    // none of them mean anything to an encoder in variable-bitrate mode.
+    if (this.videoSetup.rateControl === "quantizer") {
+      const codec = this.videoSetup.codec;
+      const quantizer = quantizerFor(codec, this.opts.quality);
+      if (codec === "av1") options.av1 = { quantizer };
+      else if (codec === "h264") options.avc = { quantizer };
+      else options.vp9 = { quantizer };
+    }
 
     const source = this.fit(frame);
     try {
@@ -980,7 +1817,69 @@ class WebCodecsEngine implements RecorderEngine {
   }
 
   private onVideoChunk(chunk: EncodedVideoChunk, meta: EncodedVideoChunkMetadata | undefined): void {
+    // This config works, whatever `isConfigSupported()` thought: from here an
+    // encoder error is a real failure, not a late rejection to fall back from.
+    this.videoStarted = true;
     this.push({ track: "video", chunk, meta });
+  }
+
+  /**
+   * A video encoder that gave up. Before it produced anything that is a
+   * configuration rejection arriving the only way WebCodecs delivers one — a
+   * queued task into this callback, never a throw out of `configure()` — so the
+   * next rung of {@link videoFallbackSetups} gets a turn before the recording
+   * is declared over. After the first chunk it is what it has always been: the
+   * end of the recording.
+   */
+  private onVideoEncoderError(encoder: VideoEncoder, err: unknown): void {
+    // A superseded encoder complaining about the config we already left behind.
+    if (this.videoEncoder !== encoder) return;
+    if (this.videoStarted || this.stopped || this.failure) {
+      this.fail(err);
+      return;
+    }
+    const next = this.videoFallback.shift();
+    if (!next) {
+      this.fail(err);
+      return;
+    }
+    console.warn(
+      `[videoshare] the ${describeSetup(this.videoSetup)} video encoder rejected its ` +
+        `configuration; retrying as ${describeSetup(next)}`,
+      err,
+    );
+    this.videoEncoder = null;
+    this.videoSetup = next;
+    // A fresh encoder starts a fresh GOP, whatever the old one was told.
+    this.lastKeyframeUs = Number.NEGATIVE_INFINITY;
+    this.restartVideo();
+  }
+
+  /**
+   * Brings the video encoder back up on the setup now in `videoSetup`, from the
+   * retained frame so a screen that has gone still does not have to move again
+   * first — the heartbeat submits that frame as soon as the encoder is up.
+   * With no frame retained there is nothing to configure from and the next one
+   * off the capture track does it instead.
+   */
+  private restartVideo(): void {
+    for (;;) {
+      const frame = this.retained;
+      if (!frame) return;
+      try {
+        this.configureVideo(frame);
+        return;
+      } catch (err) {
+        // A synchronous rejection — an invalid config rather than an
+        // unsupported one — is the same answer, one rung earlier.
+        const next = this.videoFallback.shift();
+        if (!next) {
+          this.fail(err);
+          return;
+        }
+        this.videoSetup = next;
+      }
+    }
   }
 
   // --- Audio -----------------------------------------------------------------
@@ -1001,7 +1900,11 @@ class WebCodecsEngine implements RecorderEngine {
         if (done || !value) return;
         try {
           if (this.stopped || this.failure) return;
-          if (!this.audioEncoder) this.configureAudio(value);
+          // Awaited, so the AAC support question is asked at this capture's
+          // real format before an encoder is built on the answer. The pump is
+          // sequential, so nothing else reads a half-configured encoder.
+          if (!this.audioEncoder) await this.configureAudio(value);
+          if (this.stopped || this.failure) return;
           this.noteBase(value.timestamp);
           const encoder = this.audioEncoder;
           if (encoder && encoder.state === "configured") {
@@ -1025,23 +1928,82 @@ class WebCodecsEngine implements RecorderEngine {
   /**
    * §6 asks for 48 kHz mono, which is what the capture graph produces (the
    * mixing destination is mono and Chrome's AudioContext runs at 48 kHz). The
-   * encoder is still told the format it is actually being handed: a mismatch
-   * there is rejected outright, and reporting the real rate keeps the container
-   * honest for the rare 44.1 kHz device.
+   * encoder is still told the format it is actually being handed: an encoder
+   * fed something other than what it was configured for fails outright, and
+   * reporting the real rate keeps the container honest for the device that
+   * runs its AudioContext somewhere else.
    */
-  private configureAudio(data: AudioData): void {
+  private async configureAudio(data: AudioData): Promise<void> {
+    // The §6 probe asked about 48 kHz mono, which is what the mixing graph
+    // produces — but the AudioContext runs at the device's rate, and a
+    // Bluetooth headset in its headset profile hands over 16 kHz. Ask again at
+    // the format actually arriving, before an encoder is built on the old
+    // answer: for a valid config the platform simply cannot encode, WebCodecs
+    // says so through the error callback rather than out of `configure()`, and
+    // that callback used to end the recording.
+    if (this.audioCodec === "aac" && !(await this.aacUsable(data.sampleRate, data.numberOfChannels))) {
+      console.warn("[videoshare] no AAC encoder for this capture's audio format; using Opus in MP4");
+      this.useOpus();
+    }
+    if (this.stopped || this.failure) return;
+    this.audioInput = { sampleRate: data.sampleRate, numberOfChannels: data.numberOfChannels };
+    this.openAudioEncoder(this.audioCodec, data.sampleRate, data.numberOfChannels);
+  }
+
+  private openAudioEncoder(
+    codec: AudioCodec,
+    sampleRate: number,
+    numberOfChannels: number,
+  ): void {
     const encoder = new AudioEncoder({
       output: (chunk, meta) => this.onAudioChunk(chunk, meta),
-      error: (err) => this.fail(err),
+      error: (err) => this.onAudioEncoderError(encoder, err),
     });
-    encoder.configure({
-      codec: "opus",
-      sampleRate: data.sampleRate,
-      numberOfChannels: data.numberOfChannels,
-      bitrate: OPUS_BITRATE,
-    });
+    try {
+      encoder.configure(this.audioConfig(codec, sampleRate, numberOfChannels));
+    } catch (err) {
+      // An outright invalid config, which `configure()` does throw for. Nothing
+      // has been muxed yet — the muxer opens on the first audio *chunk* — so
+      // the track can still become Opus, which every browser with WebCodecs
+      // can encode.
+      if (codec !== "aac") throw err;
+      console.warn("[videoshare] AAC rejected this capture's audio format; using Opus in MP4", err);
+      this.useOpus();
+      encoder.configure(this.audioConfig("opus", sampleRate, numberOfChannels));
+    }
     this.audioEncoder = encoder;
-    this.audioInput = { sampleRate: data.sampleRate, numberOfChannels: data.numberOfChannels };
+  }
+
+  /**
+   * The AAC encoder gave up. Before it produced a chunk that is the platform
+   * refusing the config asynchronously — the normal way WebCodecs refuses one —
+   * and nothing is committed yet: the muxer opens on the first audio chunk, so
+   * the track can still be rebuilt as Opus rather than taking the whole
+   * recording down. After the first chunk the header says AAC and the file
+   * cannot change its mind, so it is a failure like any other.
+   */
+  private onAudioEncoderError(encoder: AudioEncoder, err: unknown): void {
+    // A superseded encoder complaining about the codec we already left behind.
+    if (this.audioEncoder !== encoder) return;
+    const input = this.audioInput;
+    if (this.audioCodec !== "aac" || this.audioOutput || this.stopped || this.failure || !input) {
+      this.fail(err);
+      return;
+    }
+    console.warn("[videoshare] the AAC encoder rejected this capture's audio; using Opus in MP4", err);
+    this.useOpus();
+    this.audioEncoder = null;
+    try {
+      this.openAudioEncoder("opus", input.sampleRate, input.numberOfChannels);
+    } catch (retryErr) {
+      this.fail(retryErr);
+    }
+  }
+
+  /** Moves the audio track to Opus, and the mime type with it (§5). */
+  private useOpus(): void {
+    this.audioCodec = "opus";
+    this.retype(this.codecString);
   }
 
   /**
@@ -1098,8 +2060,9 @@ class WebCodecsEngine implements RecorderEngine {
    * Keeps the audio clock ahead of the video clock once the audio track has
    * ended, by encoding real silence.
    *
-   * webm-muxer interleaves the two tracks: it writes a video block only once
-   * the audio timestamp has passed it, and queues the block otherwise. With the
+   * Both muxers interleave the two tracks the same way: a video block is
+   * written only once the audio timestamp has passed it, and queued otherwise —
+   * webm-muxer to keep a cluster in order, mp4-muxer to fill a fragment. With the
    * audio clock frozen at the moment the track ended, every later video chunk
    * would sit in that queue — no `ondata`, so the streaming upload (§7) stalls,
    * the progress readout freezes, and the whole remainder of the recording
@@ -1166,11 +2129,15 @@ class WebCodecsEngine implements RecorderEngine {
 
   /**
    * One zero point for both tracks. Rebasing the tracks independently — which
-   * is exactly what the muxer's `firstTimestampBehavior: "offset"` does — would
-   * slide them against each other and break sync from the first frame, because
-   * audio and video never start on the same microsecond. Frozen once the muxer
-   * exists, which is only after every track present has produced a chunk, so by
-   * then this really is the earliest timestamp of the recording.
+   * is exactly what either muxer's `firstTimestampBehavior: "offset"` does —
+   * would slide them against each other and break sync from the first frame,
+   * because audio and video never start on the same microsecond. Frozen once
+   * the muxer exists, which is only after every track present has produced a
+   * chunk, so by then this really is the earliest timestamp of the recording.
+   *
+   * It is also what lets both adapters be handed timestamps the muxer has no
+   * work left to do on: WebM's "permissive" and MP4's "cross-track-offset" both
+   * come out as the identity once the earliest chunk written is already 0.
    */
   private noteBase(timestamp: number): void {
     if (this.muxer) return;
@@ -1182,10 +2149,10 @@ class WebCodecsEngine implements RecorderEngine {
   }
 
   /**
-   * Built late, and only once every declared track can be described: in
-   * streaming mode webm-muxer writes the Tracks element (with the Opus and AV1
-   * CodecPrivate blobs) lazily on the first block, and both tracks' decoder
-   * configs have to be in hand by then.
+   * Built late, and only once every declared track can be described: both
+   * muxers write their track headers from the encoders' decoder configs — the
+   * Opus/AV1 CodecPrivate blobs in WebM, the `avcC`/`esds` boxes in MP4 — and
+   * those have to be in hand by then.
    *
    * `force` is the stop path: whatever we have becomes the file.
    */
@@ -1201,24 +2168,21 @@ class WebCodecsEngine implements RecorderEngine {
     }
 
     const audio = this.audioOutput;
-    this.muxer = new Muxer({
-      target: new StreamTarget({ onData: (data, position) => this.emit(data, position) }),
+    this.muxer = createMuxer({
       video: {
-        codec: this.videoCodec === "av1" ? "V_AV1" : "V_VP9",
+        codec: this.videoSetup.codec,
         width: this.videoSize.width,
         height: this.videoSize.height,
         frameRate: this.frameRate,
       },
       audio: audio
-        ? { codec: "A_OPUS", numberOfChannels: audio.numberOfChannels, sampleRate: audio.sampleRate }
-        : undefined,
-      // Monotonic, append-only output: the bytes are uploaded as they appear and
-      // can never be rewritten (§7). This also drops the container duration,
-      // which meta.durationMs carries instead (§6).
-      streaming: true,
-      type: "webm",
-      // Timestamps are already rebased against the shared zero point above.
-      firstTimestampBehavior: "permissive",
+        ? {
+            codec: this.audioCodec,
+            numberOfChannels: audio.numberOfChannels,
+            sampleRate: audio.sampleRate,
+          }
+        : null,
+      onData: (data, position) => this.emit(data, position),
     });
 
     const queued = this.pending.splice(0).sort((a, b) => a.chunk.timestamp - b.chunk.timestamp);
@@ -1235,8 +2199,8 @@ class WebCodecsEngine implements RecorderEngine {
     if (!muxer || this.failure) return;
     const timestamp = this.rebase(entry.chunk.timestamp);
     try {
-      if (entry.track === "video") muxer.addVideoChunk(entry.chunk, entry.meta, timestamp);
-      else muxer.addAudioChunk(entry.chunk, entry.meta, timestamp);
+      if (entry.track === "video") muxer.addVideo(entry.chunk, entry.meta, timestamp);
+      else muxer.addAudio(entry.chunk, entry.meta, timestamp);
     } catch (err) {
       this.fail(err);
     }
@@ -1244,9 +2208,10 @@ class WebCodecsEngine implements RecorderEngine {
 
   private emit(data: Uint8Array, position: number): void {
     if (position !== this.written) {
-      // Streaming mode is append-only, so this cannot happen — but if it ever
-      // did, the bytes already uploaded would be wrong and no rewrite is
-      // possible, so stop instead of shipping a corrupt video.
+      // Both muxers are append-only in the modes this engine uses, so this
+      // cannot happen — but if it ever did, the bytes already uploaded would be
+      // wrong and no rewrite is possible, so stop instead of shipping a corrupt
+      // video.
       this.fail(new Error(`encoder: muxer wrote at ${position}, expected ${this.written}`));
       return;
     }

@@ -7,6 +7,17 @@
  */
 export type Quality = "smaller" | "standard" | "sharper";
 
+/**
+ * Which video codec the WebCodecs engine should aim for (SPEC §6/§9).
+ *
+ * `"auto"` takes hardware H.264 when the browser offers it and VP9 otherwise —
+ * the choice that keeps frames from being dropped at native Retina resolution
+ * without asking the user to know why. The explicit values are a promise about
+ * intent, not about the result: a codec this browser cannot encode falls back
+ * down the same chain, and the page says which one was actually used.
+ */
+export type CodecChoice = "auto" | "h264" | "vp9" | "av1";
+
 /** Plaintext metadata for one video, encrypted into `{id}/meta.json`. */
 export interface VideoMeta {
   /** Format version. */
@@ -37,8 +48,11 @@ export interface Settings {
   publicBaseUrl: string;
   /** Constant-quality target for the WebCodecs engine. */
   quality: Quality;
-  /** Prefer AV1 over VP9 when the browser can encode it — smaller files, fewer viewers. */
-  preferAv1: boolean;
+  /**
+   * Which codec to record with (SPEC §9). Replaced the older `preferAv1`
+   * boolean, which loads as `codec: "av1"` and is dropped on the next save.
+   */
+  codec: CodecChoice;
   /** Fallback MediaRecorder engine only; the WebCodecs engine is quantizer-driven. */
   videoBitsPerSecond: number;
 }

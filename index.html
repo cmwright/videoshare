@@ -118,22 +118,31 @@
                 type="number"
                 min="100000"
                 step="100000"
-                value="1200000"
+                value="2500000"
               />
               <p class="muted hint">
-                Only used on browsers without WebCodecs (Firefox, Safari), where recording falls back
-                to MediaRecorder. Ignored in Chrome and Edge.
+                Only used where recording falls back to the browser's own MediaRecorder — Firefox,
+                and anything else without the WebCodecs pieces this app needs. Normally ignored in
+                Chrome and Edge, which encode through WebCodecs, but they use it too if no WebCodecs
+                configuration works.
               </p>
             </div>
 
             <div class="field wide">
-              <label class="toggle">
-                <input id="preferAv1" name="preferAv1" type="checkbox" />
-                <span>Encode with AV1 when this browser supports it</span>
-              </label>
+              <label for="codec">Video codec</label>
+              <select id="codec" name="codec">
+                <option value="auto" selected>Auto — hardware H.264 when available (recommended)</option>
+                <option value="h264">H.264 — hardware where available, larger files, widest playback</option>
+                <option value="vp9">VP9 — smallest files, software, may drop frames at high resolution</option>
+                <option value="av1">AV1 — smallest, some Safari viewers can't play</option>
+              </select>
               <p class="muted hint">
-                AV1 makes recordings roughly 30–50% smaller than VP9, but viewers on Safari without
-                AV1 hardware decode cannot play them. Leave off if you share links widely.
+                Chrome and Edge only. Hardware H.264 encodes 4K without dropping frames; the software
+                codecs trade that for smaller uploads. If the codec you pick isn't available here, the
+                recorder falls back and says which one it used — H.264 itself falls back to a software
+                H.264 encoder, which is slower and no smaller. For Safari viewers, H.264 also needs a
+                recording machine with an AAC encoder: without one (desktop Linux) the MP4 carries
+                Opus audio, which Safari cannot play.
               </p>
             </div>
           </div>

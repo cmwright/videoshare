@@ -1,4 +1,4 @@
-import type { GatewayConfig, LibraryEntry, Quality, Settings } from "./types";
+import type { CodecChoice, GatewayConfig, LibraryEntry, Quality, Settings } from "./types";
 
 const SETTINGS_KEY = "videoshare.settings";
 const LIBRARY_KEY = "videoshare.library";
@@ -6,20 +6,26 @@ const GATEWAY_DOCS = "docs/gateway-setup.md";
 
 export const DEFAULT_REGION = "us-east-1";
 export const DEFAULT_QUALITY: Quality = "standard";
-export const DEFAULT_PREFER_AV1 = false;
+export const DEFAULT_CODEC: CodecChoice = "auto";
 /** Fallback MediaRecorder engine only (SPEC §6/§9). */
 export const DEFAULT_VIDEO_BITS_PER_SECOND = 2_500_000;
 
 /** Every accepted `quality` value, in UI order. */
 export const QUALITIES: readonly Quality[] = ["smaller", "standard", "sharper"];
 
+/** Every accepted `codec` value, in UI order (SPEC §9). */
+export const CODECS: readonly CodecChoice[] = ["auto", "h264", "vp9", "av1"];
+
 /** Every field of a stored object is untrusted until normalized. */
 type Raw<T> = { [K in keyof T]?: unknown };
+
+/** What localStorage may hold: today's shape, plus the fields older builds wrote. */
+type StoredSettings = Raw<Settings> & { preferAv1?: unknown };
 
 export function loadSettings(): Settings | null {
   const raw = readJson(SETTINGS_KEY);
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
-  const settings = normalizeSettings(raw as Raw<Settings>);
+  const settings = normalizeSettings(raw as StoredSettings);
   if (!settings.endpoint || !settings.bucket || !settings.accessKeyId || !settings.secretAccessKey) {
     return null;
   }
@@ -154,7 +160,7 @@ function writeLibrary(entries: LibraryEntry[]): void {
   }
 }
 
-function normalizeSettings(raw: Raw<Settings>): Settings {
+function normalizeSettings(raw: StoredSettings): Settings {
   return {
     endpoint: trimTrailingSlash(text(raw.endpoint).trim()),
     region: text(raw.region).trim() || DEFAULT_REGION,
@@ -165,7 +171,7 @@ function normalizeSettings(raw: Raw<Settings>): Settings {
     // Settings written before the two-engine rewrite carry neither key; both
     // fall back to their defaults rather than failing the load (SPEC §9).
     quality: quality(raw.quality),
-    preferAv1: raw.preferAv1 === true,
+    codec: codec(raw.codec, raw.preferAv1),
     videoBitsPerSecond: wholeNumber(raw.videoBitsPerSecond, DEFAULT_VIDEO_BITS_PER_SECOND, 1),
   };
 }
@@ -222,6 +228,22 @@ function text(value: unknown): string {
 
 function quality(value: unknown): Quality {
   return QUALITIES.find((allowed) => allowed === value) ?? DEFAULT_QUALITY;
+}
+
+/**
+ * The codec choice, migrating settings written before it existed (SPEC §9).
+ *
+ * `preferAv1: true` was the only way to ask for a specific codec, so it becomes
+ * `"av1"`; `preferAv1: false` meant "whatever is best", which is now `"auto"`
+ * and no longer means VP9. `codec` wins whenever it is present and valid, so a
+ * saved choice is never overruled by a stale boolean — and since
+ * `normalizeSettings` rebuilds the object from these keys alone, the old field
+ * is dropped by the next `saveSettings`.
+ */
+function codec(value: unknown, legacyPreferAv1: unknown): CodecChoice {
+  const chosen = CODECS.find((allowed) => allowed === value);
+  if (chosen) return chosen;
+  return legacyPreferAv1 === true ? "av1" : DEFAULT_CODEC;
 }
 
 function wholeNumber(value: unknown, fallback: number, min: number): number {
