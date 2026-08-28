@@ -7,13 +7,17 @@
  *
  * INVARIANT (SPEC §15): the gateway never proxies object bytes. It answers with
  * presigned URLs or with an error; there is no proxy mode and none may be
- * added. Nothing in this package fetches, streams or buffers bucket objects.
+ * added. Nothing in this package reads a stored object back out of a bucket.
+ * The single, deliberately bounded exception is §16.3's analytics beacon: a
+ * write-only, ≤ 16 KiB block of opaque ciphertext, with no read path at all.
  */
 
+import type { AnalyticsStore } from "./analytics.ts";
+import { AnalyticsStoreError, MAX_BEACON_BYTES, createAnalyticsStore } from "./analytics.ts";
 import type { AuthConfig, Authenticator } from "./auth.ts";
 import { GOOGLE_ISSUERS, GOOGLE_JWKS_URL, createAuthenticator, parseAllowedEmails, splitList } from "./auth.ts";
 import type { BucketConfig, Presigner } from "./presign.ts";
-import { createPresigner, parseSignRequest } from "./presign.ts";
+import { ID_PATTERN, createPresigner, parseSignRequest } from "./presign.ts";
 
 /** Every adapter passes the same names (SPEC §15.2); Worker vars and `process.env` both fit. */
 export interface GatewayEnv {
@@ -27,6 +31,8 @@ export interface GatewayEnv {
   ALLOWED_EMAILS?: string | undefined;
   ALLOWED_ORIGINS?: string | undefined;
   PRESIGN_EXPIRY_SECONDS?: string | undefined;
+  /** Optional (SPEC §16.4). Unset means analytics is off, which is supported. */
+  ANALYTICS_BUCKET?: string | undefined;
   /** Test-only overrides (SPEC §15.6); default to Google's. */
   OIDC_JWKS_URL?: string | undefined;
   OIDC_ISSUER?: string | undefined;
@@ -40,6 +46,12 @@ export interface GatewayConfig {
   allowedOrigins: Set<string>;
   auth: AuthConfig;
   bucket: BucketConfig;
+  /**
+   * The analytics bucket (SPEC §16.4), or null when `ANALYTICS_BUCKET` is unset.
+   * Same account, same credentials, same endpoint — a different bucket, because
+   * §3's is world-readable and watch data must never land in it.
+   */
+  analytics: BucketConfig | null;
 }
 
 /**
@@ -93,7 +105,7 @@ export async function handleRequest(request: Request, env: GatewayEnv): Promise<
   if (request.method === "OPTIONS") return preflightResponse(route, cors);
 
   try {
-    if (route === "config") {
+    if (route.kind === "config") {
       if (request.method !== "GET" && request.method !== "HEAD") {
         return methodNotAllowed("GET, OPTIONS", cors);
       }
@@ -102,10 +114,27 @@ export async function handleRequest(request: Request, env: GatewayEnv): Promise<
           gateway: true,
           publicBaseUrl: config.publicBaseUrl,
           googleClientId: config.googleClientId,
+          // SPEC §16.4. A site that reads `false` — or reads nothing, from an
+          // older gateway — sends no beacons and shows no stats page.
+          analytics: instance.analytics !== null,
         },
         200,
         cors,
       );
+    }
+
+    if (route.kind === "beacon") {
+      const store = instance.analytics;
+      // SPEC §16.4: no ANALYTICS_BUCKET, no endpoint. This is a supported
+      // configuration, not a broken one, so the route simply does not exist.
+      if (store === null) return jsonResponse({ error: "Not found." }, 404, cors);
+
+      if (route.sessionId === null) {
+        if (request.method !== "GET") return methodNotAllowed("GET, OPTIONS", cors);
+        return await handleBeaconList(request, instance, store, route.videoId, cors);
+      }
+      if (request.method !== "POST") return methodNotAllowed("POST, OPTIONS", cors);
+      return await handleBeaconWrite(request, store, route.videoId, route.sessionId, cors);
     }
 
     if (request.method !== "POST") return methodNotAllowed("POST, OPTIONS", cors);
@@ -149,6 +178,99 @@ async function handleSign(
   return jsonResponse(await instance.presigner.sign(parsed.request), 200, cors);
 }
 
+// --- POST /beacon/{videoId}/{sessionId} --------------------------------------
+
+/**
+ * The one place bytes legitimately pass through this gateway (SPEC §16.3), and
+ * every dimension of it is bounded: unauthenticated but write-only, ≤ 16 KiB,
+ * opaque ciphertext, an object key built here from two ids that matched
+ * `ID_PATTERN`, and no route anywhere that can read the object back.
+ *
+ * Unauthenticated is not an oversight. Viewers have no identity and must never
+ * be asked for one; what stands in for authorization is that the payload is
+ * encrypted under a key only holders of the share link have, so an unwanted
+ * write is junk the stats page counts and skips rather than data anyone can read.
+ */
+async function handleBeaconWrite(
+  request: Request,
+  store: AnalyticsStore,
+  videoId: string,
+  sessionId: string,
+  cors: Record<string, string>,
+): Promise<Response> {
+  if (!ID_PATTERN.test(videoId) || !ID_PATTERN.test(sessionId)) {
+    return jsonResponse(
+      { error: "Beacon path must be /beacon/{videoId}/{sessionId}, each 22 base64url characters." },
+      400,
+      cors,
+    );
+  }
+
+  // SPEC §16.3 states the accepted body as a *range*: "body 1…MAX_BEACON_BYTES
+  // bytes … → else 413". A zero-byte beacon is outside it, so it answers 413
+  // like an oversized one rather than 400 — the client never sends one either
+  // way (an AES-GCM block is at least 28 bytes), so this is purely about
+  // matching the stated contract instead of inventing a second status for it.
+  const body = await readBoundedBytes(request, MAX_BEACON_BYTES);
+  if (body === null || body.byteLength === 0) {
+    return jsonResponse({ error: "Beacon body must be 1 to 16384 bytes." }, 413, cors);
+  }
+
+  try {
+    await store.put(videoId, sessionId, body);
+  } catch (err) {
+    // SPEC §16.4: a failed write logs the video id and the storage status, and
+    // nothing else — no session id, no size, no origin, and above all no IP. A
+    // *successful* write logs nothing at all, which is why there is no line here
+    // outside the catch.
+    const status = err instanceof AnalyticsStoreError ? err.status : 0;
+    console.error(`[videoshare-gateway] analytics write failed id=${videoId} storage-status=${status}`);
+    return jsonResponse({ error: "The analytics bucket refused the write." }, 502, cors);
+  }
+  return noContentResponse(cors);
+}
+
+// --- GET /beacon/{videoId} ---------------------------------------------------
+
+/**
+ * Lists one video's sessions as presigned GET URLs (SPEC §16.3). The gateway
+ * signs; the browser fetches the ciphertext from the bucket and decrypts it with
+ * the fragment key, which never reaches this process.
+ *
+ * The whitelist here is the *uploader* whitelist: anyone who may upload through
+ * this gateway may list sessions for any video id they know. That is a real
+ * property rather than an oversight, and `docs/gateway-setup.md` states it
+ * plainly instead of implying a per-video ownership that does not exist.
+ */
+async function handleBeaconList(
+  request: Request,
+  instance: Instance,
+  store: AnalyticsStore,
+  videoId: string,
+  cors: Record<string, string>,
+): Promise<Response> {
+  // Authenticate before anything else, exactly as `POST /api/sign` does.
+  const auth = await instance.authenticator.authenticate(request.headers.get("Authorization"));
+  if (!auth.ok) return jsonResponse({ error: auth.error }, auth.status, cors);
+
+  if (!ID_PATTERN.test(videoId)) {
+    return jsonResponse({ error: '"id" must be 22 base64url characters.' }, 400, cors);
+  }
+
+  // The same audit line `POST /api/sign` writes, for the same reason (§15.4):
+  // reading a video's watch data is an authenticated act by a named uploader.
+  // The write half above logs nothing, because that one has a viewer behind it.
+  console.log(`[videoshare-gateway] sessions id=${videoId} email=${auth.email}`);
+
+  try {
+    return jsonResponse(await store.list(videoId), 200, cors);
+  } catch (err) {
+    const status = err instanceof AnalyticsStoreError ? err.status : 0;
+    console.error(`[videoshare-gateway] analytics listing failed id=${videoId} storage-status=${status}`);
+    return jsonResponse({ error: "The analytics bucket refused the listing." }, 502, cors);
+  }
+}
+
 /**
  * The body, or null if it is over `limit` bytes.
  *
@@ -160,11 +282,19 @@ async function handleSign(
  * spends. Reading incrementally caps it at `limit` regardless of what arrives.
  */
 async function readBoundedText(request: Request, limit: number): Promise<string | null> {
+  const bytes = await readBoundedBytes(request, limit);
+  // Decoded once over the whole body, so a character split across two chunks
+  // still decodes.
+  return bytes === null ? null : new TextDecoder().decode(bytes);
+}
+
+/** The same read, left as bytes: a beacon body is ciphertext, not text. */
+async function readBoundedBytes(request: Request, limit: number): Promise<Uint8Array | null> {
   const declared = Number(request.headers.get("Content-Length"));
   if (Number.isFinite(declared) && declared > limit) return null;
 
   const stream = request.body;
-  if (stream === null) return "";
+  if (stream === null) return new Uint8Array(0);
 
   const reader = stream.getReader();
   const chunks: Uint8Array[] = [];
@@ -187,25 +317,43 @@ async function readBoundedText(request: Request, limit: number): Promise<string 
     bytes.set(chunk, offset);
     offset += chunk.byteLength;
   }
-  // Decoded once over the whole body, so a character split across two chunks
-  // still decodes.
-  return new TextDecoder().decode(bytes);
+  return bytes;
 }
 
 // --- Routing -----------------------------------------------------------------
 
-type Route = "config" | "sign";
+type Route =
+  | { kind: "config" }
+  | { kind: "sign" }
+  /** `sessionId` present is the write (POST); absent is the listing (GET). */
+  | { kind: "beacon"; videoId: string; sessionId: string | null };
+
+/**
+ * `/beacon/{videoId}` and `/beacon/{videoId}/{sessionId}` (SPEC §16.3).
+ * Deliberately loose about what an id *contains*: a malformed one is a 400 from
+ * the handler, not a 404 from here, and the handler is where `ID_PATTERN` lives.
+ */
+const BEACON_PATH = /^(?:\/api)?\/beacon\/([^/]+)(?:\/([^/]+))?$/;
 
 /**
  * `gatewayUrl` in the client's config may be an origin or a path prefix, and a
  * reverse proxy may or may not strip `/api`, so both mount points are accepted.
  * Nothing security-relevant hangs on this: `/api/sign` authenticates whichever
  * path reached it.
+ *
+ * Path segments are matched *as received*, never percent-decoded. Every
+ * character `ID_PATTERN` allows is unreserved, so a real id is never encoded on
+ * the wire — and an encoded one is therefore something else, which should fail.
  */
 function routeOf(pathname: string): Route | null {
   const path = pathname.length > 1 && pathname.endsWith("/") ? pathname.slice(0, -1) : pathname;
-  if (path === "/api/config" || path === "/config") return "config";
-  if (path === "/api/sign" || path === "/sign") return "sign";
+  if (path === "/api/config" || path === "/config") return { kind: "config" };
+  if (path === "/api/sign" || path === "/sign") return { kind: "sign" };
+
+  const beacon = BEACON_PATH.exec(path);
+  if (beacon?.[1] !== undefined) {
+    return { kind: "beacon", videoId: beacon[1], sessionId: beacon[2] ?? null };
+  }
   return null;
 }
 
@@ -220,11 +368,18 @@ function corsHeaders(origin: string | null): Record<string, string> {
 }
 
 function preflightResponse(route: Route, cors: Record<string, string>): Response {
+  // The beacon route carries both: POST writes one session, GET lists them.
+  const methods =
+    route.kind === "config"
+      ? "GET, OPTIONS"
+      : route.kind === "beacon"
+        ? "GET, POST, OPTIONS"
+        : "POST, OPTIONS";
   return new Response(null, {
     status: 204,
     headers: {
       ...cors,
-      "access-control-allow-methods": route === "config" ? "GET, OPTIONS" : "POST, OPTIONS",
+      "access-control-allow-methods": methods,
       // Bearer tokens only — no cookies, so no Access-Control-Allow-Credentials.
       "access-control-allow-headers": "Authorization, Content-Type",
       "access-control-max-age": "600",
@@ -251,6 +406,11 @@ function methodNotAllowed(allow: string, cors: Record<string, string>): Response
   return jsonResponse({ error: `Method not allowed; use ${allow}.` }, 405, { ...cors, allow });
 }
 
+/** A beacon that was stored. The client never reads this, and there is nothing to read. */
+function noContentResponse(cors: Record<string, string>): Response {
+  return new Response(null, { status: 204, headers: { ...cors, "cache-control": "no-store" } });
+}
+
 function describe(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
@@ -261,6 +421,8 @@ interface Instance {
   config: GatewayConfig;
   authenticator: Authenticator;
   presigner: Presigner;
+  /** Null when `ANALYTICS_BUCKET` is unset — both beacon routes then 404. */
+  analytics: AnalyticsStore | null;
 }
 
 /**
@@ -281,6 +443,7 @@ function getInstance(env: GatewayEnv): Instance {
     config,
     authenticator: createAuthenticator(config.auth),
     presigner: createPresigner(config.bucket),
+    analytics: config.analytics === null ? null : createAnalyticsStore(config.analytics),
   };
   instances.set(env, instance);
   return instance;
@@ -294,7 +457,7 @@ function getInstance(env: GatewayEnv): Instance {
 export function readConfig(env: GatewayEnv): GatewayConfig {
   const bucket: BucketConfig = {
     endpoint: readUrl(env, "BUCKET_ENDPOINT"),
-    bucket: readBucketName(env),
+    bucket: readBucketName(required(env, "BUCKET_NAME"), "BUCKET_NAME"),
     region: (env.BUCKET_REGION ?? "").trim() || "auto",
     accessKeyId: required(env, "BUCKET_ACCESS_KEY_ID"),
     secretAccessKey: required(env, "BUCKET_SECRET_ACCESS_KEY"),
@@ -314,6 +477,7 @@ export function readConfig(env: GatewayEnv): GatewayConfig {
     allowedOrigins: readAllowedOrigins(env),
     auth,
     bucket,
+    analytics: readAnalyticsBucket(env, bucket),
   };
 }
 
@@ -346,14 +510,35 @@ function readUrl(env: GatewayEnv, name: string): string {
  * S3 naming rules — a name with a `/` or `?` in it would change what is being
  * signed rather than just naming a bucket.
  */
-function readBucketName(env: GatewayEnv): string {
-  const name = required(env, "BUCKET_NAME");
+function readBucketName(name: string, variable: string): string {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{1,62}$/.test(name)) {
     throw new GatewayConfigError(
-      "BUCKET_NAME must be 3-63 characters of letters, digits, dot, dash or underscore.",
+      `${variable} must be 3-63 characters of letters, digits, dot, dash or underscore.`,
     );
   }
   return name;
+}
+
+/**
+ * `ANALYTICS_BUCKET` (SPEC §16.4): a bucket name, or nothing. Credentials,
+ * endpoint and region are the video bucket's — the analytics bucket lives in the
+ * same account and provider — so this is that config with one field replaced.
+ *
+ * It must not *be* the video bucket. §3's bucket is world-readable by design;
+ * watch data landing in it would be published to anyone who guessed a key. That
+ * is worth a boot-time failure rather than a runtime surprise.
+ */
+function readAnalyticsBucket(env: GatewayEnv, bucket: BucketConfig): BucketConfig | null {
+  const name = env.ANALYTICS_BUCKET?.trim();
+  if (!name) return null;
+
+  readBucketName(name, "ANALYTICS_BUCKET");
+  if (name === bucket.bucket) {
+    throw new GatewayConfigError(
+      "ANALYTICS_BUCKET must name a different, private bucket than BUCKET_NAME; the video bucket is publicly readable.",
+    );
+  }
+  return { ...bucket, bucket: name };
 }
 
 function readExpiry(env: GatewayEnv): number {

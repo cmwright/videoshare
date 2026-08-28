@@ -1,0 +1,250 @@
+/* Stats page layout (SPEC §16.6). Tokens and base element styles come from app.css.
+
+   The attention curve is plain CSS bars on purpose: no chart library, no canvas,
+   no external asset — this page decrypts private watch data, and nothing about
+   drawing a bar chart is worth a third-party script. */
+
+.page {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: var(--space-6) var(--space-4) var(--space-7);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  min-height: 100vh;
+}
+
+.site-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2) var(--space-3);
+}
+
+.brand {
+  font-size: 1.6rem;
+}
+
+.hint {
+  font-size: 0.8125rem;
+}
+
+.button-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+/* Sign-in — the same panel as the recorder's (SPEC §15.5) ------------------- */
+
+.auth {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.auth > :empty {
+  display: none;
+}
+
+.auth-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-4);
+}
+
+.auth-row > .hint {
+  flex-basis: 100%;
+}
+
+.auth-identity {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Video picker -------------------------------------------------------------- */
+
+.picker {
+  display: flex;
+  flex-direction: column;
+}
+
+.fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-4);
+  margin: var(--space-4) 0;
+}
+
+.field.wide {
+  grid-column: 1 / -1;
+}
+
+.field .hint {
+  margin-top: var(--space-1);
+}
+
+.picker-status {
+  font-size: 0.875rem;
+}
+
+.picker-status:empty {
+  display: none;
+}
+
+.picker-status.error {
+  color: var(--danger);
+}
+
+/* Results ------------------------------------------------------------------- */
+
+.results {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: var(--space-3);
+}
+
+.tile {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+}
+
+.tile-value {
+  font-size: 1.75rem;
+  font-weight: 620;
+  letter-spacing: -0.02em;
+  line-height: 1.1;
+}
+
+.tile-label {
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+}
+
+.notes:empty {
+  display: none;
+}
+
+/* Attention curve ----------------------------------------------------------- */
+
+.curve {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 140px;
+  margin-top: var(--space-4);
+  padding: var(--space-2);
+  border-radius: var(--radius-md);
+  background: var(--surface-sunken);
+}
+
+.curve-bar {
+  flex: 1;
+  min-width: 0;
+  /* A bucket nobody watched still shows a hairline, so the axis reads as a
+     timeline rather than as missing data. */
+  min-height: 2px;
+  border-radius: 2px 2px 0 0;
+  background: var(--accent);
+}
+
+.curve-bar.empty {
+  background: var(--border-strong);
+}
+
+.curve-axis {
+  display: flex;
+  justify-content: space-between;
+  margin-top: var(--space-1);
+  font-size: 0.75rem;
+}
+
+/* Per-session table --------------------------------------------------------- */
+
+.table-wrap {
+  margin-top: var(--space-4);
+  overflow-x: auto;
+}
+
+.sessions {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.875rem;
+  white-space: nowrap;
+}
+
+.sessions th,
+.sessions td {
+  padding: var(--space-2) var(--space-3);
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+
+.sessions th {
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+  font-weight: 550;
+}
+
+.sessions tr:last-child td {
+  border-bottom: none;
+}
+
+.sessions td.numeric {
+  font-variant-numeric: tabular-nums;
+}
+
+.sessions td.viewer {
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+}
+
+.sessions .done {
+  color: var(--success);
+}
+
+/* Footer -------------------------------------------------------------------- */
+
+.footer {
+  margin-top: auto;
+  padding-top: var(--space-5);
+  text-align: center;
+  font-size: 0.8125rem;
+}
+
+.footer a {
+  color: var(--text-faint);
+  text-decoration: none;
+}
+
+.footer a:hover {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+@media (max-width: 560px) {
+  .fields {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .curve {
+    height: 110px;
+  }
+}

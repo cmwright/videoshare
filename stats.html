@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="robots" content="noindex" />
+    <title>VideoShare — Stats</title>
+    <!-- Deploy config, copied verbatim to dist/. Classic script: runs before the module. -->
+    <script src="/config.js"></script>
+  </head>
+
+  <body>
+    <main class="page">
+      <header class="site-header">
+        <h1 class="brand">Watch stats</h1>
+        <p class="muted">
+          Decrypted in this browser with the key from the share link. The server never held any of it.
+        </p>
+      </header>
+
+      <!--
+        Shown instead of everything else when analytics is not available here
+        (SPEC §16.6): no gatewayUrl in config.js, or a gateway with no analytics
+        bucket. stats.ts fills in which of the two it is.
+      -->
+      <section id="unavailable" class="card hidden">
+        <h2 id="unavailable-title"></h2>
+        <p id="unavailable-detail" class="muted"></p>
+      </section>
+
+      <!-- Gateway mode only; the same panel and the same module as the recorder (SPEC §15.5). -->
+      <section id="auth-panel" class="card auth hidden" aria-label="Sign in">
+        <p id="auth-loading" class="muted hint">Loading Google sign-in…</p>
+
+        <div id="auth-signed-out" class="auth-row hidden">
+          <p class="muted hint">
+            Sign in with Google to list a video's sessions. The gateway authorizes the listing; the
+            watch data itself is decrypted here, with the key from the share link.
+          </p>
+          <div id="auth-button"></div>
+        </div>
+
+        <div id="auth-signed-in" class="auth-row hidden">
+          <p class="auth-identity">Signed in as <strong id="auth-email"></strong></p>
+          <button id="sign-out" type="button" class="ghost">Sign out</button>
+        </div>
+
+        <p id="auth-status" class="muted hint" role="status" aria-live="polite"></p>
+      </section>
+
+      <!--
+        Deliberately not a <form>: a pasted share link carries the decryption key
+        in its fragment, and nothing on this page may ever submit or navigate
+        with it (SPEC §16.6).
+      -->
+      <section id="picker" class="card picker hidden" aria-label="Choose a video">
+        <h2>Choose a video</h2>
+
+        <div class="fields">
+          <div class="field wide">
+            <label for="library">From this browser's library</label>
+            <select id="library"></select>
+          </div>
+
+          <div class="field wide">
+            <label for="link">…or paste a share link</label>
+            <input
+              id="link"
+              type="text"
+              placeholder="https://example.com/view.html#id.key"
+              spellcheck="false"
+              autocomplete="off"
+            />
+            <p class="muted hint">
+              The key stays in this tab — only the video id is ever sent to the gateway.
+            </p>
+          </div>
+        </div>
+
+        <div class="button-row">
+          <button id="load" type="button" class="primary">Show stats</button>
+          <span id="picker-status" class="picker-status muted" role="status" aria-live="polite"></span>
+        </div>
+      </section>
+
+      <section id="results" class="results hidden" aria-label="Watch statistics">
+        <div class="summary">
+          <div class="tile">
+            <span class="tile-value" id="stat-sessions">0</span>
+            <span class="tile-label">Sessions</span>
+          </div>
+          <div class="tile">
+            <span class="tile-value" id="stat-viewers">0</span>
+            <span class="tile-label">Unique viewers</span>
+          </div>
+          <div class="tile">
+            <span class="tile-value" id="stat-coverage">—</span>
+            <span class="tile-label">Average watched</span>
+          </div>
+          <div class="tile">
+            <span class="tile-value" id="stat-completions">0</span>
+            <span class="tile-label">Completions (≥90%)</span>
+          </div>
+        </div>
+
+        <p id="notes" class="notes muted hint"></p>
+
+        <section id="curve-card" class="card">
+          <h2>Attention</h2>
+          <p class="muted hint">
+            How many sessions watched each 2% of the video, from start to end.
+          </p>
+          <div id="curve" class="curve"></div>
+          <div class="curve-axis muted">
+            <span>Start</span>
+            <span>Halfway</span>
+            <span>End</span>
+          </div>
+        </section>
+
+        <section id="sessions-card" class="card">
+          <h2>Sessions</h2>
+          <p class="muted hint">
+            One row per viewing. A viewer is a browser, not a person — and there is no IP column
+            because no IP was ever read.
+          </p>
+          <div class="table-wrap">
+            <table class="sessions">
+              <thead>
+                <tr>
+                  <th scope="col">Started</th>
+                  <th scope="col">Watched</th>
+                  <th scope="col">Watch time</th>
+                  <th scope="col">Viewer</th>
+                </tr>
+              </thead>
+              <tbody id="sessions"></tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+
+      <noscript>
+        <section class="card">
+          <h2>JavaScript required</h2>
+          <p>Watch data is decrypted in the browser, so this page needs JavaScript enabled.</p>
+        </section>
+      </noscript>
+
+      <!-- Deploying a fork? Point this at your own repository. -->
+      <footer class="footer muted">
+        Powered by <a href="https://github.com/cmwright/videoshare">VideoShare</a>
+      </footer>
+    </main>
+
+    <script type="module" src="/src/stats.ts"></script>
+  </body>
+</html>

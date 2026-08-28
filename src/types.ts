@@ -79,6 +79,13 @@ export interface GatewayConfig {
   publicBaseUrl: string;
   /** OAuth 2.0 client id for Google Identity Services. */
   googleClientId: string;
+  /**
+   * Whether the gateway has an analytics bucket, i.e. whether the beacon
+   * endpoints exist at all (SPEC §16.4). A gateway built before §16 omits the
+   * field, which reads as `false` — so a newer site against an older gateway
+   * simply sends no beacons rather than posting them into a 404.
+   */
+  analytics: boolean;
 }
 
 /** One row of the local library, persisted at `videoshare.library`. */

@@ -317,6 +317,8 @@ export function b64urlEncode(bytes: Uint8Array): string;  // no padding
 export function b64urlDecode(s: string): Uint8Array;
 export function formatDuration(ms: number): string;       // "m:ss" / "h:mm:ss"
 export function formatBytes(n: number): string;           // "12.3 MB"
+export function parseShareFragment(fragment: string):     // "#{id}.{key}" per §2, or null
+  { id: string; keyB64: string } | null;
 ```
 
 `crypto.ts`  (pure WebCrypto — must run in both browser and Node ≥20 for tests)
@@ -330,6 +332,7 @@ export function encryptBlock(key: CryptoKey, aad: string, plain: Uint8Array): Pr
 export function decryptBlock(key: CryptoKey, aad: string, block: Uint8Array): Promise<Uint8Array>; // throws on tamper
 export function metaAad(id: string): string;              // `${id}:meta`
 export function chunkAad(id: string, index: number): string;
+export function analyticsAad(id: string, sessionId: string): string;  // `${id}:analytics:${sessionId}` (§16)
 export function decryptChunkRange(index: number, chunkCount: number, meta: VideoMeta):
   { start: number; end: number | null };                  // byte range in video.bin (end exclusive, null = EOF)
 ```
@@ -353,8 +356,14 @@ export function publicBaseUrl(): string;                  // from window.VIDEOSH
 machine in §6, including the internal Blob→8 MiB-chunk assembler that feeds
 `UploadSession.addChunk`). `player.ts` — page controller for `view.html` (owns §8).
 
-Page-specific styles live in `src/record.css` / `src/player.css`; shared design
-tokens and base styles in `src/app.css`.
+`watch.ts` / `beacon.ts` / `stats.ts` — playback analytics (§16), split the way §8's
+arithmetic is: `watch.ts` is pure watch-range and aggregation math (no DOM, so Node
+tests and the stats page both import it), `beacon.ts` is the browser-side tracker and
+flush, and `stats.ts` is the page controller for `stats.html`. Full signatures in
+§16.5/§16.6.
+
+Page-specific styles live in `src/record.css` / `src/player.css` / `src/stats.css`;
+shared design tokens and base styles in `src/app.css`.
 
 ## 12. Build & tooling
 
@@ -362,8 +371,8 @@ tokens and base styles in `src/app.css`.
   `vite`, `vitest`. Scripts: `dev` (vite), `build` (`tsc --noEmit && vite build`),
   `preview`, `test` (`vitest run`), `test:e2e` (`vitest run --config vitest.e2e.config.ts`,
   only meaningful with MinIO up).
-- Vite multi-page: rollup inputs `index.html` + `view.html`. `public/config.js`
-  copied verbatim to `dist/`.
+- Vite multi-page: rollup inputs `index.html` + `view.html` + `stats.html` (§16.6).
+  `public/config.js` copied verbatim to `dist/`.
 - TypeScript `strict: true`. No frameworks, no other runtime deps.
 
 ## 13. Tests
@@ -379,6 +388,12 @@ tokens and base styles in `src/app.css`.
   non-object value, per-field fallback for an invalid quality/codec/bitrate,
   save/load round-trip, no `preferAv1` migration, and a blocked or refusing
   store reported rather than thrown.
+- `tests/watch.test.ts` (vitest, Node): the pure helpers of `watch.ts` (§16.5) —
+  seconds→ms normalization, clamping, merging and the 200-range cap; `coverage`
+  and `isCompleted` around the 0.9 threshold and at `durationMs = 0`;
+  attention-curve bucket boundaries and multi-session counting; strict payload
+  parsing. §16.9 has the detail, plus what §16 adds to `tests/crypto.test.ts`,
+  `tests/gateway.test.ts` and `tests/e2e.gateway.test.ts`.
 - `tests/crypto.test.ts` (vitest, Node WebCrypto): key export/import round-trip;
   block round-trip; tampered byte → throws; wrong AAD (reordered chunk index) →
   throws; chunked encrypt/decrypt round-trip across ≥3 chunks incl. short
@@ -423,7 +438,9 @@ tokens and base styles in `src/app.css`.
 An optional, **stateless** service that removes all bucket credentials from
 browsers. Core invariant: **the gateway MUST NOT proxy object data — every
 storage byte flows browser↔bucket via presigned URLs. There is no proxy mode
-and none may be added.** The gateway holds the bucket credentials (env vars),
+and none may be added.** (§16.3's ≤ 16 KiB analytics beacon is the single,
+deliberately bounded exception: write-only, opaque ciphertext, no read path. No
+stored byte ever flows back out through the gateway.) The gateway holds the bucket credentials (env vars),
 authenticates uploaders, and signs URLs. It never streams, never stores state,
 and depends on nothing but its env — so one core handler runs identically as a
 Cloudflare Worker, an AWS Lambda (function URL), or a plain Node process.
@@ -454,7 +471,8 @@ Adapters are thin translations only; ALL logic lives in core/auth/presign
 `GOOGLE_CLIENT_ID`, `ALLOWED_EMAILS` (comma-separated; each entry is a full
 email or a `@domain.com` suffix; case-insensitive), `ALLOWED_ORIGINS`
 (comma-separated origins for the gateway's own CORS; `*` forbidden),
-`PRESIGN_EXPIRY_SECONDS` (default 900, max 3600). Test-only overrides
+`PRESIGN_EXPIRY_SECONDS` (default 900, max 3600), and the optional
+`ANALYTICS_BUCKET` (§16.4; unset = analytics off). Test-only overrides
 `OIDC_JWKS_URL` / `OIDC_ISSUER` (§15.6) default to Google's.
 
 ### 15.3 Endpoints
@@ -521,7 +539,11 @@ token itself must never be logged.
   `prompt()` with auto-select) and retries once; if that fails, the part
   queue's existing retry/degraded path applies and the UI shows a re-sign-in
   prompt without stopping the recording.
-- The player and viewing flow are untouched (public reads, no gateway).
+- The player and viewing flow are untouched (public reads, no gateway) — with the
+  single exception of §16. In gateway mode `view.html` reads `{gatewayUrl}/config`
+  once per page load, to learn whether analytics is on (§16.4), and sends §16.3's
+  beacon only when it is; those two are the only requests it ever makes to the
+  gateway. In legacy mode it makes neither (§16.7).
 
 ### 15.6 Tests
 
@@ -548,3 +570,386 @@ first real-R2 deployment MUST run a smoke upload before rollout (documented).
   wired to MinIO, off by default (profile), since local Google sign-in needs a
   real client id with localhost origins.
 - README: gateway mode vs legacy mode, one paragraph + pointer.
+
+## 16. Playback analytics (optional): end-to-end encrypted watch data
+
+Who watched how much of a video, without the server learning any of it. The viewer
+already holds the video's AES key — it is in the share link's fragment — so the
+player encrypts everything it has to say about the watch **with that same key**
+before it leaves the tab. The gateway and the analytics bucket only ever hold
+ciphertext, a video id, a random session label, and the storage layer's own
+timestamp and byte count. Watch data is therefore readable by exactly the people
+who can already watch the video: holders of the share link.
+
+Three invariants hold everywhere in this section:
+
+1. **No IP address is read, stored or logged for analytics** — not into an object,
+   not into a log line, not into a header the gateway inspects.
+2. **The fragment key never leaves the browser.** It appears in no beacon body, no
+   URL, no header, no query. (Browsers strip fragments from `Referer`; nothing here
+   ever copies one into a path or a query, which is the only way it could reappear.)
+3. Analytics is **off** unless a gateway is configured *and* `ANALYTICS_BUCKET` is
+   set. Legacy mode (§9/§10) makes no new network call and writes no new key.
+
+### 16.1 Identifiers
+
+Two ids, both 16 random bytes → base64url, unpadded, 22 characters (§2's
+`randomId()`), both **inside the encrypted payload**, neither derived from anything
+about the viewer:
+
+- **`browserId`** — persisted in the *viewer's* localStorage under
+  `videoshare.viewer` (a bare string, not JSON). Minted on first use and reused
+  afterwards, so the stats page can collapse repeat viewings by one browser into one
+  "viewer". When storage is unavailable or refuses (§9's rules), an ephemeral
+  in-memory id is used **silently** — a viewer is never asked to fix their browser.
+  It is written only when a beacon will actually be sent, so a legacy deployment
+  leaves nothing behind on `view.html`. This is the only key `view.html` writes; it
+  holds no settings and no identity, and it is the one narrowing of §10.
+- **`sessionId`** — minted per player page load, memory only, never persisted. One
+  session = one viewing instance = one storage object.
+
+### 16.2 Beacon payload (plaintext, before encryption)
+
+```jsonc
+{
+  "v": 1,                             // format version, integer
+  "browserId": "8f3k2Jd0QpZ1nV7xLmA9Bw",
+  "sessionId": "Qr4TgYs2Nb6HcE0uWkP1Zx",
+  "durationMs": 93250,
+  "watched": [[0, 41200], [58000, 93250]],   // [startMs, endMs), merged, sorted, disjoint
+  "completed": false,
+  "firstPlayedAt": "2026-08-27T21:04:00.000Z"  // ISO 8601 UTC
+}
+```
+
+- `durationMs` — `meta.durationMs` (§5, authoritative) when > 0; otherwise the media
+  element's `duration × 1000`, rounded; `0` when neither is finite and positive.
+- `watched` — integer milliseconds, derived from the media element's `played`
+  TimeRanges at flush time (§16.5). Union semantics: a stretch watched three times
+  appears once, so this is "seen at least once", never "time spent". At most
+  `MAX_WATCH_RANGES` (200) entries.
+- `completed` — `coverage ≥ COMPLETION_THRESHOLD` (0.9), recomputed at every flush by
+  the same helper the stats page uses, so the two sides agree by construction.
+- `firstPlayedAt` — the first `play` of this session; stable across every flush.
+
+Encryption is exactly §4's single block — `IV (12) ‖ ciphertext ‖ tag (16)`, same
+AES-GCM key as the video — with AAD `"{videoId}:analytics:{sessionId}"`
+(`analyticsAad()`, §11). The AAD binds the block to one video *and* one session, so
+an object copied to another key or another session id fails to decrypt. Plaintext is
+the JSON above, UTF-8, `JSON.stringify` with no padding or pretty-printing.
+
+Every flush carries the **whole cumulative state**, never a delta. The 16 KiB body
+cap (§16.3) is therefore a cap on an entire session, which is what
+`MAX_WATCH_RANGES` exists to guarantee: a merged list longer than 200 is coalesced
+across its **smallest gaps first** (`capRanges`) until it fits, so the error is
+bounded by the narrowest gaps in the list and the shape of the curve survives.
+
+### 16.3 Beacon endpoint (viewer → gateway → bucket)
+
+`POST {gatewayUrl}/beacon/{videoId}/{sessionId}` — **unauthenticated**. Viewers have
+no identity and must never be asked for one.
+
+- Sent with `navigator.sendBeacon(url, blob)`, body = the raw ciphertext bytes.
+  `sendBeacon` cannot set headers, so **all routing lives in the path**. The Blob's
+  type is `text/plain;charset=UTF-8`: a CORS-safelisted content type, chosen so that
+  no preflight can strand a beacon fired at `pagehide`. The bytes are unaffected by
+  that label and the gateway never reads the Content-Type. (The client never reads
+  the response, so whether the browser's CORS check on the 204 passes is irrelevant
+  to it; the gateway answers with the usual echoed origin and, as everywhere else,
+  no `Access-Control-Allow-Credentials`.)
+- Both mount points, exactly as §15.3's routes: `/api/beacon/…` and `/beacon/…`.
+- Validation: `videoId` and `sessionId` must each match §15.3's `^[A-Za-z0-9_-]{22}$`
+  → else **400**; body 1…`MAX_BEACON_BYTES` (16384) bytes, counted *while reading*
+  (§15's bounded-read rule, not a declared `Content-Length`) → else **413**;
+  `ANALYTICS_BUCKET` unset → **404**; any method but POST/OPTIONS → **405**; an
+  `Origin` outside `ALLOWED_ORIGINS` → **403**, from the same check every other route
+  already passes through. Preflight for this route answers
+  `Access-Control-Allow-Methods: GET, POST, OPTIONS`.
+- On success the gateway performs **one server-side S3 `PutObject`** of the raw body
+  to `{ANALYTICS_BUCKET}/{videoId}/{sessionId}.bin` with
+  `Content-Type: application/octet-stream`, and answers **204** with no body. A
+  bucket that rejects the write → **502**. The gateway never inspects, parses,
+  decompresses or rewrites the body; it is opaque ciphertext to it.
+
+**This is the one bounded exception to §15's no-proxy invariant**, and it is bounded
+on purpose: one direction (write only), ≤ 16 KiB, opaque bytes, a key the gateway
+constructs itself from two validated ids, and no read path whatsoever. Nothing may
+be added to it, and no response on any route may ever carry stored bytes.
+
+`GET {gatewayUrl}/beacon/{videoId}` — **authenticated exactly like `POST /api/sign`**
+(§15.4: Google bearer token, `ALLOWED_EMAILS`; 401 bad/expired token, 403 valid token
+not whitelisted, 503 identity provider unreachable). It lists the analytics bucket
+under prefix `{videoId}/` with `ListObjectsV2`, server-side, and answers:
+
+```jsonc
+{
+  "sessions": [
+    { "sessionId": "Qr4TgYs2Nb6HcE0uWkP1Zx",
+      "lastModified": "2026-08-27T21:41:02.000Z",  // ISO 8601 UTC, from S3
+      "size": 291,                                  // ciphertext bytes
+      "url": "https://…X-Amz-Signature=…" }         // short-lived presigned GET
+  ],
+  "truncated": false
+}
+```
+
+- `url` is a presigned GET for that object, expiring per `PRESIGN_EXPIRY_SECONDS`
+  (§15.2). The browser fetches the ciphertext **straight from the bucket** — the
+  gateway never streams a stored byte back (§15).
+- Pagination is followed to `MAX_LISTED_SESSIONS` (1000). Stopping early sets
+  `truncated: true` rather than silently trimming, and the stats page says so on the
+  page.
+- Keys that do not match `{videoId}/{22 base64url}.bin` are skipped: nothing else
+  belongs in that prefix, and if something is there it is not a session.
+- Malformed `videoId` → **400**; analytics disabled → **404**; any method but
+  GET/OPTIONS → **405**; a bucket that rejects the listing → **502**.
+- The whitelist here is the *uploader* whitelist: anyone who may upload through this
+  gateway may list sessions for any video id they know. Ids are 128-bit random and
+  only reachable through a share link, but this is a real property and the README
+  says so rather than implying per-video ownership that does not exist.
+
+### 16.4 Gateway configuration and storage layout
+
+- One new optional variable, `ANALYTICS_BUCKET` — a bucket **name**. Credentials,
+  endpoint and region are §15.2's: the analytics bucket lives in the same account and
+  provider. It is validated by §15.2's bucket-name rule and **must not equal
+  `BUCKET_NAME`** — §3's bucket is world-readable by design and watch data must never
+  land in it. That is a boot-time `GatewayConfigError`, not a runtime surprise.
+- Unset → analytics is off: `/config` answers `analytics: false` and both beacon
+  routes 404. This is a supported configuration, not a broken one.
+- `GET /api/config` gains `"analytics": true | false` beside `gateway`,
+  `publicBaseUrl` and `googleClientId`. `types.ts`'s `GatewayConfig` and
+  `settings.ts`'s `fetchGatewayConfig` gain the same boolean; a `/config` that omits
+  it reads as `false`, so a newer site against an older gateway simply sends no
+  beacons.
+- Object key, constructed server-side only and never from client input beyond the two
+  validated ids: **`{videoId}/{sessionId}.bin`**.
+- **Overwrite-collapse storage model**: every flush of a session PUTs the same key, so
+  the last successful write *is* the session. No compaction, no merging, no append, no
+  read-modify-write — the gateway never reads an analytics object. Beacons are not
+  ordered by the browser; a lost or reordered flush costs at most the delta between
+  two cumulative states, and the object that stands is the newest one the bucket
+  accepted.
+- The analytics bucket MUST be **private**: no public domain attached, no anonymous
+  read policy. It needs no CORS for writes (the gateway writes it) but DOES need
+  `GET` CORS from the site origin, because the stats page fetches presigned URLs from
+  it directly (§16.10).
+- Logging: the beacon handler writes **no per-request log line** — not the session id,
+  not a size, not an origin. A failed write logs the video id and the storage status
+  and nothing else. No IP-bearing header (`CF-Connecting-IP`, `X-Forwarded-For`,
+  `request.cf`, Lambda's `sourceIp`) is read on any analytics path.
+
+New module `gateway/src/analytics.ts` — adapters stay thin translations; all logic
+lives in core/auth/presign/analytics:
+
+```ts
+export const MAX_BEACON_BYTES: number;      // 16384
+export const MAX_LISTED_SESSIONS: number;   // 1000
+export interface SessionSummary { sessionId: string; lastModified: string; size: number; url: string; }
+export interface SessionListing { sessions: SessionSummary[]; truncated: boolean; }
+export interface AnalyticsStore {
+  put(videoId: string, sessionId: string, body: Uint8Array): Promise<void>;
+  list(videoId: string): Promise<SessionListing>;
+}
+export function analyticsKey(videoId: string, sessionId: string): string;  // `${videoId}/${sessionId}.bin`
+export function createAnalyticsStore(config: BucketConfig): AnalyticsStore;
+```
+
+Its two server-side calls are signed with `aws4fetch`'s `AwsClient` and its presigned
+GETs reuse `presign.ts`'s query-signing path — **no new runtime dependency**, in
+either package. `core.ts` gains `ANALYTICS_BUCKET` in `GatewayEnv`,
+`analytics: BucketConfig | null` in `GatewayConfig`, and a `"beacon"` route in
+`routeOf`. `MAX_BEACON_BYTES` is the same 16384 as §15's `MAX_SIGN_BODY_BYTES` but is
+declared separately: the gateway is its own package and imports nothing from `src/`.
+
+### 16.5 Client watch tracking
+
+Two modules, split on testability the same way §8's arithmetic lives in `gap.ts`.
+
+`watch.ts` — pure, no DOM, imported by Node tests and by the stats page:
+
+```ts
+export type Range = [startMs: number, endMs: number];
+export interface WatchPayload { v: 1; browserId: string; sessionId: string;
+  durationMs: number; watched: Range[]; completed: boolean; firstPlayedAt: string; }
+export const BEACON_INTERVAL_MS: number;     // 30_000
+export const MAX_WATCH_RANGES: number;       // 200
+export const COMPLETION_THRESHOLD: number;   // 0.9
+export const ATTENTION_BUCKETS: number;      // 50 → one bucket per 2% of duration
+export function playedRanges(played: TimeRangesLike, durationMs: number): Range[];
+export function mergeRanges(ranges: readonly Range[]): Range[];
+export function capRanges(ranges: readonly Range[], max?: number): Range[];
+export function watchedMs(ranges: readonly Range[]): number;
+export function coverage(ranges: readonly Range[], durationMs: number): number;   // 0..1
+export function isCompleted(ranges: readonly Range[], durationMs: number): boolean;
+export function attentionCurve(sessions: readonly WatchPayload[], buckets?: number): number[];
+export function parsePayload(value: unknown): WatchPayload | null;   // strict; null, never throws
+```
+
+What the helpers pin: seconds → ms by `Math.round`; every range clamped to
+`[0, durationMs]` (or left as-is when `durationMs` is 0); ranges with `end ≤ start`
+after rounding dropped; output sorted by start, non-overlapping, with touching ranges
+merged; then `capRanges`. `coverage` = `watchedMs / durationMs`, capped at 1, and `0`
+when `durationMs ≤ 0`. `TimeRangesLike` is `gap.ts`'s — the same structural type the
+real `TimeRanges` satisfies.
+
+`beacon.ts` — the browser half (needs `navigator`, `document`, WebCrypto):
+
+```ts
+export interface BeaconOptions { gatewayUrl: string; videoId: string; key: CryptoKey; durationMs: number; }
+export interface WatchBeacon { stop(): void; }   // final flush, then teardown
+export function startWatchBeacon(video: HTMLMediaElement, opts: BeaconOptions): WatchBeacon;
+export function viewerId(): string;              // `videoshare.viewer`; in-memory when storage refuses
+```
+
+- The flush timer starts on the first `play` and is cleared at `ended` and at
+  `pagehide`. There is **no polling loop beyond it**: ranges are read from
+  `video.played` at flush time, not sampled.
+- Flush triggers: every `BEACON_INTERVAL_MS` while the timer runs, on `ended`, on
+  `visibilitychange` → `hidden`, and on `pagehide`.
+- **No beacon at all** when: `config.js` sets no `gatewayUrl`; `/config` did not
+  answer `analytics: true`; nothing has been played yet (`watched` is empty); or the
+  page is the recorder. Beacons come from `view.html` only — `record.ts` never calls
+  this and the recorder's preview element is not tracked.
+- **Every failure is silent**: a `sendBeacon` that returns false, a 4xx, an encrypt
+  that throws. Nothing reaches the viewer, nothing retries in a loop; the next
+  scheduled flush carries the same cumulative state anyway.
+- `player.ts` starts it after `meta` is loaded and the gateway config has resolved,
+  and does nothing else differently. Both `player.ts` and `stats.ts` parse
+  `#{id}.{key}` through one exported `parseShareFragment()` in `util.ts` (§11) so the
+  §2 format lives in one place — a pure refactor, playback behaviour unchanged.
+
+### 16.6 Stats page (`stats.html`, `src/stats.ts`, `src/stats.css`)
+
+A third page, built like the other two (§12 rollup inputs), and **gateway mode only**.
+
+- No `gatewayUrl` in `config.js` → the page renders one honest paragraph: analytics
+  needs a gateway with an analytics bucket, pointing at `docs/gateway-setup.md`. It
+  loads no Google script and makes no network call.
+- `gatewayUrl` present but `/config` answers `analytics: false` → the same treatment,
+  a different sentence.
+- Otherwise: Google sign-in through `src/auth.ts` (§15.5's module, unchanged — token
+  in memory only), then pick a video either from the **local library**
+  (`videoshare.library`, same origin as the recorder) or by pasting a share link.
+  Either way the id and key come from `#{id}.{key}` via `parseShareFragment`.
+- Then `GET {gatewayUrl}/beacon/{id}` with the bearer → fetch each session's
+  ciphertext **directly from its presigned url** → `decryptBlock(key,
+  analyticsAad(id, sessionId), block)` → `parsePayload`. A session that fails to
+  decrypt or to parse is **skipped and counted**, and the page shows "N sessions could
+  not be read" rather than hiding them: the write endpoint is unauthenticated, so junk
+  is possible, and so is a video re-uploaded under a new key.
+- **The key is never sent to the gateway.** Only the id appears in a request path. A
+  pasted link is read, parsed and dropped — never written to `location`, to
+  `history`, or into a form that could be submitted.
+
+Aggregates, all computed in the browser from decrypted payloads:
+
+- **Total sessions** — decryptable objects; one per viewing instance.
+- **Unique viewers** — distinct `browserId` values. A payload whose `browserId` is not
+  22 base64url characters counts as its own viewer and is never collapsed with
+  another.
+- **Average watch coverage** — the mean of `coverage(watched, durationMs)` over
+  sessions with `durationMs > 0`, as a percentage. Coverage is *fraction of the video
+  seen at least once*; re-watching cannot push it past 100%.
+- **Completions** — sessions with `completed === true`, i.e. coverage ≥ 90% (§16.2).
+- **Attention curve** — `ATTENTION_BUCKETS` (50) buckets of 2% of duration each;
+  bucket *b* covers `[b/50, (b+1)/50)` of *that session's own* `durationMs`, and a
+  session adds 1 to the bucket if any watched range overlaps it at all (a range ending
+  exactly on a boundary does not light the next bucket). Sessions with
+  `durationMs ≤ 0` are excluded from the curve and from the coverage average, while
+  still counting as sessions. Rendered as plain CSS bars — **no chart library, no
+  canvas, no external asset**.
+- **Per-session table** — started (`firstPlayedAt`), watched %, watched time
+  (`formatDuration`), and the `browserId` truncated to its first 6 characters. No IP
+  column, because no IP exists to put in one.
+
+### 16.7 Legacy mode
+
+Zero behaviour change, and stated so it can be tested rather than hoped for: with no
+`gatewayUrl`, `view.html` makes exactly the requests §8 already makes, writes no
+localStorage key, mints no ids, loads no Google script, and contains no timer;
+`stats.html` explains itself and stops. §9's settings and §10's "viewers are
+strangers" are otherwise untouched.
+
+### 16.8 Privacy guarantees
+
+What an operator of the gateway and the analytics bucket **can** learn:
+
+- that *some* browser watched video `{id}`, and roughly when — the object's
+  `LastModified`, refreshed by each flush;
+- how many sessions exist for an id, and the ciphertext size of each, from which a
+  coarse guess at the *number* of watched ranges is possible and nothing more;
+- the `sessionId`, since it is the object key — a random per-page-load label that
+  links to no person, no browser, and no other video;
+- whatever their transport layer logs on its own. A CDN's or load balancer's access
+  log is outside this spec's reach; the gateway itself neither reads nor writes an IP
+  for analytics, and this section forbids adding one.
+
+What they **cannot** learn without the share link:
+
+- which parts of the video were watched, how much of it, or whether it finished;
+- `browserId` — it is inside the ciphertext, so two sessions from the same browser are
+  not linkable server-side, even under the same video id;
+- any viewer identity at all: no account, no cookie, no fingerprint, no IP;
+- the key. It stays in the fragment, in the tab, and is used only to encrypt.
+
+Said the other way round, which is the sentence the README owes a reader: **watch data
+is readable by exactly the holders of the share link. Sharing the link shares the
+analytics.**
+
+### 16.9 Tests
+
+- `tests/watch.test.ts` (vitest, Node) — §13's entry. Range normalization
+  (seconds→ms rounding, clamping to duration, overlapping/touching/out-of-order input,
+  zero-length after rounding); a 400-range `played` list capped to 200 with the
+  smallest gaps closed first; `coverage`/`isCompleted` either side of 0.9 and at
+  `durationMs = 0`; `attentionCurve` boundary behaviour and multi-session counting;
+  `parsePayload` rejecting a wrong `v`, missing fields, non-integer milliseconds, and
+  unsorted or overlapping ranges.
+- `tests/crypto.test.ts` gains: `analyticsAad` round-trip, and a block that decrypts
+  under `{id}:analytics:{sessionA}` failing under `{id}:analytics:{sessionB}` and
+  under `{id}:meta`.
+- `tests/gateway.test.ts` gains a `POST /beacon` suite (id validation → 400, oversized
+  body → 413, analytics disabled → 404, wrong method → 405, unlisted origin → 403;
+  happy path → 204 with exactly one PutObject at `{id}/{session}.bin` against a stub
+  bucket, no `Authorization` required, and no per-request log line) and a
+  `GET /beacon/{id}` suite (no token → 401, non-whitelisted → 403, presigned url shape
+  and expiry, pagination cap → `truncated: true`, non-matching keys skipped); plus
+  config tests that `analytics` follows `ANALYTICS_BUCKET` and that
+  `ANALYTICS_BUCKET === BUCKET_NAME` fails at boot.
+- `tests/e2e.gateway.test.ts` gains the full loop against MinIO: encrypt a payload with
+  the video's key, POST it to the running Node adapter, read the object back with
+  credentials and decrypt it byte-for-byte; a second flush overwriting the same key
+  (last write wins, one object left in the prefix); `GET /beacon/{id}` with a real
+  minted JWT, fetching each presigned url anonymously and decrypting; and a check that
+  the analytics bucket is **not** anonymously readable.
+- §15.6's rule stands: no test bypasses. The write endpoint is genuinely
+  unauthenticated, so there is nothing to bypass; the read endpoint runs the same
+  minted-JWT path as `/api/sign`.
+- The beacon is the first **binary** body the gateway carries, and the Worker and Node
+  adapters hand it through as bytes (covered above). The Lambda function-URL adapter
+  cannot be: a function URL decides text-vs-base64 delivery from the request's
+  `Content-Type`, and §16.3 fixes the beacon's at `text/plain;charset=UTF-8` because
+  `sendBeacon` cannot set a header — a text label on ciphertext. A text-delivered body
+  reaches the adapter as an already-decoded UTF-8 string, and no decode recovers bytes
+  the runtime replaced. That behaviour is AWS's and cannot be exercised locally, so the
+  same rule §15.6 applies to R2 applies here: the first Lambda deployment with
+  `ANALYTICS_BUCKET` set MUST send **one real beacon and read it back decrypted**
+  before rollout (documented, §16.10).
+
+### 16.10 Docs & examples
+
+- `docs/gateway-setup.md`: an `ANALYTICS_BUCKET` section — creating a **private**
+  second bucket on R2/S3/MinIO (no public domain attached, no anonymous read policy),
+  the fact that it needs no CORS for writes because the gateway writes it but does
+  need `GET` CORS from the site origin for the presigned stats fetches, that leaving
+  the variable unset is a supported configuration, and §16.9's one-real-beacon smoke
+  test for Lambda deployments — written the same way §15.7's R2 step is, with the
+  failure it catches and what to do about it.
+- `examples/docker-compose.yml`: the `mc` init job creates the analytics bucket
+  (private, no anonymous policy) and sets its GET CORS; the `gateway` profile passes
+  `ANALYTICS_BUCKET`.
+- `README.md`: one honest paragraph in the security model — the server learns that and
+  roughly when a video id was watched and how big each session object is; it never
+  learns watch ranges, viewer identity, or an IP address, because none is read. Watch
+  data is readable only by holders of the share link.

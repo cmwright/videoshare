@@ -47,6 +47,10 @@ services:
     ports:
       - "9000:9000"
       - "9001:9001"
+      # 8787 is the *gateway's* port, published here because that service shares
+      # this container's network namespace (see its `network_mode` below).
+      # Nothing listens on it unless you start the gateway profile.
+      - "8787:8787"
     volumes:
       - minio-data:/data
     healthcheck:
@@ -56,9 +60,10 @@ services:
       retries: 30
       start_period: 2s
 
-  # One-shot: creates the bucket, makes it anonymously readable (objects only),
-  # mints an upload-only access key, and sets abandoned multipart uploads to be
-  # swept after a day. Safe to re-run; exits 0 when done.
+  # One-shot: creates the video bucket and makes it anonymously readable
+  # (objects only), mints an upload-only access key, creates the *private*
+  # analytics bucket and the gateway's own key for it, and sets abandoned
+  # multipart uploads to be swept after a day. Safe to re-run; exits 0 when done.
   minio-init:
     image: minio/mc:latest
     depends_on:
@@ -117,6 +122,60 @@ services:
         mc admin policy create local videoshare-uploader /tmp/uploader-policy.json
         mc admin policy attach local videoshare-uploader --user videoshare-uploader
 
+        # The analytics bucket (docs/SPEC.md §16). It holds one small encrypted
+        # object per viewing session and it is PRIVATE: no anonymous policy is
+        # applied to it, deliberately and by omission. The bucket above is
+        # world-readable because share links have to work without credentials;
+        # this one must not be, or every session object would be downloadable by
+        # anyone who guessed a video id. They are separate buckets for exactly
+        # that reason, and the gateway refuses to start if you point
+        # ANALYTICS_BUCKET at the public one.
+        #
+        # It needs no CORS for writes — the gateway writes it server-side — but
+        # the stats page fetches session objects straight from presigned URLs,
+        # so it does need GET CORS from the site's origin. That is the same
+        # server-wide MINIO_API_CORS_ALLOW_ORIGIN as everything else here.
+        mc mb --ignore-existing local/videoshare-analytics
+
+        # Credentials for the gateway, and only for the gateway: they are never
+        # pasted into a browser, so they can carry the extra authority analytics
+        # needs without widening what a recorder holds.
+        #
+        # GetObject on the analytics bucket looks surprising for a service that
+        # never reads an object — but a presigned URL inherits the authority of
+        # the key that signed it, so without it the stats page's downloads would
+        # come back 403. ListBucket is scoped to the bucket itself (no /*),
+        # which is what ListObjectsV2 authorizes against, and it is granted on
+        # the analytics bucket alone: video ids stay unguessable.
+        cat > /tmp/gateway-policy.json <<'JSON'
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "VideoShareUploadOnly",
+              "Effect": "Allow",
+              "Action": ["s3:PutObject", "s3:AbortMultipartUpload"],
+              "Resource": ["arn:aws:s3:::videoshare/*"]
+            },
+            {
+              "Sid": "VideoShareAnalyticsWriteAndRead",
+              "Effect": "Allow",
+              "Action": ["s3:PutObject", "s3:GetObject"],
+              "Resource": ["arn:aws:s3:::videoshare-analytics/*"]
+            },
+            {
+              "Sid": "VideoShareAnalyticsList",
+              "Effect": "Allow",
+              "Action": ["s3:ListBucket"],
+              "Resource": ["arn:aws:s3:::videoshare-analytics"]
+            }
+          ]
+        }
+        JSON
+        mc admin user add local videoshare-gateway videoshare-gateway-secret
+        mc admin policy create local videoshare-gateway /tmp/gateway-policy.json
+        mc admin policy attach local videoshare-gateway --user videoshare-gateway
+
         # Sweep multipart uploads that were never completed — a closed tab or a
         # crashed browser mid-recording leaves parts behind, and unfinished
         # parts are billed like objects while being invisible to a plain `ls`.
@@ -142,6 +201,8 @@ services:
         echo "  Access key ID      videoshare-uploader"
         echo "  Secret access key  videoshare-uploader-secret"
         echo "  Public base URL    http://localhost:9000/videoshare"
+        echo
+        echo "  Buckets: videoshare (public read) + videoshare-analytics (private)"
         echo
 
   # OPTIONAL — the upload gateway (docs/SPEC.md §15, docs/gateway-setup.md).
@@ -171,24 +232,36 @@ services:
     depends_on:
       minio:
         condition: service_healthy
-    ports:
-      - "8787:8787"
+    # Shares MinIO's network namespace, which is what makes ONE endpoint string
+    # correct in two places at once. BUCKET_ENDPOINT is signed into URLs the
+    # *browser* dereferences, so it has to be http://localhost:9000 — and with
+    # analytics on (SPEC §16.3) the gateway also PUTs beacons to that same URL
+    # itself, which from an ordinary container would be its own loopback. Here
+    # `localhost` is MinIO's loopback for both. The cost is that the gateway
+    # cannot publish its own port; 8787 is published by the minio service above.
+    network_mode: "service:minio"
     volumes:
       - ../gateway:/app:ro
     environment:
       # http://localhost:9000, NOT http://minio:9000 — this is the endpoint the
-      # gateway *signs URLs for*, and it is the browser that dereferences them.
-      # The gateway itself never connects to the bucket at all (SPEC §15: it
-      # signs, it does not proxy), so it does not even need to resolve the name.
+      # gateway signs URLs for, and it is the browser that dereferences them.
+      # The gateway is still not in the data path (SPEC §15: it signs, it does
+      # not proxy); the one thing it sends itself is a ≤16 KiB encrypted beacon.
       BUCKET_ENDPOINT: http://localhost:9000
       BUCKET_NAME: videoshare
       BUCKET_REGION: us-east-1
-      # The same upload-only key the init job mints. The gateway needs no more
-      # authority than the recorder did: PutObject and AbortMultipartUpload.
-      # What changes is who holds it — a container you run, not every browser.
-      BUCKET_ACCESS_KEY_ID: videoshare-uploader
-      BUCKET_SECRET_ACCESS_KEY: videoshare-uploader-secret
+      # The gateway's own key, minted by the init job above. Held by a container
+      # you run rather than by every browser, so it can carry what analytics
+      # needs — write beacons, list them, and sign reads of them — on top of the
+      # recorder's PutObject and AbortMultipartUpload. Set no ANALYTICS_BUCKET
+      # and videoshare-uploader's narrower key does just as well.
+      BUCKET_ACCESS_KEY_ID: videoshare-gateway
+      BUCKET_SECRET_ACCESS_KEY: videoshare-gateway-secret
       PUBLIC_BASE_URL: http://localhost:9000/videoshare
+      # Playback analytics (SPEC §16). Comment this out and analytics is simply
+      # off: /api/config answers analytics:false, the player sends no beacons,
+      # and stats.html says so. That is a supported setup, not a broken one.
+      ANALYTICS_BUCKET: videoshare-analytics
       # Yours, from console.cloud.google.com → Clients → Create client → Web
       # application, with http://localhost and http://localhost:8080 as
       # authorized JavaScript origins. See docs/gateway-setup.md.

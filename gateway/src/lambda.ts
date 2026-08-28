@@ -74,6 +74,17 @@ function toRequest(event: LambdaFunctionUrlEvent): Request {
 
   let body: Uint8Array<ArrayBuffer> | null = null;
   if (event.body !== undefined && method !== "GET" && method !== "HEAD") {
+    // A base64 body round-trips byte for byte. A text one has already been
+    // decoded to a UTF-8 string by the time it reaches here, and the function
+    // URL — not this code — decides which arrives, from the request's
+    // Content-Type. Lossless for /api/sign's JSON; NOT provably so for §16.3's
+    // beacon, whose AES-GCM ciphertext is labelled `text/plain;charset=UTF-8`
+    // because `sendBeacon` cannot set a header. No decode recovers bytes the
+    // runtime already replaced, so this is an operational check rather than a
+    // code one: SPEC §16.9 and docs/gateway-setup.md §6 require one real beacon,
+    // read back decrypted, before a Lambda analytics rollout. The Worker and
+    // Node adapters take the body as bytes and are unaffected.
+    //
     // `BodyInit` only accepts ArrayBuffer-backed views, which a Buffer is not
     // guaranteed to be.
     body = Uint8Array.from(Buffer.from(event.body, event.isBase64Encoded ? "base64" : "utf8"));

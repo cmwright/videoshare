@@ -17,10 +17,10 @@
  * the gateway. The gateway signs; the bytes never touch it.
  */
 
-import { createServer, type Server } from "node:http";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { SignJWT, exportJWK, generateKeyPair, type JWK } from "jose";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { handleRequest, type GatewayEnv } from "../gateway/src/core";
 import { randomId } from "../src/util";
 
@@ -31,6 +31,7 @@ const ISSUER = "https://accounts.test.invalid";
 const KID = "videoshare-test-key";
 
 const BUCKET = "videoshare";
+const ANALYTICS_BUCKET = "videoshare-analytics";
 const BUCKET_ENDPOINT = "https://s3.example.com";
 const ACCESS_KEY_ID = "AKIAEXAMPLEKEYID0000";
 /** Must never appear in anything the gateway returns. */
@@ -59,6 +60,101 @@ let jwks: { keys: JWK[] } = { keys: [] };
 let jwksServer: Server;
 let jwksUrl: string;
 
+// --- Stub bucket -------------------------------------------------------------
+
+/**
+ * A stand-in for the analytics bucket (SPEC §16.4), because the beacon endpoints
+ * are the one place in this gateway that talks to storage itself. It is a real
+ * socket, so the *whole* path runs: aws4fetch signs the request, Node's fetch
+ * sends it, and what arrives here is exactly what an S3 implementation would see.
+ * Nothing about it is mocked at the module boundary.
+ */
+interface BucketWrite {
+  method: string;
+  path: string;
+  contentType: string | null;
+  authorization: string | null;
+  body: Buffer;
+}
+
+interface StoredObject {
+  key: string;
+  size: number;
+  lastModified: string;
+}
+
+let bucketServer: Server;
+let bucketEndpoint: string;
+/** Every request the gateway made to the bucket, in order. */
+let bucketWrites: BucketWrite[] = [];
+/** What a listing answers with. */
+let bucketObjects: StoredObject[] = [];
+/** Non-null makes the bucket refuse everything with that status. */
+let bucketFailure: number | null = null;
+/** Keys per listing page, so pagination can be exercised without 1000-key pages. */
+let bucketPageSize = 1000;
+
+function resetBucket(): void {
+  bucketWrites = [];
+  bucketObjects = [];
+  bucketFailure = null;
+  bucketPageSize = 1000;
+}
+
+function listXml(prefix: string, start: number): string {
+  const matching = bucketObjects.filter((object) => object.key.startsWith(prefix));
+  const page = matching.slice(start, start + bucketPageSize);
+  const more = matching.length > start + page.length;
+  const contents = page
+    .map(
+      (object) =>
+        `<Contents><Key>${object.key}</Key><LastModified>${object.lastModified}</LastModified>` +
+        `<ETag>&quot;d41d8cd98f00b204e9800998ecf8427e&quot;</ETag><Size>${object.size}</Size>` +
+        `<StorageClass>STANDARD</StorageClass></Contents>`,
+    )
+    .join("");
+  const next = more
+    ? `<NextContinuationToken>${Buffer.from(String(start + page.length)).toString("base64")}</NextContinuationToken>`
+    : "";
+  return (
+    `<?xml version="1.0" encoding="UTF-8"?>` +
+    `<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">` +
+    `<Name>${ANALYTICS_BUCKET}</Name><Prefix>${prefix}</Prefix><KeyCount>${page.length}</KeyCount>` +
+    `<MaxKeys>${bucketPageSize}</MaxKeys><IsTruncated>${more}</IsTruncated>${contents}${next}` +
+    `</ListBucketResult>`
+  );
+}
+
+function serveBucket(req: IncomingMessage, res: ServerResponse): void {
+  const chunks: Buffer[] = [];
+  req.on("data", (chunk: Buffer) => chunks.push(chunk));
+  req.on("end", () => {
+    const url = new URL(req.url ?? "/", "http://bucket.invalid");
+    bucketWrites.push({
+      method: req.method ?? "GET",
+      path: url.pathname,
+      contentType: req.headers["content-type"] ?? null,
+      authorization: req.headers["authorization"] ?? null,
+      body: Buffer.concat(chunks),
+    });
+
+    if (bucketFailure !== null) {
+      res.writeHead(bucketFailure, { "content-type": "application/xml" });
+      res.end("<Error><Code>InternalError</Code><Message>nope</Message></Error>");
+      return;
+    }
+    if (url.searchParams.get("list-type") === "2") {
+      const token = url.searchParams.get("continuation-token");
+      const start = token === null ? 0 : Number(Buffer.from(token, "base64").toString());
+      res.writeHead(200, { "content-type": "application/xml" });
+      res.end(listXml(url.searchParams.get("prefix") ?? "", start));
+      return;
+    }
+    res.writeHead(200, { etag: '"d41d8cd98f00b204e9800998ecf8427e"' });
+    res.end();
+  });
+}
+
 beforeAll(async () => {
   const real = await generateKeyPair("RS256", { extractable: true });
   const stranger = await generateKeyPair("RS256", { extractable: true });
@@ -77,12 +173,25 @@ beforeAll(async () => {
   });
   await new Promise<void>((resolve) => jwksServer.listen(0, "127.0.0.1", resolve));
   jwksUrl = `http://127.0.0.1:${(jwksServer.address() as AddressInfo).port}/jwks`;
+
+  bucketServer = createServer(serveBucket);
+  await new Promise<void>((resolve) => bucketServer.listen(0, "127.0.0.1", resolve));
+  bucketEndpoint = `http://127.0.0.1:${(bucketServer.address() as AddressInfo).port}`;
+});
+
+afterEach(() => {
+  resetBucket();
+  vi.restoreAllMocks();
 });
 
 afterAll(async () => {
-  await new Promise<void>((resolve, reject) =>
-    jwksServer.close((err) => (err ? reject(err) : resolve())),
-  );
+  for (const server of [jwksServer, bucketServer]) {
+    // Both are spoken to over keep-alive connections, which `close()` waits on.
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) =>
+      server.close((err) => (err ? reject(err) : resolve())),
+    );
+  }
 });
 
 // --- Environment -------------------------------------------------------------
@@ -209,17 +318,26 @@ async function sign(body: unknown, options: CallOptions = {}): Promise<Answer> {
  * Every presigned URL must point at the bucket, carry a complete SigV4 query
  * signature, and address exactly the key the gateway chose.
  */
-function expectPresigned(url: unknown, objectKey: string, region = "us-east-1"): URL {
+interface PresignExpectations {
+  region?: string;
+  /** Defaults to the video bucket's; the analytics suites pass the stub's. */
+  endpoint?: string;
+  bucket?: string;
+}
+
+function expectPresigned(
+  url: unknown,
+  objectKey: string,
+  { region = "us-east-1", endpoint = BUCKET_ENDPOINT, bucket = BUCKET }: PresignExpectations = {},
+): URL {
   expect(typeof url, "presigned url is a string").toBe("string");
   const parsed = new URL(url as string);
 
   // The hard invariant of SPEC §15: bytes go browser↔bucket. A URL pointing at
   // the gateway would mean the gateway is in the data path.
-  expect(parsed.origin, "presigned URLs must address the bucket, never the gateway").toBe(
-    BUCKET_ENDPOINT,
-  );
+  expect(parsed.origin, "presigned URLs must address the bucket, never the gateway").toBe(endpoint);
   // Path-style, and the key is the gateway's, not the caller's.
-  expect(parsed.pathname).toBe(`/${BUCKET}/${objectKey}`);
+  expect(parsed.pathname).toBe(`/${bucket}/${objectKey}`);
 
   const query = parsed.searchParams;
   expect(query.get("X-Amz-Algorithm")).toBe("AWS4-HMAC-SHA256");
@@ -251,7 +369,7 @@ function expectError(answer: Answer, status: number, label: string): void {
 // --- Config ------------------------------------------------------------------
 
 describe("GET /api/config", () => {
-  it("is public and returns exactly the three fields the recorder needs", async () => {
+  it("is public and returns exactly the four fields the client needs", async () => {
     const answer = await call(undefined, { method: "GET", url: CONFIG_URL, token: null });
 
     expect(answer.status).toBe(200);
@@ -259,7 +377,61 @@ describe("GET /api/config", () => {
       gateway: true,
       publicBaseUrl: "https://pub.example.com/videoshare",
       googleClientId: CLIENT_ID,
+      analytics: false,
     });
+  });
+
+  it("reports analytics: true once ANALYTICS_BUCKET names a bucket", async () => {
+    const answer = await call(undefined, {
+      method: "GET",
+      url: CONFIG_URL,
+      token: null,
+      envOverrides: { ANALYTICS_BUCKET },
+    });
+
+    expect(answer.status, answer.text).toBe(200);
+    expect(answer.json.analytics).toBe(true);
+  });
+
+  it("reports analytics: false when ANALYTICS_BUCKET is unset, which is a supported setup", async () => {
+    const answer = await call(undefined, {
+      method: "GET",
+      url: CONFIG_URL,
+      token: null,
+      envOverrides: { ANALYTICS_BUCKET: undefined },
+    });
+
+    expect(answer.status, answer.text).toBe(200);
+    expect(answer.json.analytics).toBe(false);
+    // Never absent: a site reading `undefined` and one reading `false` must not
+    // be able to disagree about whether this gateway takes beacons.
+    expect(Object.keys(answer.json)).toContain("analytics");
+  });
+
+  it("refuses to start when ANALYTICS_BUCKET is the video bucket", async () => {
+    // SPEC §16.4: §3's bucket is world-readable by design. Watch data landing in
+    // it would be published, so this is a boot-time failure, not a runtime one.
+    const answer = await call(undefined, {
+      method: "GET",
+      url: CONFIG_URL,
+      token: null,
+      envOverrides: { ANALYTICS_BUCKET: BUCKET },
+    });
+
+    expect(answer.status).toBe(500);
+    expect(String(answer.json.error)).toContain("ANALYTICS_BUCKET");
+  });
+
+  it("refuses an ANALYTICS_BUCKET name that is not a bucket name", async () => {
+    for (const name of ["has/slash", "has?query", "x", "-leading-dash".repeat(8)]) {
+      const answer = await call(undefined, {
+        method: "GET",
+        url: CONFIG_URL,
+        token: null,
+        envOverrides: { ANALYTICS_BUCKET: name },
+      });
+      expect(answer.status, `ANALYTICS_BUCKET=${name}`).toBe(500);
+    }
   });
 
   it("leaks no bucket credentials and no whitelist", async () => {
@@ -692,7 +864,416 @@ describe("POST /api/sign — presigned URLs", () => {
   it("defaults BUCKET_REGION to auto, the value R2 wants", async () => {
     const answer = await sign({ op: "create", id }, { envOverrides: { BUCKET_REGION: undefined } });
     expect(answer.status, answer.text).toBe(200);
-    expectPresigned(answer.json.url, videoKey, "auto");
+    expectPresigned(answer.json.url, videoKey, { region: "auto" });
+  });
+});
+
+// --- Analytics beacons -------------------------------------------------------
+
+const GATEWAY_ORIGIN = "https://gateway.example.com";
+
+interface BeaconOptions {
+  body?: Uint8Array;
+  method?: string;
+  token?: string;
+  origin?: string;
+  envOverrides?: EnvOverrides;
+}
+
+/**
+ * Drives a beacon route against the stub bucket. `ANALYTICS_BUCKET` is on by
+ * default here; a test that wants it off overrides it to `undefined`.
+ */
+async function beacon(path: string, options: BeaconOptions = {}): Promise<Answer> {
+  const headers = new Headers();
+  if (options.token) headers.set("authorization", `Bearer ${options.token}`);
+  if (options.origin) headers.set("origin", options.origin);
+
+  const method = options.method ?? (options.body === undefined ? "GET" : "POST");
+  const init: RequestInit = { method, headers };
+  if (options.body !== undefined && method !== "GET" && method !== "HEAD" && method !== "OPTIONS") {
+    // What `navigator.sendBeacon` sends: raw bytes under a CORS-safelisted
+    // content type it cannot override (SPEC §16.3). The gateway never reads it.
+    headers.set("content-type", "text/plain;charset=UTF-8");
+    init.body = options.body as BodyInit;
+  }
+
+  const res = await handleRequest(
+    new Request(`${GATEWAY_ORIGIN}${path}`, init),
+    env({ BUCKET_ENDPOINT: bucketEndpoint, ANALYTICS_BUCKET, ...options.envOverrides }),
+  );
+  const text = await res.text();
+  let json: Record<string, unknown> = {};
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (parsed && typeof parsed === "object") json = parsed as Record<string, unknown>;
+  } catch {
+    // A 204 has no body at all; tests that care assert on `status`.
+  }
+  return { status: res.status, text, json, headers: res.headers };
+}
+
+/** A stand-in for `IV ‖ ciphertext ‖ tag` — opaque to everything being tested. */
+function ciphertext(length = 291): Uint8Array {
+  return Uint8Array.from({ length }, (_, i) => (i * 37 + 11) % 256);
+}
+
+function puts(): BucketWrite[] {
+  return bucketWrites.filter((write) => write.method === "PUT");
+}
+
+describe("POST /beacon/{videoId}/{sessionId}", () => {
+  it("stores the body verbatim at {videoId}/{sessionId}.bin and answers 204", async () => {
+    const videoId = randomId();
+    const sessionId = randomId();
+    const body = ciphertext();
+
+    const answer = await beacon(`/beacon/${videoId}/${sessionId}`, { body, origin: SITE_ORIGIN });
+
+    expect(answer.status, answer.text).toBe(204);
+    expect(answer.text, "204 means 204 — nothing to read back").toBe("");
+    expect(puts()).toHaveLength(1);
+
+    const write = puts()[0]!;
+    expect(write.path, "the key is built server-side from two validated ids").toBe(
+      `/${ANALYTICS_BUCKET}/${videoId}/${sessionId}.bin`,
+    );
+    expect(write.body.equals(Buffer.from(body)), "ciphertext is stored byte for byte").toBe(true);
+    expect(write.contentType).toBe("application/octet-stream");
+    expect(write.authorization, "the gateway signs the write with its own credentials").toContain(
+      "AWS4-HMAC-SHA256",
+    );
+  });
+
+  it("never touches the video bucket", async () => {
+    await beacon(`/beacon/${randomId()}/${randomId()}`, { body: ciphertext() });
+    for (const write of bucketWrites) {
+      expect(write.path.startsWith(`/${ANALYTICS_BUCKET}/`), write.path).toBe(true);
+    }
+  });
+
+  it("requires no Authorization header: viewers have no identity", async () => {
+    const answer = await beacon(`/beacon/${randomId()}/${randomId()}`, { body: ciphertext() });
+    expect(answer.status, answer.text).toBe(204);
+  });
+
+  it("writes no log line at all on success", async () => {
+    // SPEC §16.4. Not the session id, not a size, not an origin — a beacon is
+    // the one request in this gateway with a *viewer* behind it.
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const answer = await beacon(`/beacon/${randomId()}/${randomId()}`, {
+      body: ciphertext(),
+      origin: SITE_ORIGIN,
+    });
+
+    expect(answer.status).toBe(204);
+    expect(log).not.toHaveBeenCalled();
+    expect(error).not.toHaveBeenCalled();
+  });
+
+  const badIds: Array<[string, string]> = [
+    ["21 characters", "aaaaaaaaaaaaaaaaaaaaa"],
+    ["23 characters", "aaaaaaaaaaaaaaaaaaaaaaa"],
+    ["a dot", "aaaaaaaaaaa.aaaaaaaaaa"],
+    ["a percent escape", "aaaaaaaaaa%2Faaaaaaaaa"],
+    ["an encoded traversal", "..%2F..%2F..%2Fetc%2Fpw"],
+    ["an encoded id of the right length", encodeURIComponent("aaaaaaaaaa+aaaaaaaaaaa")],
+  ];
+
+  it.each(badIds)("rejects a videoId with %s", async (_label, videoId) => {
+    const answer = await beacon(`/beacon/${videoId}/${randomId()}`, { body: ciphertext() });
+    expectError(answer, 400, `videoId=${videoId}`);
+    expect(puts(), "nothing is written for a path that did not validate").toHaveLength(0);
+  });
+
+  it.each(badIds)("rejects a sessionId with %s", async (_label, sessionId) => {
+    const answer = await beacon(`/beacon/${randomId()}/${sessionId}`, { body: ciphertext() });
+    expectError(answer, 400, `sessionId=${sessionId}`);
+    expect(puts()).toHaveLength(0);
+  });
+
+  it("404s a path with a third segment rather than reading it as a key", async () => {
+    const answer = await beacon(`/beacon/${randomId()}/${randomId()}/video.bin`, {
+      body: ciphertext(),
+    });
+    expect(answer.status).toBe(404);
+    expect(puts()).toHaveLength(0);
+  });
+
+  it("accepts a body of exactly MAX_BEACON_BYTES", async () => {
+    const answer = await beacon(`/beacon/${randomId()}/${randomId()}`, {
+      body: ciphertext(16384),
+    });
+    expect(answer.status, answer.text).toBe(204);
+    expect(puts()).toHaveLength(1);
+  });
+
+  it("rejects one byte more with 413 and stores nothing", async () => {
+    const answer = await beacon(`/beacon/${randomId()}/${randomId()}`, {
+      body: ciphertext(16385),
+    });
+    expectError(answer, 413, "oversized beacon");
+    expect(puts()).toHaveLength(0);
+  });
+
+  it("rejects an empty body with 413, the same as an oversized one", async () => {
+    // SPEC §16.3 gives the accepted body as a range — "1…MAX_BEACON_BYTES bytes
+    // … → else 413" — so a zero-byte beacon falls outside it just as 16385 does.
+    const answer = await beacon(`/beacon/${randomId()}/${randomId()}`, { body: new Uint8Array(0) });
+    expectError(answer, 413, "empty beacon");
+    expect(puts()).toHaveLength(0);
+  });
+
+  it("404s when the gateway has no ANALYTICS_BUCKET", async () => {
+    const answer = await beacon(`/beacon/${randomId()}/${randomId()}`, {
+      body: ciphertext(),
+      envOverrides: { ANALYTICS_BUCKET: undefined },
+    });
+    expectError(answer, 404, "analytics disabled");
+    expect(bucketWrites, "a disabled gateway does not talk to storage at all").toHaveLength(0);
+  });
+
+  it.each(["GET", "PUT", "DELETE", "PATCH"])("refuses %s on the write path with 405", async (method) => {
+    const answer = await beacon(`/beacon/${randomId()}/${randomId()}`, { method });
+    expectError(answer, 405, method);
+    expect(answer.headers.get("allow")).toContain("POST");
+  });
+
+  it("refuses an origin that is not in ALLOWED_ORIGINS", async () => {
+    const answer = await beacon(`/beacon/${randomId()}/${randomId()}`, {
+      body: ciphertext(),
+      origin: EVIL_ORIGIN,
+    });
+    expectError(answer, 403, "unlisted origin");
+    expect(puts()).toHaveLength(0);
+  });
+
+  it("echoes an allowed origin on the 204", async () => {
+    // The client never reads this answer, but the beacon must not be the one
+    // route whose CORS behaviour differs from every other.
+    const answer = await beacon(`/beacon/${randomId()}/${randomId()}`, {
+      body: ciphertext(),
+      origin: SITE_ORIGIN,
+    });
+    expect(answer.status).toBe(204);
+    expect(answer.headers.get("access-control-allow-origin")).toBe(SITE_ORIGIN);
+    expect(answer.headers.get("access-control-allow-credentials")).toBeNull();
+  });
+
+  it("answers a preflight for both halves of the route", async () => {
+    const res = await handleRequest(
+      new Request(`${GATEWAY_ORIGIN}/beacon/${randomId()}/${randomId()}`, {
+        method: "OPTIONS",
+        headers: { origin: SITE_ORIGIN, "access-control-request-method": "POST" },
+      }),
+      env({ BUCKET_ENDPOINT: bucketEndpoint, ANALYTICS_BUCKET }),
+    );
+
+    expect(res.status).toBeLessThan(300);
+    expect(res.headers.get("access-control-allow-origin")).toBe(SITE_ORIGIN);
+    const methods = res.headers.get("access-control-allow-methods") ?? "";
+    expect(methods).toContain("POST");
+    expect(methods).toContain("GET");
+  });
+
+  it("answers 502 when the bucket refuses the write, logging the id and status only", async () => {
+    bucketFailure = 500;
+    const videoId = randomId();
+    const sessionId = randomId();
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const answer = await beacon(`/beacon/${videoId}/${sessionId}`, { body: ciphertext() });
+
+    expectError(answer, 502, "bucket refused");
+    expect(error).toHaveBeenCalledTimes(1);
+    const line = String(error.mock.calls[0]?.[0] ?? "");
+    expect(line).toContain(videoId);
+    expect(line).toContain("500");
+    expect(line, "a failed write logs the video id and the status, and nothing else").not.toContain(
+      sessionId,
+    );
+  });
+
+  it("mounts at /api/beacon as well", async () => {
+    const answer = await beacon(`/api/beacon/${randomId()}/${randomId()}`, { body: ciphertext() });
+    expect(answer.status, answer.text).toBe(204);
+    expect(puts()).toHaveLength(1);
+  });
+});
+
+// --- Session listing ---------------------------------------------------------
+
+describe("GET /beacon/{videoId}", () => {
+  function store(videoId: string, count: number): string[] {
+    const sessionIds = Array.from({ length: count }, () => randomId());
+    bucketObjects = sessionIds.map((sessionId, index) => ({
+      key: `${videoId}/${sessionId}.bin`,
+      size: 200 + index,
+      lastModified: "2026-08-27T21:41:02.000Z",
+    }));
+    return sessionIds;
+  }
+
+  interface Listing {
+    sessions: { sessionId: string; lastModified: string; size: number; url: string }[];
+    truncated: boolean;
+  }
+
+  it("lists each session with a presigned GET straight at the analytics bucket", async () => {
+    const videoId = randomId();
+    const sessionIds = store(videoId, 3);
+
+    const answer = await beacon(`/beacon/${videoId}`, { token: await goodToken() });
+
+    expect(answer.status, answer.text).toBe(200);
+    const listing = answer.json as unknown as Listing;
+    expect(listing.truncated).toBe(false);
+    expect(listing.sessions.map((session) => session.sessionId)).toEqual(sessionIds);
+
+    listing.sessions.forEach((session, index) => {
+      expect(session.size).toBe(200 + index);
+      expect(session.lastModified).toBe("2026-08-27T21:41:02.000Z");
+      expectPresigned(session.url, `${videoId}/${session.sessionId}.bin`, {
+        endpoint: bucketEndpoint,
+        bucket: ANALYTICS_BUCKET,
+      });
+    });
+  });
+
+  it("returns URLs the browser dereferences, never bytes and never the gateway", async () => {
+    // SPEC §15/§16.3: the beacon write is the *only* place bytes pass through,
+    // and there is no read path. The listing hands out signatures, not objects.
+    const videoId = randomId();
+    store(videoId, 2);
+
+    const answer = await beacon(`/beacon/${videoId}`, { token: await goodToken() });
+
+    expect(answer.headers.get("content-type")).toContain("application/json");
+    expect(answer.text).not.toContain(GATEWAY_ORIGIN);
+    expect(answer.text).not.toContain(SECRET_ACCESS_KEY);
+    expect(answer.text).toContain(bucketEndpoint);
+  });
+
+  it("honours PRESIGN_EXPIRY_SECONDS on the session URLs", async () => {
+    const videoId = randomId();
+    store(videoId, 1);
+
+    const answer = await beacon(`/beacon/${videoId}`, {
+      token: await goodToken(),
+      envOverrides: { PRESIGN_EXPIRY_SECONDS: "120" },
+    });
+
+    const listing = answer.json as unknown as Listing;
+    expect(new URL(listing.sessions[0]!.url).searchParams.get("X-Amz-Expires")).toBe("120");
+  });
+
+  it("skips keys that are not {videoId}/{22 base64url}.bin", async () => {
+    const videoId = randomId();
+    const real = randomId();
+    bucketObjects = [
+      { key: `${videoId}/${real}.bin`, size: 291, lastModified: "2026-08-27T21:41:02.000Z" },
+      { key: `${videoId}/`, size: 0, lastModified: "2026-08-27T21:41:02.000Z" },
+      { key: `${videoId}/notanid.bin`, size: 7, lastModified: "2026-08-27T21:41:02.000Z" },
+      { key: `${videoId}/${real}.json`, size: 7, lastModified: "2026-08-27T21:41:02.000Z" },
+      { key: `${videoId}/nested/${real}.bin`, size: 7, lastModified: "2026-08-27T21:41:02.000Z" },
+    ];
+
+    const answer = await beacon(`/beacon/${videoId}`, { token: await goodToken() });
+
+    const listing = answer.json as unknown as Listing;
+    expect(listing.sessions.map((session) => session.sessionId)).toEqual([real]);
+  });
+
+  it("follows pagination to the cap and says so instead of trimming silently", async () => {
+    const videoId = randomId();
+    store(videoId, 1100);
+    bucketPageSize = 400;
+
+    const answer = await beacon(`/beacon/${videoId}`, { token: await goodToken() });
+
+    expect(answer.status, answer.text).toBe(200);
+    const listing = answer.json as unknown as Listing;
+    expect(listing.sessions).toHaveLength(1000);
+    expect(listing.truncated, "SPEC §16.3: honest truncation, not a quiet trim").toBe(true);
+    expect(bucketWrites.filter((write) => write.method === "GET").length).toBeGreaterThan(1);
+  });
+
+  it("reports truncated: false when one page holds everything", async () => {
+    const videoId = randomId();
+    store(videoId, 5);
+
+    const answer = await beacon(`/beacon/${videoId}`, { token: await goodToken() });
+    expect((answer.json as unknown as Listing).truncated).toBe(false);
+  });
+
+  it("rejects a request with no token, before it touches the bucket", async () => {
+    const answer = await beacon(`/beacon/${randomId()}`);
+    expectError(answer, 401, "no bearer");
+    expect(bucketWrites).toHaveLength(0);
+  });
+
+  it("rejects a verified token that is not on the upload whitelist with 403", async () => {
+    const token = await mintToken({ email: "carol@example.com", emailVerified: true });
+    const answer = await beacon(`/beacon/${randomId()}`, { token });
+    expectError(answer, 403, "not whitelisted");
+    expect(bucketWrites).toHaveLength(0);
+  });
+
+  it("rejects an expired token with 401", async () => {
+    const token = await mintToken({ emailVerified: true, expiresIn: "-1m" });
+    expectError(await beacon(`/beacon/${randomId()}`, { token }), 401, "expired");
+  });
+
+  it("rejects a malformed videoId with 400", async () => {
+    const token = await goodToken();
+    for (const videoId of ["short", "aaaaaaaaaaa.aaaaaaaaaa", "aaaaaaaaaa%2Faaaaaaaaa"]) {
+      expectError(await beacon(`/beacon/${videoId}`, { token }), 400, videoId);
+    }
+    expect(bucketWrites).toHaveLength(0);
+  });
+
+  it("404s when the gateway has no ANALYTICS_BUCKET, token or not", async () => {
+    const answer = await beacon(`/beacon/${randomId()}`, {
+      token: await goodToken(),
+      envOverrides: { ANALYTICS_BUCKET: undefined },
+    });
+    expectError(answer, 404, "analytics disabled");
+  });
+
+  it.each(["POST", "PUT", "DELETE"])("refuses %s on the listing path with 405", async (method) => {
+    const answer = await beacon(`/beacon/${randomId()}`, { method, token: await goodToken() });
+    expectError(answer, 405, method);
+    expect(answer.headers.get("allow")).toContain("GET");
+  });
+
+  it("answers 502 when the bucket refuses the listing", async () => {
+    bucketFailure = 503;
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    const answer = await beacon(`/beacon/${randomId()}`, { token: await goodToken() });
+    expectError(answer, 502, "bucket refused the listing");
+  });
+
+  it("mounts at /api/beacon as well", async () => {
+    const videoId = randomId();
+    store(videoId, 1);
+    const answer = await beacon(`/api/beacon/${videoId}`, { token: await goodToken() });
+    expect(answer.status, answer.text).toBe(200);
+    expect((answer.json as unknown as Listing).sessions).toHaveLength(1);
+  });
+
+  it("puts CORS headers on the listing so the stats page can read it", async () => {
+    const videoId = randomId();
+    store(videoId, 1);
+    const answer = await beacon(`/beacon/${videoId}`, {
+      token: await goodToken(),
+      origin: SITE_ORIGIN,
+    });
+    expect(answer.status, answer.text).toBe(200);
+    expect(answer.headers.get("access-control-allow-origin")).toBe(SITE_ORIGIN);
   });
 });
 

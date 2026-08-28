@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  analyticsAad,
   CHUNK_OVERHEAD,
   CHUNK_SIZE,
   chunkAad,
@@ -146,6 +147,54 @@ describe("AAD strings", () => {
     expect(chunkAad("abc", 0)).toBe("abc:video:0");
     expect(chunkAad("abc", 12)).toBe("abc:video:12");
     expect(chunkAad("abc", 1234)).toBe("abc:video:1234");
+    expect(analyticsAad("abc", "xyz")).toBe("abc:analytics:xyz");
+  });
+});
+
+describe("analytics blocks (SPEC §16.2)", () => {
+  it("round-trips a watch payload under its own session's AAD", async () => {
+    const key = await generateKey();
+    const id = randomId();
+    const sessionId = randomId();
+    const plain = randomBytes(291);
+
+    const block = await encryptBlock(key, analyticsAad(id, sessionId), plain);
+    expect(block.length).toBe(plain.length + CHUNK_OVERHEAD);
+    expectBytesEqual(
+      await decryptBlock(key, analyticsAad(id, sessionId), block),
+      plain,
+      "analytics round-trip",
+    );
+  });
+
+  it("binds a session's watch data to that session and that video", async () => {
+    // The beacon endpoint is unauthenticated (SPEC §16.3), so the AAD is what
+    // stops an object copied to another key — another session id, another
+    // video's prefix — from being read as someone's viewing. It is also what
+    // stops watch data from ever being mistaken for the video's own metadata.
+    const key = await generateKey();
+    const id = randomId();
+    const sessionA = randomId();
+    const sessionB = randomId();
+
+    const block = await encryptBlock(key, analyticsAad(id, sessionA), randomBytes(200));
+
+    await expect(decryptBlock(key, analyticsAad(id, sessionB), block)).rejects.toThrow();
+    await expect(decryptBlock(key, analyticsAad(randomId(), sessionA), block)).rejects.toThrow();
+    await expect(decryptBlock(key, metaAad(id), block)).rejects.toThrow();
+    await expect(decryptBlock(key, chunkAad(id, 0), block)).rejects.toThrow();
+  });
+
+  it("is unreadable to anyone without the video's key", async () => {
+    // Which is the whole privacy claim: watch data is readable by exactly the
+    // holders of the share link (SPEC §16.8), and by no one else — including
+    // whoever operates the bucket the object sits in.
+    const [key, other] = [await generateKey(), await generateKey()];
+    const id = randomId();
+    const sessionId = randomId();
+
+    const block = await encryptBlock(key, analyticsAad(id, sessionId), randomBytes(200));
+    await expect(decryptBlock(other, analyticsAad(id, sessionId), block)).rejects.toThrow();
   });
 });
 

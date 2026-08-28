@@ -14,6 +14,7 @@
 import { createServer } from "node:http";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import { pathToFileURL } from "node:url";
+import { MAX_BEACON_BYTES } from "./analytics.ts";
 import type { GatewayEnv } from "./core.ts";
 import { MAX_SIGN_BODY_BYTES, handleRequest, readConfig } from "./core.ts";
 
@@ -21,10 +22,11 @@ export const DEFAULT_PORT = 8787;
 
 /**
  * A transport-level backstop, not the real limit: `handleRequest` rejects
- * anything over `MAX_SIGN_BODY_BYTES` with a proper CORS-carrying 413, so this
- * only has to stop a socket from streaming gigabytes into memory first.
+ * anything over `MAX_SIGN_BODY_BYTES` (or `MAX_BEACON_BYTES`) with a proper
+ * CORS-carrying 413, so this only has to stop a socket from streaming gigabytes
+ * into memory first.
  */
-const MAX_BODY_BYTES = Math.max(MAX_SIGN_BODY_BYTES * 4, 1024 * 1024);
+const MAX_BODY_BYTES = Math.max(MAX_SIGN_BODY_BYTES * 4, MAX_BEACON_BYTES * 4, 1024 * 1024);
 
 /**
  * Builds (but does not start) the server. `env` is captured once and passed to
@@ -159,7 +161,12 @@ if (entry !== undefined && pathToFileURL(entry).href === import.meta.url) {
   }
   try {
     await startGateway(process.env, port);
-    console.log(`[videoshare-gateway] listening on http://localhost:${port} (GET /api/config, POST /api/sign)`);
+    const analytics = process.env["ANALYTICS_BUCKET"]?.trim()
+      ? ", POST /api/beacon/{id}/{session}"
+      : "";
+    console.log(
+      `[videoshare-gateway] listening on http://localhost:${port} (GET /api/config, POST /api/sign${analytics})`,
+    );
   } catch (err) {
     console.error(`[videoshare-gateway] ${err instanceof Error ? err.message : err}`);
     process.exit(1);

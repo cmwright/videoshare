@@ -153,16 +153,55 @@ test, so it stays cheap and small no matter how much you record.
 Turning it on is one line in `public/config.js`. The recorder drops its storage
 settings panel and asks you to sign in instead, keeping a small **Recording
 options** panel for the quality, codec and fallback-bitrate choices — those are
-yours, not the bucket's. Everything else — browser-side
-encryption, the key in the fragment, the anonymous player — is untouched, and
-existing share links keep working. It runs as a Cloudflare Worker, a Lambda
-function URL, or a Node process next to your bucket.
-[`docs/gateway-setup.md`](docs/gateway-setup.md) has the walkthrough, and
-`examples/docker-compose.yml` has it wired to the local stack behind a
-`--profile gateway` flag.
+yours, not the bucket's. Everything else — browser-side encryption, the key in
+the fragment, existing share links — is untouched, and the player stays
+anonymous: it holds no credentials and never asks a viewer to sign in. Exactly
+one thing does change for viewers, it is off unless you switch it on, and it is
+the analytics below. It runs as a Cloudflare Worker, a Lambda function URL, or a Node
+process next to your bucket. [`docs/gateway-setup.md`](docs/gateway-setup.md) has
+the walkthrough, and `examples/docker-compose.yml` has it wired to the local
+stack behind a `--profile gateway` flag.
 
 Without that line you are in the default mode described above: no server, no
 sign-in, credentials in your own browser.
+
+### Optional: knowing what got watched
+
+A gateway can also collect **playback analytics**, and this is the one feature
+that changes what `view.html` does. Point the gateway's `ANALYTICS_BUCKET` at a
+second, **private** bucket and the player starts reporting: every 30 seconds
+while a video plays, and once more when the tab goes away, it sends what has been
+watched so far to the gateway, which writes it to that bucket. A third page,
+`stats.html`, reads it back — sessions, unique viewers, average coverage,
+completions, and a curve of which parts people actually watched.
+
+Every one of those reports is encrypted in the viewer's tab first, with **the
+same AES key that is in the share link** — the key no server ever sees. So the
+operator of the gateway and the analytics bucket learns that *some* browser
+watched video `{id}`, roughly when (the object's timestamp, refreshed by each
+report), how many sessions exist for that id, and how many ciphertext bytes each
+one is. They do not learn which parts were watched, how much, whether it
+finished, or anything about the viewer — no account, no cookie, no fingerprint
+and no IP address, because none is read or logged on any analytics path.
+
+Three consequences to be blunt about before you switch it on:
+
+- **Watch data is readable by exactly the holders of the share link.** Sharing
+  the link shares the analytics. There is no second key and no separate audience.
+- **The player writes one `localStorage` key on the viewer's machine** —
+  `videoshare.viewer`, a single random 128-bit label, so repeat viewings from one
+  browser collapse into one "viewer". It is minted only when a report is actually
+  going to be sent, it travels inside the ciphertext, and it identifies nothing
+  but itself.
+- **Listing sessions uses the *uploader* whitelist.** Anyone in `ALLOWED_EMAILS`
+  can list the sessions for any video id they know. Ids are 128 random bits and
+  only reachable through a share link, but this is not per-video ownership and is
+  not built to be.
+
+Leaving `ANALYTICS_BUCKET` unset is a supported configuration, not a broken one,
+and it is the default: `view.html` then makes no request to the gateway beyond
+reading its config, sends nothing, and writes no key at all.
+[`docs/gateway-setup.md`](docs/gateway-setup.md) §6 has the walkthrough.
 
 ### What this does *not* protect against
 
@@ -170,8 +209,10 @@ Be clear-eyed about this list before you record anything sensitive.
 
 - **Anyone with the link can watch, forever.** The link *is* the credential.
   There is no revocation, no expiry, no per-viewer access, and no way to tell who
-  watched. Deleting a video from the recorder's library removes the local entry
-  only — the objects stay in the bucket. Forwarded link, forwarded video.
+  watched — the optional analytics above tell you *that* a link was watched and
+  how much of it, never by whom. Deleting a video from the recorder's library
+  removes the local entry only — the objects stay in the bucket. Forwarded link,
+  forwarded video.
 - **The link leaks wherever you paste it.** Chat history, browser history,
   screenshots of a chat, someone's clipboard manager. A key in a URL is
   convenient exactly because it travels, which is also the problem.

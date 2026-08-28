@@ -5,14 +5,12 @@
 import "./app.css";
 import "./player.css";
 
+import { startWatchBeacon } from "./beacon";
 import { chunkAad, decryptBlock, decryptChunkRange, importKeyB64, metaAad } from "./crypto";
 import { bufferedRanges, findGapSeek, isStalling } from "./gap";
-import { publicBaseUrl } from "./settings";
+import { fetchGatewayConfig, gatewayUrl, publicBaseUrl } from "./settings";
 import type { VideoMeta } from "./types";
-import { formatDuration } from "./util";
-
-/** `#{id}.{key}` — 22-char base64url id, 43-char base64url AES-256 key (SPEC §2). */
-const FRAGMENT_RE = /^([A-Za-z0-9_-]{22})\.([A-Za-z0-9_-]{43})$/;
+import { formatDuration, parseShareFragment } from "./util";
 
 /** Seconds of already-played video to keep buffered when evicting under quota pressure. */
 const KEEP_BEHIND_SECONDS = 10;
@@ -557,21 +555,40 @@ async function playWholeFile(meta: VideoMeta, id: string, key: CryptoKey, url: s
   startPlayback();
 }
 
-// --- Entry point ----------------------------------------------------------
+// --- Playback analytics (SPEC §16) ----------------------------------------
 
-function parseFragment(hash: string): { id: string; keyB64: string } | null {
-  let raw = hash.startsWith("#") ? hash.slice(1) : hash;
+/**
+ * Starts reporting what gets watched, if and only if this deployment asked for
+ * it: config.js must name a gateway, and that gateway must answer
+ * `analytics: true` (i.e. it has an analytics bucket). Legacy mode returns on
+ * the first line, having made no request and written no storage key.
+ *
+ * The config fetch is lazy — it happens once, after a video's metadata is in
+ * hand, so it never delays the first frame — and its failure is silent. A
+ * gateway that is down, unreachable, or answers something else simply means no
+ * analytics; the viewer came here to watch a video and hears nothing about it.
+ *
+ * Everything the beacon sends is encrypted with the key from the fragment
+ * (§16.2), which is why this is safe to do without asking: the operator learns
+ * that an id was watched and nothing about how.
+ */
+async function startAnalytics(id: string, key: CryptoKey, meta: VideoMeta): Promise<void> {
+  const base = gatewayUrl();
+  if (!base) return;
+
   try {
-    raw = decodeURIComponent(raw);
+    const config = await fetchGatewayConfig(base);
+    if (!config.analytics) return;
+    startWatchBeacon(video, { gatewayUrl: base, videoId: id, key, durationMs: meta.durationMs });
   } catch {
-    // not percent-encoded; use it as-is
+    // Unreachable, or not a gateway. Nothing to report to, and nothing to say.
   }
-  const m = FRAGMENT_RE.exec(raw.trim());
-  return m ? { id: m[1], keyB64: m[2] } : null;
 }
 
+// --- Entry point ----------------------------------------------------------
+
 async function main(): Promise<void> {
-  const fragment = parseFragment(location.hash);
+  const fragment = parseShareFragment(location.hash);
   if (!fragment) {
     showError(
       "Incomplete link",
@@ -599,6 +616,10 @@ async function main(): Promise<void> {
   setStatus("Loading…");
   const meta = await loadMeta(base, fragment.id, key);
   showMeta(meta);
+
+  // Fire and forget, before playback so the first `play` is caught: nothing
+  // below waits on it, and it can neither fail nor speak (SPEC §16.5).
+  void startAnalytics(fragment.id, key, meta);
 
   const url = `${base}/${fragment.id}/video.bin`;
   if (canStream(meta.mimeType)) {

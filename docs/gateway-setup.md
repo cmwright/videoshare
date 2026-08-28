@@ -27,8 +27,10 @@ Which means the gateway stays tiny and cheap no matter how much video you record
 a Worker on a free plan can serve a team.
 
 Everything else is unchanged. The video is still encrypted in the browser, the
-key still lives only in the share link's fragment, and **the player never touches
-the gateway** — viewing is anonymous reads from the bucket, exactly as before.
+key still lives only in the share link's fragment, and **the player never asks
+the gateway for anything** — viewing is anonymous reads from the bucket, exactly
+as before. Turn on playback analytics (§6) and the player gains exactly one
+outbound call: a small encrypted beacon it never reads a reply to.
 
 ### What it does *not* give you
 
@@ -93,6 +95,7 @@ anywhere: this list *is* the deployment.
 | `ALLOWED_EMAILS` | yes | Who may upload. Comma-separated; see below. |
 | `ALLOWED_ORIGINS` | yes | Comma-separated origins allowed to call the gateway from a browser. `*` is refused as a configuration error. |
 | `PRESIGN_EXPIRY_SECONDS` | no (`900`) | Lifetime of each signed URL, 1–3600. |
+| `ANALYTICS_BUCKET` | no | A **second, private** bucket for encrypted playback analytics. Unset means analytics is off. See §6. |
 
 `OIDC_JWKS_URL` and `OIDC_ISSUER` also exist. They point token verification at a
 different provider and are there **only** so the tests can run against a local
@@ -123,7 +126,9 @@ entry was rejected, that is in the service's own log.
 Scope them exactly as the credential-in-the-browser mode does —
 `examples/iam-uploader-policy.json`, `s3:PutObject` and
 `s3:AbortMultipartUpload` on `{bucket}/*`. The gateway needs no more authority
-than the recorder had; what changes is who holds it. Everything in
+than the recorder had (turning on `ANALYTICS_BUCKET` adds three permissions on
+that *other* bucket, and nothing on this one — §6); what changes is who holds
+it. Everything in
 `docs/storage-setup.md` still applies, including the CORS rules: the *browser*
 still talks to the bucket directly, so the bucket must still allow
 `PUT`/`POST`/`DELETE` from the site's origin and still expose `ETag`.
@@ -259,10 +264,16 @@ VIDEOSHARE_ALLOWED_EMAILS=you@example.com \
 ```
 
 It listens on `http://localhost:8787`, already pointed at the compose MinIO with
-the upload-only key that stack mints. Note that its `BUCKET_ENDPOINT` is
+a key that stack mints for it. Note that its `BUCKET_ENDPOINT` is
 `http://localhost:9000`, not `http://minio:9000`: that endpoint is what gets
-*signed into URLs the browser dereferences*, and the gateway never connects to
-the bucket at all.
+*signed into URLs the browser dereferences*, so it has to be the name a browser
+on your machine can resolve.
+
+That is also why the compose service sets `network_mode: "service:minio"` and
+publishes its port from the `minio` service. With analytics on, the gateway
+sends beacons to `BUCKET_ENDPOINT` *itself*, and `localhost` has to mean the same
+thing in the container as it does in the browser. Outside Docker — or with a real
+bucket, where the endpoint is a public hostname — the question does not arise.
 
 Outside Docker it is just a process — no framework, no build step, Node 22.18+
 strips the types itself:
@@ -360,6 +371,155 @@ If a part `PUT` comes back 403 against R2 while the same code works against
 MinIO, that is the failure this step exists to catch. Report it, and stay on
 credential-in-the-browser mode against that bucket in the meantime.
 
+## 6. Optional: playback analytics
+
+Who watched how much of a video, without the server learning any of it
+(`docs/SPEC.md` §16). The viewer's browser already holds the video's AES key — it
+is in the share link's fragment — so the player encrypts everything it has to say
+about the watch **with that same key** before sending it. The gateway and the
+bucket only ever hold ciphertext, a video id, and a random per-page-load session
+label.
+
+**Leaving `ANALYTICS_BUCKET` unset is a supported configuration, not a broken
+one.** `/api/config` then answers `analytics: false`, the player sends nothing,
+the beacon routes are `404`, and `stats.html` says so politely. Everything below
+is opt-in.
+
+```
+  viewer ─── POST /beacon/{videoId}/{sessionId} ───▶ gateway ──▶ analytics bucket
+                (≤ 16 KiB of ciphertext, no token, no reply read)
+
+  you ────── GET  /beacon/{videoId}  (Google ID token) ──▶ gateway
+         ◀── { sessions: [ { url: "https://bucket/…?X-Amz-Signature=…" } ] }
+  you ══════ fetch each url ═══════════════════════════════▶ analytics bucket
+```
+
+The beacon write is the **one** place object bytes pass through the gateway, and
+it is bounded on purpose: one direction, at most 16 KiB, opaque bytes, an object
+key the gateway builds itself from two validated ids, and **no read path at
+all**. Reading is presigned URLs like everything else.
+
+### Make the bucket
+
+A second bucket in the same account, on the same endpoint, with the same
+credentials. Two rules:
+
+- **It must be private.** No public domain attached on R2, no anonymous-read
+  policy on S3 or MinIO. `docs/storage-setup.md` walks you through making the
+  *video* bucket world-readable; do none of that here. The gateway refuses to
+  start if `ANALYTICS_BUCKET` and `BUCKET_NAME` are the same bucket, because the
+  video bucket is world-readable by design and watch data must never land in it.
+- **It needs `GET` CORS from the site's origin**, and nothing else. Writes need
+  no CORS at all — the gateway performs them server-side — but the stats page
+  fetches session objects straight from their presigned URLs, so the browser does
+  a cross-origin `GET` against the bucket. `examples/s3-cors.json` is more
+  permissive than this bucket needs; `GET` and `HEAD` from your site's origin is
+  enough. (MinIO has no per-bucket CORS and answers permissively out of the box,
+  so the compose stack needs nothing extra.)
+
+### Widen the credentials
+
+Three permissions, all of them on the analytics bucket only:
+
+```jsonc
+{
+  "Sid": "VideoShareAnalytics",
+  "Effect": "Allow",
+  "Action": ["s3:PutObject", "s3:GetObject"],   // write beacons; sign reads of them
+  "Resource": ["arn:aws:s3:::videoshare-analytics/*"]
+},
+{
+  "Sid": "VideoShareAnalyticsList",
+  "Effect": "Allow",
+  "Action": ["s3:ListBucket"],                  // the bucket itself, not /*
+  "Resource": ["arn:aws:s3:::videoshare-analytics"]
+}
+```
+
+`s3:GetObject` looks wrong for a service that never reads an object, and it is
+the one people leave out. A presigned URL carries the authority of the key that
+signed it: without `GetObject` the gateway signs URLs happily and every one of
+them comes back `403`. On R2, the equivalent is an API token scoped to both
+buckets with **Object Read & Write**.
+
+Because these are wider than the uploader's, keep them on a key of their own
+rather than reusing the one a legacy-mode browser might hold. The compose stack
+does exactly that: `videoshare-uploader` stays upload-only, and
+`videoshare-gateway` is the key with analytics on it.
+
+### Turn it on
+
+```sh
+ANALYTICS_BUCKET=videoshare-analytics
+```
+
+or `npx wrangler secret put ANALYTICS_BUCKET` (it is not secret; a var in
+`wrangler.jsonc` is just as good). Then:
+
+```sh
+curl https://<your-gateway>/api/config
+# {"gateway":true,…,"analytics":true}
+
+curl -i -X POST https://<your-gateway>/api/beacon/aaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbb \
+  --data-binary 'not really ciphertext'
+# HTTP/1.1 204  — unauthenticated on purpose: viewers have no identity
+```
+
+Rebuild the site (`npm run build`) and open `stats.html`. It is gateway-mode
+only, signs in with the same Google client id, and asks for one video's sessions
+at a time.
+
+### Lambda: smoke-test one real beacon before you roll out
+
+**Only if your gateway runs as a Lambda function URL, and only once.** A function
+URL decides whether to hand the handler the request body as text or as base64
+from the request's `Content-Type` — and the beacon's is
+`text/plain;charset=UTF-8`, because `sendBeacon` cannot set a header and a
+safelisted type is what keeps a preflight from stranding a beacon fired at
+`pagehide`. That is a text label on bytes that are pure AES-GCM ciphertext. If
+the runtime takes the label at its word and decodes the body as UTF-8, every
+sequence that is not valid UTF-8 comes back a replacement character, the adapter
+faithfully re-encodes the damage, the `PutObject` succeeds, and the `204` tells
+you nothing: the object simply never decrypts. The Worker and Node adapters carry
+the body as bytes and cannot hit this, and no test that runs on your laptop can
+prove which way the function URL goes.
+
+So prove it on the real thing. Record a fresh video, play a minute of it from its
+share link against the deployed gateway, then open `stats.html`, sign in, and
+paste that same link:
+
+- **One session, decrypted, watch percentage roughly matching what you did** —
+  the beacon survived the round trip. Nothing further to do, ever.
+- **"1 session could not be read"**, on a video whose key has not changed and
+  with nothing else in that prefix — that is this failure, and it is the reason
+  this step exists.
+
+The `curl` above is not a substitute: `'not really ciphertext'` is valid UTF-8
+and survives either path. Only real ciphertext tests the encoding decision.
+
+If it fails, move that gateway to the Worker or Node adapter, or leave
+`ANALYTICS_BUCKET` unset on it — and please report it. Recording and playback are
+unaffected either way: uploads go to presigned URLs and never put a body through
+Lambda at all.
+
+### What this does and does not hide
+
+The operator of the gateway and the bucket can see **that** a video id was
+watched, roughly **when** (the object's `LastModified`, refreshed by each flush),
+how many sessions exist for it, and how big each encrypted object is. They cannot
+see which parts were watched, how much, whether it finished, or anything about
+the viewer — no account, no cookie, and no IP address, because none is read or
+logged on any analytics path.
+
+Two consequences worth saying out loud:
+
+- **Watch data is readable by exactly the holders of the share link.** Sharing
+  the link shares the analytics. There is no separate key.
+- **The listing endpoint uses the uploader whitelist.** Anyone in
+  `ALLOWED_EMAILS` can list sessions for any video id they know. Ids are 128-bit
+  random and only reachable through a share link, but this is not per-video
+  ownership, and it is not built to be.
+
 ## Troubleshooting
 
 | What you see | Usually |
@@ -373,3 +533,10 @@ credential-in-the-browser mode against that bucket in the meantime.
 | `403` from the **bucket** on a part upload | The presigned URL expired (raise `PRESIGN_EXPIRY_SECONDS`, or check the gateway's clock), or the bucket credentials cannot `PutObject`. |
 | Upload fails with no HTTP status at all | The **bucket's** CORS, not the gateway's — the gateway answered, so its own CORS is fine. See `examples/s3-cors.json`. |
 | `503` with "could not reach the identity provider" | The gateway cannot fetch Google's JWKS. Check egress from wherever it runs. |
+| `/api/config` says `"analytics":false` | `ANALYTICS_BUCKET` is unset, or set to whitespace. Nothing else turns analytics on. |
+| Gateway exits naming `ANALYTICS_BUCKET` | Either it is not a legal bucket name, or it is the *same* bucket as `BUCKET_NAME` — which is refused, because that bucket is world-readable. |
+| `404` from `/beacon/…` on a gateway you configured | The reverse proxy is not passing the path through, or `ANALYTICS_BUCKET` is unset on the instance that answered. `/api/beacon/…` and `/beacon/…` both work. |
+| `502` from `/beacon/…` | The bucket rejected the write or the listing; the gateway's log has the video id and the storage status. Usually the credentials lack `PutObject`/`ListBucket` on the analytics bucket, or the bucket does not exist. |
+| Stats page lists sessions, then every download fails | The signing key has no `s3:GetObject` on the analytics bucket (a presigned URL is only as authorized as the key behind it), or the bucket has no `GET` CORS for the site's origin. |
+| Stats page says N sessions could not be read | Expected in small numbers: the write endpoint is unauthenticated, and a video re-uploaded under a new key leaves old sessions undecryptable. |
+| *Every* session unreadable, on a **Lambda** gateway | The function URL is likely handing the adapter the `text/plain`-labelled beacon as a UTF-8 string and mangling the ciphertext. That is what §6's one-real-beacon smoke test catches; move to the Worker or Node adapter. |

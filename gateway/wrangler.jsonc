@@ -10,6 +10,13 @@
   // browser reports them (scheme + host + port, no trailing slash). "*" is
   // refused at boot: a wildcard would let any page spend this gateway's bucket
   // credentials on behalf of a signed-in user.
+  //
+  // ANALYTICS_BUCKET is optional (SPEC §16) and commented out because unset is a
+  // supported configuration: no beacon routes, no watch data, /api/config says
+  // analytics:false. Turning it on means a SECOND bucket, private — no public
+  // r2.dev domain, no custom domain — and an API token scoped to both buckets.
+  // The gateway refuses to start if it names the same bucket as BUCKET_NAME,
+  // which is public by design. See docs/gateway-setup.md §6.
   "vars": {
     "BUCKET_ENDPOINT": "https://<account-id>.r2.cloudflarestorage.com",
     "BUCKET_NAME": "videoshare",
@@ -17,6 +24,7 @@
     "PUBLIC_BASE_URL": "https://videos.example.com",
     "ALLOWED_ORIGINS": "https://videoshare.example.com",
     "PRESIGN_EXPIRY_SECONDS": "900"
+    // "ANALYTICS_BUCKET": "videoshare-analytics"
   }
 
   // Secrets — never put these in this file. Set them once per environment:

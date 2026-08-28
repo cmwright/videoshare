@@ -175,7 +175,13 @@ export async function fetchGatewayConfig(base: string): Promise<GatewayConfig> {
         `googleClientId from GOOGLE_CLIENT_ID). See ${GATEWAY_DOCS}.`,
     );
   }
-  return { publicBaseUrl: trimTrailingSlash(text(raw.publicBaseUrl).trim()), googleClientId };
+  return {
+    publicBaseUrl: trimTrailingSlash(text(raw.publicBaseUrl).trim()),
+    googleClientId,
+    // Strictly `true`, so a gateway that omits the field — every gateway built
+    // before §16 — reads as analytics off (SPEC §16.4).
+    analytics: raw.analytics === true,
+  };
 }
 
 /** `window.VIDEOSHARE` from config.js, as far as it can be trusted (i.e. not at all). */

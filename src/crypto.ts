@@ -105,6 +105,16 @@ export function chunkAad(id: string, index: number): string {
 }
 
 /**
+ * Binds one encrypted watch-data block to one video *and* one viewing session
+ * (SPEC §16.2). The analytics write endpoint is unauthenticated, so this is what
+ * makes an object copied to another key — another session, or another video —
+ * fail to decrypt instead of quietly counting as someone's viewing.
+ */
+export function analyticsAad(id: string, sessionId: string): string {
+  return `${id}:analytics:${sessionId}`;
+}
+
+/**
  * Byte range of encrypted chunk `index` within `video.bin`, for a player Range
  * request. `end` is exclusive; `null` means "to end of object" — the final
  * chunk, whose plaintext may be shorter than a full chunk.

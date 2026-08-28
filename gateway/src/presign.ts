@@ -129,16 +129,26 @@ export function parseSignRequest(body: unknown): ParseResult {
   return { ok: false, error: `Unknown op "${op}".` };
 }
 
-/**
- * One presigner per configuration. The `AwsV4Signer` cache it holds is the
- * derived SigV4 signing key (per secret/date/region/service), so signing a
- * 100-part batch costs one key derivation, not a hundred.
- */
-export function createPresigner(config: BucketConfig): Presigner {
-  const cache = new Map<string, ArrayBuffer>();
+/** Signs one URL for one method, query-style. See `createQuerySigner`. */
+export type QuerySigner = (
+  method: "GET" | "PUT" | "POST" | "DELETE",
+  url: string,
+) => Promise<string>;
 
-  const presign = (method: "GET" | "PUT" | "POST" | "DELETE", url: string): Promise<string> =>
-    signQuery(config, cache, method, url);
+/**
+ * A query-string presigner bound to one configuration. The cache it closes over
+ * is the derived SigV4 signing key (per secret/date/region/service), so signing
+ * a 100-part batch — or a thousand analytics sessions (SPEC §16.3) — costs one
+ * key derivation, not a thousand.
+ */
+export function createQuerySigner(config: BucketConfig): QuerySigner {
+  const cache = new Map<string, ArrayBuffer>();
+  return (method, url) => signQuery(config, cache, method, url);
+}
+
+/** One presigner per configuration, over one `createQuerySigner`. */
+export function createPresigner(config: BucketConfig): Presigner {
+  const presign = createQuerySigner(config);
 
   return {
     async sign(request: SignRequest): Promise<SignResponse> {
@@ -184,8 +194,13 @@ export function createPresigner(config: BucketConfig): Presigner {
 // --- URL construction --------------------------------------------------------
 
 /** Path-style `{endpoint}/{bucket}/{key}` — works for MinIO, R2 and S3 alike. */
-function objectUrl(config: BucketConfig, objectKey: string): string {
+export function objectUrl(config: BucketConfig, objectKey: string): string {
   return `${config.endpoint}/${config.bucket}/${objectKey}`;
+}
+
+/** The bucket itself, which is what a `?list-type=2` listing addresses. */
+export function bucketUrl(config: BucketConfig): string {
+  return `${config.endpoint}/${config.bucket}`;
 }
 
 /** The only two keys this gateway will ever sign for (SPEC §3). */
@@ -219,7 +234,7 @@ function uploadIdParam(uploadId: string): string {
  * 403 that only some S3 implementations would ever produce. `URLSearchParams`
  * is not usable for the same reason (it emits `+` for space and leaves `*`).
  */
-function encodeQueryValue(value: string): string {
+export function encodeQueryValue(value: string): string {
   return encodeURIComponent(value).replace(
     /[!'()*]/g,
     (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`,

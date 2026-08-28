@@ -12,6 +12,7 @@ export default defineConfig({
       input: {
         index: page("index.html"),
         view: page("view.html"),
+        stats: page("stats.html"),
       },
     },
   },

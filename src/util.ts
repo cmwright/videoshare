@@ -66,6 +66,29 @@ export function formatDuration(ms: number): string {
   return hours > 0 ? `${hours}:${String(minutes).padStart(2, "0")}:${ss}` : `${minutes}:${ss}`;
 }
 
+/** `#{id}.{key}` — 22-char base64url id, 43-char base64url AES-256 key (SPEC §2). */
+const SHARE_FRAGMENT_RE = /^([A-Za-z0-9_-]{22})\.([A-Za-z0-9_-]{43})$/;
+
+/**
+ * Reads a share link's fragment (SPEC §2), with or without the leading `#`.
+ * Null for anything that is not exactly `{id}.{key}` — a truncated paste, a
+ * bare id, an empty hash.
+ *
+ * The player and the stats page both come at a video this way, which is why the
+ * format lives here rather than in either of them. Note that the key never
+ * leaves this parse: callers turn it into a `CryptoKey` and drop the string.
+ */
+export function parseShareFragment(fragment: string): { id: string; keyB64: string } | null {
+  let raw = fragment.startsWith("#") ? fragment.slice(1) : fragment;
+  try {
+    raw = decodeURIComponent(raw);
+  } catch {
+    // not percent-encoded; use it as-is
+  }
+  const m = SHARE_FRAGMENT_RE.exec(raw.trim());
+  return m ? { id: m[1], keyB64: m[2] } : null;
+}
+
 const BYTE_UNITS = ["B", "KB", "MB", "GB", "TB"];
 
 /** Decimal (SI) units, one decimal place above bytes: "12.3 MB". */

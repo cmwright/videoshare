@@ -30,9 +30,11 @@ import { startGateway } from "../gateway/src/node";
 import {
   CHUNK_OVERHEAD,
   CHUNK_SIZE,
+  analyticsAad,
   chunkAad,
   decryptBlock,
   decryptChunkRange,
+  encryptBlock,
   exportKeyB64,
   generateKey,
   importKeyB64,
@@ -41,12 +43,15 @@ import {
 import { createGatewaySigner, createUploadSession } from "../src/upload";
 import type { Signer } from "../src/upload";
 import { randomId } from "../src/util";
+import { parsePayload } from "../src/watch";
 import type { VideoMeta } from "../src/types";
 
 const E2E = process.env.E2E === "1";
 
 const ENDPOINT = process.env.E2E_ENDPOINT ?? "http://localhost:9000";
 const BUCKET = process.env.E2E_BUCKET ?? "videoshare";
+/** The second, PRIVATE bucket (SPEC §16.4). Created below if it is not there. */
+const ANALYTICS_BUCKET = process.env.E2E_ANALYTICS_BUCKET ?? "videoshare-analytics";
 const REGION = process.env.E2E_REGION ?? "us-east-1";
 
 /** What a viewer is given: the bucket, readable without credentials. */
@@ -101,6 +106,7 @@ function expectBytesEqual(actual: Uint8Array, expected: Uint8Array, label: strin
 }
 
 const objectUrl = (key: string): string => `${PUBLIC_BASE_URL}/${key}`;
+const analyticsUrl = (key: string): string => `${ENDPOINT}/${ANALYTICS_BUCKET}/${key}`;
 
 /** The player's Range header for one encrypted chunk; `end` is exclusive. */
 function rangeHeader(range: { start: number; end: number | null }): string {
@@ -186,6 +192,8 @@ let gatewayUrl: string;
 describe.skipIf(!E2E)("gateway end-to-end", () => {
   /** Every id the suite created, so afterAll can take it back out again. */
   const litter: string[] = [];
+  /** Analytics object keys this suite wrote, cleaned up the same way. */
+  const analyticsLitter: string[] = [];
   const track = (id: string): string => {
     litter.push(id);
     return id;
@@ -229,9 +237,16 @@ describe.skipIf(!E2E)("gateway end-to-end", () => {
       ALLOWED_EMAILS: "@team.example.com",
       ALLOWED_ORIGINS: "http://localhost:8080",
       PRESIGN_EXPIRY_SECONDS: "900",
+      ANALYTICS_BUCKET,
       OIDC_JWKS_URL: jwksUrl,
       OIDC_ISSUER: ISSUER,
     };
+
+    // The analytics bucket, created here rather than assumed, so this suite runs
+    // against a stack that predates SPEC §16. No anonymous policy is applied to
+    // it — the test below depends on it staying private.
+    const made = await rootClient.fetch(`${ENDPOINT}/${ANALYTICS_BUCKET}`, { method: "PUT" });
+    expect([200, 409], `create bucket ${ANALYTICS_BUCKET}`).toContain(made.status);
 
     gateway = await startGateway(env, 0);
     gatewayOrigin = `http://127.0.0.1:${(gateway.address() as AddressInfo).port}`;
@@ -263,6 +278,9 @@ describe.skipIf(!E2E)("gateway end-to-end", () => {
         await rootClient.fetch(objectUrl(key), { method: "DELETE" }).catch(() => undefined);
       }
     }
+    for (const key of analyticsLitter) {
+      await rootClient.fetch(analyticsUrl(key), { method: "DELETE" }).catch(() => undefined);
+    }
     const close = (server: Server | undefined): Promise<void> =>
       server
         ? new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())))
@@ -278,6 +296,8 @@ describe.skipIf(!E2E)("gateway end-to-end", () => {
       gateway: true,
       publicBaseUrl: PUBLIC_BASE_URL,
       googleClientId: CLIENT_ID,
+      // ANALYTICS_BUCKET is set for this suite, so the player will send beacons.
+      analytics: true,
     });
   });
 
@@ -497,6 +517,261 @@ describe.skipIf(!E2E)("gateway end-to-end", () => {
       });
       expect(res.headers.get("access-control-allow-origin")).not.toBe("https://evil.example.net");
       expect(res.status).toBe(403);
+    });
+  });
+
+  // --- Playback analytics (SPEC §16) -----------------------------------------
+
+  describe("encrypted playback analytics", () => {
+    const id = randomId();
+    let key: CryptoKey;
+    let keyB64: string;
+
+    /** What the player would send after `durationMs` of a watch (SPEC §16.2). */
+    function payload(sessionId: string, watched: [number, number][]) {
+      return {
+        v: 1,
+        browserId: randomId(),
+        sessionId,
+        durationMs: 93_250,
+        watched,
+        completed: false,
+        firstPlayedAt: "2026-08-27T21:04:00.000Z",
+      };
+    }
+
+    async function flush(sessionId: string, watched: [number, number][]): Promise<Response> {
+      const block = await encryptBlock(
+        key,
+        analyticsAad(id, sessionId),
+        new TextEncoder().encode(JSON.stringify(payload(sessionId, watched))),
+      );
+      analyticsLitter.push(`${id}/${sessionId}.bin`);
+      // Exactly what `navigator.sendBeacon(url, blob)` puts on the wire: raw
+      // bytes, a safelisted content type, and no Authorization header at all.
+      return fetch(`${gatewayUrl}/beacon/${id}/${sessionId}`, {
+        method: "POST",
+        headers: { "content-type": "text/plain;charset=UTF-8" },
+        body: block as Uint8Array<ArrayBuffer>,
+      });
+    }
+
+    beforeAll(async () => {
+      key = await generateKey();
+      keyB64 = await exportKeyB64(key);
+    });
+
+    it("stores an unauthenticated beacon as ciphertext only the link key opens", async () => {
+      const sessionId = randomId();
+      const res = await flush(sessionId, [
+        [0, 41_200],
+        [58_000, 93_250],
+      ]);
+      expect(res.status, await res.text()).toBe(204);
+
+      // Read it back with credentials: what landed must be the exact block the
+      // browser encrypted, and the gateway must have written nothing else.
+      const stored = await rootClient.fetch(analyticsUrl(`${id}/${sessionId}.bin`));
+      expect(stored.status, "the object is at {videoId}/{sessionId}.bin").toBe(200);
+      const block = new Uint8Array(await stored.arrayBuffer());
+
+      const viewerKey = await importKeyB64(keyB64);
+      const decoded = JSON.parse(
+        new TextDecoder().decode(await decryptBlock(viewerKey, analyticsAad(id, sessionId), block)),
+      ) as { sessionId: string; watched: [number, number][] };
+      expect(decoded.sessionId).toBe(sessionId);
+      expect(decoded.watched).toEqual([
+        [0, 41_200],
+        [58_000, 93_250],
+      ]);
+    });
+
+    it("collapses every flush of one session onto one object: the last write is the session", async () => {
+      const sessionId = randomId();
+      expect((await flush(sessionId, [[0, 10_000]])).status).toBe(204);
+      expect((await flush(sessionId, [[0, 30_000]])).status).toBe(204);
+
+      const stored = await rootClient.fetch(analyticsUrl(`${id}/${sessionId}.bin`));
+      const viewerKey = await importKeyB64(keyB64);
+      const decoded = JSON.parse(
+        new TextDecoder().decode(
+          await decryptBlock(
+            viewerKey,
+            analyticsAad(id, sessionId),
+            new Uint8Array(await stored.arrayBuffer()),
+          ),
+        ),
+      ) as { watched: [number, number][] };
+      expect(decoded.watched, "cumulative state, not a delta").toEqual([[0, 30_000]]);
+
+      const listing = await listSessions(await mintToken(UPLOADER_EMAIL));
+      expect(
+        listing.sessions.filter((session) => session.sessionId === sessionId),
+        "two flushes, one object",
+      ).toHaveLength(1);
+    });
+
+    interface Listing {
+      sessions: { sessionId: string; lastModified: string; size: number; url: string }[];
+      truncated: boolean;
+    }
+
+    async function listSessions(token: string): Promise<Listing> {
+      const res = await fetch(`${gatewayUrl}/beacon/${id}`, {
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(res.status, await res.clone().text()).toBe(200);
+      return (await res.json()) as Listing;
+    }
+
+    it("lists sessions to a whitelisted uploader and hands back readable presigned URLs", async () => {
+      const listing = await listSessions(await mintToken(UPLOADER_EMAIL));
+
+      expect(listing.truncated).toBe(false);
+      expect(listing.sessions.length).toBeGreaterThanOrEqual(2);
+
+      const viewerKey = await importKeyB64(keyB64);
+      for (const session of listing.sessions) {
+        expect(new URL(session.url).origin, "the browser fetches from the bucket").toBe(
+          new URL(ENDPOINT).origin,
+        );
+        expect(session.size).toBeGreaterThan(0);
+        expect(Number.isFinite(Date.parse(session.lastModified))).toBe(true);
+
+        // Anonymous — the presigned signature is the whole credential.
+        const object = await fetch(session.url);
+        expect(object.status, `presigned GET ${session.sessionId}`).toBe(200);
+        const decoded = JSON.parse(
+          new TextDecoder().decode(
+            await decryptBlock(
+              viewerKey,
+              analyticsAad(id, session.sessionId),
+              new Uint8Array(await object.arrayBuffer()),
+            ),
+          ),
+        ) as { sessionId: string };
+        expect(decoded.sessionId).toBe(session.sessionId);
+      }
+    });
+
+    it("round-trips one session: beacon in, presigned url out, same payload back", async () => {
+      // The whole §16 loop in one test, with nothing read out of band: the
+      // player's exact bytes go in unauthenticated, the uploader's token gets
+      // them back as a presigned url, and the *browser's* anonymous fetch of
+      // that url decrypts to the object that was sent — field for field. The
+      // tests above each check one leg; this one is the leg-to-leg identity,
+      // which is what a viewer's watch data actually has to survive.
+      const sessionId = randomId();
+      const sent = {
+        v: 1,
+        browserId: randomId(),
+        sessionId,
+        durationMs: 93_250,
+        watched: [
+          [0, 41_200],
+          [58_000, 93_250],
+        ],
+        completed: false,
+        firstPlayedAt: "2026-08-27T21:04:00.000Z",
+      };
+      const block = await encryptBlock(
+        key,
+        analyticsAad(id, sessionId),
+        new TextEncoder().encode(JSON.stringify(sent)),
+      );
+      analyticsLitter.push(`${id}/${sessionId}.bin`);
+
+      const posted = await fetch(`${gatewayUrl}/beacon/${id}/${sessionId}`, {
+        method: "POST",
+        headers: { "content-type": "text/plain;charset=UTF-8" },
+        body: block as Uint8Array<ArrayBuffer>,
+      });
+      expect(posted.status, await posted.text()).toBe(204);
+
+      const listing = await listSessions(await mintToken(UPLOADER_EMAIL));
+      const row = listing.sessions.find((session) => session.sessionId === sessionId);
+      expect(row, "the session just written is in the listing").toBeDefined();
+      expect(row!.size, "ciphertext bytes, as stored").toBe(block.byteLength);
+
+      // Anonymous, and straight at the bucket: the signature is the only
+      // credential, and the gateway is not in this request's path at all.
+      const url = new URL(row!.url);
+      expect(url.origin).toBe(new URL(ENDPOINT).origin);
+      expect(url.origin).not.toBe(gatewayOrigin);
+      const object = await fetch(row!.url);
+      expect(object.status, "presigned GET").toBe(200);
+      const fetched = new Uint8Array(await object.arrayBuffer());
+      expectBytesEqual(fetched, block, "ciphertext survived the round trip");
+
+      // Decrypted with the link key alone — the one the gateway never held.
+      const viewerKey = await importKeyB64(keyB64);
+      const back = JSON.parse(
+        new TextDecoder().decode(await decryptBlock(viewerKey, analyticsAad(id, sessionId), fetched)),
+      ) as unknown;
+      expect(back).toEqual(sent);
+      // And it is what the stats page will accept, not merely valid JSON.
+      expect(parsePayload(back)).toEqual(sent);
+    });
+
+    it("keeps the analytics bucket unreadable without a signature", async () => {
+      // The video bucket is anonymously readable by design; this one must not be,
+      // or every session object would be downloadable by anyone who guessed an id.
+      const listing = await listSessions(await mintToken(UPLOADER_EMAIL));
+      const first = listing.sessions[0]!;
+
+      const bare = await fetch(analyticsUrl(`${id}/${first.sessionId}.bin`));
+      expect(bare.status, "no anonymous read policy belongs on this bucket").toBeGreaterThanOrEqual(
+        400,
+      );
+
+      const listed = await fetch(`${ENDPOINT}/${ANALYTICS_BUCKET}?list-type=2`);
+      expect(listed.status, "and no anonymous listing either").toBeGreaterThanOrEqual(400);
+    });
+
+    it("refuses to list for a token that is not on the upload whitelist", async () => {
+      const res = await fetch(`${gatewayUrl}/beacon/${id}`, {
+        headers: { authorization: `Bearer ${await mintToken(OUTSIDER_EMAIL)}` },
+      });
+      expect(res.status).toBe(403);
+    });
+
+    it("refuses to list without a token, though writing one needs none", async () => {
+      const res = await fetch(`${gatewayUrl}/beacon/${id}`);
+      expect(res.status).toBe(401);
+    });
+
+    it("refuses a beacon over the size cap without storing anything", async () => {
+      const sessionId = randomId();
+      const res = await fetch(`${gatewayUrl}/beacon/${id}/${sessionId}`, {
+        method: "POST",
+        headers: { "content-type": "text/plain;charset=UTF-8" },
+        body: new Uint8Array(16 * 1024 + 1),
+      });
+      expect(res.status).toBe(413);
+      expect((await rootClient.fetch(analyticsUrl(`${id}/${sessionId}.bin`))).status).toBe(404);
+    });
+
+    it("never carries a stored analytics byte back through the gateway", async () => {
+      // SPEC §16.3's exception is one-directional. Everything the gateway itself
+      // answers with is JSON; the ciphertext travels browser↔bucket.
+      const res = await fetch(`${gatewayUrl}/beacon/${id}`, {
+        headers: { authorization: `Bearer ${await mintToken(UPLOADER_EMAIL)}` },
+      });
+      expect(res.headers.get("content-type")).toContain("application/json");
+      const text = await res.text();
+      expect(text).not.toContain(gatewayOrigin);
+
+      // Every URL is a derived *signature* over one key for a bounded window,
+      // not a standing credential. (A substring search for the secret is no use
+      // here: MinIO's default access key id and secret are the same string, and
+      // the access key id belongs in X-Amz-Credential. The unit suite, which
+      // holds a secret distinct from its key id, makes that check instead.)
+      const listing = JSON.parse(text) as Listing;
+      for (const session of listing.sessions) {
+        const query = new URL(session.url).searchParams;
+        expect(query.get("X-Amz-Signature")).toMatch(/^[0-9a-f]{64}$/);
+        expect(Number(query.get("X-Amz-Expires"))).toBeLessThanOrEqual(3600);
+      }
     });
   });
 });
