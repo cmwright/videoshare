@@ -1,10 +1,16 @@
-import type { LibraryEntry, Settings } from "./types";
+import type { LibraryEntry, Quality, Settings } from "./types";
 
 const SETTINGS_KEY = "videoshare.settings";
 const LIBRARY_KEY = "videoshare.library";
 
 export const DEFAULT_REGION = "us-east-1";
-export const DEFAULT_VIDEO_BITS_PER_SECOND = 2_000_000;
+export const DEFAULT_QUALITY: Quality = "standard";
+export const DEFAULT_PREFER_AV1 = false;
+/** Fallback MediaRecorder engine only (SPEC §6/§9). */
+export const DEFAULT_VIDEO_BITS_PER_SECOND = 1_200_000;
+
+/** Every accepted `quality` value, in UI order. */
+export const QUALITIES: readonly Quality[] = ["smaller", "standard", "sharper"];
 
 /** Every field of a stored object is untrusted until normalized. */
 type Raw<T> = { [K in keyof T]?: unknown };
@@ -92,6 +98,10 @@ function normalizeSettings(raw: Raw<Settings>): Settings {
     accessKeyId: text(raw.accessKeyId).trim(),
     secretAccessKey: text(raw.secretAccessKey).trim(),
     publicBaseUrl: trimTrailingSlash(text(raw.publicBaseUrl).trim()),
+    // Settings written before the two-engine rewrite carry neither key; both
+    // fall back to their defaults rather than failing the load (SPEC §9).
+    quality: quality(raw.quality),
+    preferAv1: raw.preferAv1 === true,
     videoBitsPerSecond: wholeNumber(raw.videoBitsPerSecond, DEFAULT_VIDEO_BITS_PER_SECOND, 1),
   };
 }
@@ -101,13 +111,19 @@ function toLibraryEntry(value: unknown): LibraryEntry | null {
   const raw = value as Raw<LibraryEntry>;
   const id = text(raw.id).trim();
   if (!id) return null;
-  return {
+  const entry: LibraryEntry = {
     id,
     title: text(raw.title),
     createdAt: text(raw.createdAt),
     durationMs: wholeNumber(raw.durationMs, 0, 0),
     link: text(raw.link),
   };
+  // Optional, and stays absent for entries written before v1.1 so the UI can
+  // tell "unknown size" from "zero bytes" (SPEC §9).
+  if (typeof raw.sizeBytes === "number" && Number.isFinite(raw.sizeBytes) && raw.sizeBytes >= 0) {
+    entry.sizeBytes = Math.round(raw.sizeBytes);
+  }
+  return entry;
 }
 
 function storage(): Storage | null {
@@ -138,6 +154,10 @@ function readJson(key: string): unknown {
 
 function text(value: unknown): string {
   return typeof value === "string" ? value : "";
+}
+
+function quality(value: unknown): Quality {
+  return QUALITIES.find((allowed) => allowed === value) ?? DEFAULT_QUALITY;
 }
 
 function wholeNumber(value: unknown, fallback: number, min: number): number {

@@ -21,9 +21,9 @@ serve. Browsers have done all four natively for years.
 
 So VideoShare is the smallest thing that works:
 
-- **`index.html`** — the recorder. Captures screen + mic, encodes with
-  `MediaRecorder`, encrypts with WebCrypto, and sends the ciphertext to your
-  bucket *while you are still recording*: every 8 MiB goes up as one part of a
+- **`index.html`** — the recorder. Captures screen + mic, encodes at a constant
+  quality with WebCodecs, encrypts with WebCrypto, and sends the ciphertext to
+  your bucket *while you are still recording*: every 8 MiB goes up as one part of a
   SigV4-signed S3 multipart upload, so stopping only leaves the tail to flush and
   the link lands about as fast as you can read it. One chunk is encrypted at a
   time, so an hour-long recording costs no more memory than a one-minute one.
@@ -37,16 +37,17 @@ The output is a `dist/` folder of static files. Host it on GitHub Pages,
 Cloudflare Pages, S3, or a Raspberry Pi. Anything that speaks the S3 API can be
 the bucket: Cloudflare R2, AWS S3, MinIO, Backblaze B2, Wasabi.
 
-TypeScript, no frameworks, one runtime dependency (`aws4fetch`, for request
-signing).
+TypeScript, no frameworks, two runtime dependencies: `aws4fetch` for request
+signing and `webm-muxer` for assembling the WebM container.
 
 ## Quickstart
 
 Five minutes to a working stack on your laptop: MinIO as the bucket, nginx
-serving the site. You need Node 20+ and Docker. Clone this repository, then from
-its root:
+serving the site. You need Node 20+ and Docker.
 
 ```sh
+git clone https://github.com/cmwright/videoshare
+cd videoshare
 npm install
 npm run build
 docker compose -f examples/docker-compose.yml up -d
@@ -166,18 +167,67 @@ Be clear-eyed about this list before you record anything sensitive.
 - **Recording captures what you show it.** The most common leak here is a
   notification popping up mid-take, not cryptography.
 
+## Recording quality and file size
+
+Screen recordings compress extraordinarily well — a slide, an IDE, a terminal is
+a still image with a cursor moving over it — but only if you encode for a
+quality target instead of a bitrate. A fixed bitrate spends the same bits on a
+motionless slide as on a scrolling diff, so you pick between a bloated file and
+mush the moment anything moves. VideoShare aims at the quality and lets the size
+fall where it may.
+
+Where the browser has WebCodecs (Chrome and Edge today) the recorder drives
+`VideoEncoder` directly, in **constant-quality mode**: it is handed a quantizer,
+not a bitrate, and spends whatever that quality costs. A minute of a static
+slide costs almost nothing. A minute of scrolling code costs real bytes.
+
+Typical screencasts land in the low **single-digit megabytes per minute**, and
+stretches where nothing moves cost close to nothing. Treat that as the usual
+shape rather than a promise — full-screen video, an animated wallpaper, or a lot
+of fast scrolling all cost considerably more.
+
+Three settings steer it:
+
+| Setting | Effect |
+| --- | --- |
+| **Recording quality** — smaller / standard / sharper | The quantizer the encoder aims at. `Standard` is picked to keep small text crisp; `Sharper` for dense code or fine diagrams; `Smaller` when the link matters more than the pixels. |
+| **Encode with AV1** | Off by default. AV1 typically takes another 30–50% off a file at the same quality — but a viewer on Safari without hardware AV1 decode cannot play the result at all. Turn it on when you know who is watching. |
+| **Fallback bitrate** | The fallback engine only, default 1.2 Mbps. Ignored on the WebCodecs path. |
+
+Capture itself is pinned to **1080p at 30 fps**, the video track is marked as
+screen content (`contentHint = "text"`, which tells the encoder to hold sharp
+edges rather than smooth them), and mic and system audio are mixed down to a
+single mono Opus track at 48 kbps — plenty for a voice-over, and a rounding
+error next to the video. Recording a 4K display at 60 fps would cost four times
+the bits for no extra legibility.
+
+Firefox, and anything else without WebCodecs, falls back to `MediaRecorder` at a
+flat **1.2 Mbps** of video (and 64 kbps of audio) — VP9 if the browser offers
+it, VP8 otherwise. That is a bitrate cap rather than a quality target, so the
+files are more uniform in size and less responsive to what is actually on
+screen. **Recording quality** and
+**Encode with AV1** do nothing here; **Fallback bitrate** is the only knob.
+
+Every row of the local library shows what the recording cost — `14.2 MB ·
+1.9 Mbps` — so the effect of a setting is something you can read rather than
+guess at.
+
 ## Browser support
 
 | Browser | Record | Watch |
 | --- | --- | --- |
-| Chrome / Edge (desktop) | Yes | Yes — streams progressively via MSE |
-| Firefox (desktop) | Yes | Yes — streams progressively via MSE |
+| Chrome / Edge (desktop) | Yes — WebCodecs, constant quality | Yes — streams progressively via MSE |
+| Firefox (desktop) | Yes — `MediaRecorder` at 1.2 Mbps | Yes — streams progressively via MSE |
 | Safari 16+ (macOS) | No | Yes — downloads and decrypts in full, then plays |
 | Mobile browsers | No | Best-effort, on the fallback path |
 
 **Recording is desktop-only.** It needs `getDisplayMedia`, which mobile browsers
-do not offer. Safari can capture a screen but its `MediaRecorder` will not
-produce WebM, and v1 records WebM (VP9 or VP8, Opus audio) only.
+do not offer. Safari can capture a screen, and since 16.4 it can encode video
+through WebCodecs — but the WebCodecs engine needs `VideoEncoder`,
+`AudioEncoder` and `MediaStreamTrackProcessor` together, and Safari has no
+`MediaStreamTrackProcessor` to pull raw frames off a capture track. That leaves
+the `MediaRecorder` fallback, which on Safari produces MP4 rather than WebM, and
+v1 records WebM only.
 
 **Watching works anywhere the browser can decode VP9-in-WebM.** Chrome, Edge and
 Firefox report `video/webm` support to `MediaSource`, so the player fetches,
@@ -187,13 +237,20 @@ decrypts before playback starts. Correct, just less snappy on long videos, and
 seeking is instant afterwards. macOS Safari gained WebM in 16; mobile Safari's
 support arrived later and is patchier, so treat phones as best-effort.
 
+**Turning on Prefer AV1 narrows that column.** Chrome, Edge and Firefox decode
+AV1 in software. Safari plays it only on hardware that decodes it — M3-class
+Apple silicon and newer, iPhone 15 Pro and newer — and there is no software
+fallback, so every Intel Mac, every M1 and M2, and every older iPhone gets
+nothing at all. VP9 is the default precisely because it plays everywhere the
+WebM container does.
+
 ## Development
 
 ```sh
 npm run dev        # vite dev server
 npm run build      # tsc --noEmit && vite build  ->  dist/
 npm run preview    # serve the built dist/
-npm test           # unit tests (crypto format, offset math, base64url)
+npm test           # unit tests (crypto format, offset math, base64url, codec strings)
 ```
 
 The end-to-end test drives the real streaming multipart upload against the

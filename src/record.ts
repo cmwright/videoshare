@@ -12,30 +12,32 @@ import "./record.css";
 
 import { CHUNK_OVERHEAD, CHUNK_SIZE, generateKey } from "./crypto";
 import {
+  createEngine,
+  type RecorderEngine,
+  selectEngineKind,
+  selectFallbackMimeType,
+} from "./encoder";
+import {
   addToLibrary,
-  DEFAULT_VIDEO_BITS_PER_SECOND,
+  DEFAULT_QUALITY,
   loadLibrary,
   loadSettings,
   publicBaseUrl,
+  QUALITIES,
   removeFromLibrary,
   saveSettings,
 } from "./settings";
-import type { LibraryEntry, Settings, VideoMeta } from "./types";
+import type { LibraryEntry, Quality, Settings, VideoMeta } from "./types";
 import { createUploadSession, type UploadSession } from "./upload";
 import { formatBytes, formatDuration, randomId } from "./util";
 
-const AUDIO_BITRATE = 128_000;
-const TIMESLICE_MS = 1000;
+/** Capture ceiling (SPEC §6): a 4K display downscales, and 30fps is plenty for a screen. */
+const MAX_WIDTH = 1920;
+const MAX_HEIGHT = 1080;
+const MAX_FRAME_RATE = 30;
 
 /** Cap on waiting for the preview element during the duration probe. */
 const ELEMENT_TIMEOUT_MS = 5000;
-
-/** First supported wins (SPEC §6). */
-const MIME_CANDIDATES = [
-  "video/webm;codecs=vp9,opus",
-  "video/webm;codecs=vp8,opus",
-  "video/webm",
-];
 
 // --- DOM ---------------------------------------------------------------------
 
@@ -102,13 +104,17 @@ interface Finished {
 
 let stage: Stage = "idle";
 let capture: Capture | null = null;
-let recorder: MediaRecorder | null = null;
+let engine: RecorderEngine | null = null;
+/** Set by whichever stop path arrives first, so the other one is a no-op. */
+let stopping = false;
+/** The engine reported a mid-recording failure and its message is already on screen. */
+let engineFailure: Error | null = null;
 
 let session: UploadSession | null = null;
 let videoId = "";
 let mimeType = "";
 
-/** Every dataavailable Blob, retained until the share link exists (SPEC §6). */
+/** Every emitted container slice as a Blob, retained until the share link exists (SPEC §6). */
 let recordedParts: Blob[] = [];
 let recordedBytes = 0;
 
@@ -188,10 +194,23 @@ async function copyLink(text: string, button: HTMLButtonElement): Promise<void> 
 
 // --- Settings panel ----------------------------------------------------------
 
+function control<T extends Element>(name: string, type: new () => T): T {
+  const node = settingsForm.elements.namedItem(name);
+  if (!(node instanceof type)) throw new Error(`record.ts: missing settings field ${name}`);
+  return node;
+}
+
 function field(name: string): HTMLInputElement {
-  const input = settingsForm.elements.namedItem(name);
-  if (!(input instanceof HTMLInputElement)) throw new Error(`record.ts: missing settings field ${name}`);
-  return input;
+  return control(name, HTMLInputElement);
+}
+
+function select(name: string): HTMLSelectElement {
+  return control(name, HTMLSelectElement);
+}
+
+/** The <select> can only offer valid values, but a cached page could disagree with this build. */
+function readQuality(value: string): Quality {
+  return QUALITIES.find((allowed) => allowed === value) ?? DEFAULT_QUALITY;
 }
 
 function fillSettingsForm(saved: Settings): void {
@@ -201,6 +220,8 @@ function fillSettingsForm(saved: Settings): void {
   field("accessKeyId").value = saved.accessKeyId;
   field("secretAccessKey").value = saved.secretAccessKey;
   field("publicBaseUrl").value = saved.publicBaseUrl;
+  select("quality").value = saved.quality;
+  field("preferAv1").checked = saved.preferAv1;
   field("videoBitsPerSecond").value = String(saved.videoBitsPerSecond);
 }
 
@@ -267,6 +288,8 @@ settingsForm.addEventListener("submit", (event) => {
       accessKeyId: field("accessKeyId").value,
       secretAccessKey: field("secretAccessKey").value,
       publicBaseUrl: field("publicBaseUrl").value,
+      quality: readQuality(select("quality").value),
+      preferAv1: field("preferAv1").checked,
       videoBitsPerSecond: Number(field("videoBitsPerSecond").value),
     });
   } catch (err) {
@@ -292,6 +315,27 @@ settingsForm.addEventListener("submit", (event) => {
 
 // --- Library -----------------------------------------------------------------
 
+/**
+ * Delivered bytes over wall-clock duration — what a viewer actually has to
+ * download per second, so the effect of the quality setting is visible.
+ */
+function formatBitrate(bytes: number, durationMs: number): string | null {
+  if (bytes <= 0 || durationMs <= 0) return null;
+  const mbps = (bytes * 8) / (durationMs * 1000);
+  return mbps >= 0.1 ? `${mbps.toFixed(1)} Mbps` : `${Math.round(mbps * 1000)} kbps`;
+}
+
+/** "27/08/2026, 21:04 · 1:33 · 14.2 MB · 1.9 Mbps" — the last two only when known (SPEC §9). */
+function librarySubtitle(entry: LibraryEntry): string {
+  const parts = [new Date(entry.createdAt).toLocaleString(), formatDuration(entry.durationMs)];
+  if (entry.sizeBytes !== undefined) {
+    parts.push(formatBytes(entry.sizeBytes));
+    const rate = formatBitrate(entry.sizeBytes, entry.durationMs);
+    if (rate) parts.push(rate);
+  }
+  return parts.join(" · ");
+}
+
 function libraryRow(entry: LibraryEntry): HTMLLIElement {
   const item = document.createElement("li");
   item.className = "library-item";
@@ -308,7 +352,7 @@ function libraryRow(entry: LibraryEntry): HTMLLIElement {
 
   const sub = document.createElement("div");
   sub.className = "library-sub muted";
-  sub.textContent = `${new Date(entry.createdAt).toLocaleString()} · ${formatDuration(entry.durationMs)}`;
+  sub.textContent = librarySubtitle(entry);
 
   details.append(title, sub);
 
@@ -340,10 +384,6 @@ function renderLibrary(): void {
 
 // --- Capture -----------------------------------------------------------------
 
-function pickMimeType(): string | null {
-  return MIME_CANDIDATES.find((type) => MediaRecorder.isTypeSupported(type)) ?? null;
-}
-
 function stopStream(stream: MediaStream | null): void {
   for (const track of stream?.getTracks() ?? []) track.stop();
 }
@@ -361,8 +401,14 @@ function releaseCapture(): void {
 async function startCapture(useMic: boolean): Promise<Capture> {
   // getDisplayMedia must run within the click's transient user activation, so it
   // goes first: awaiting a microphone permission prompt before it can expire it.
+  // Capped at 1080p30 (SPEC §6): a Retina or 4K display would otherwise hand the
+  // encoder four times the pixels for no legibility gain, at four times the size.
   const display = await navigator.mediaDevices.getDisplayMedia({
-    video: { frameRate: { ideal: 30 } },
+    video: {
+      frameRate: { ideal: MAX_FRAME_RATE, max: MAX_FRAME_RATE },
+      width: { max: MAX_WIDTH },
+      height: { max: MAX_HEIGHT },
+    },
     audio: true,
   });
 
@@ -382,6 +428,10 @@ async function startCapture(useMic: boolean): Promise<Capture> {
     throw new Error("The screen picker returned no video track.");
   }
 
+  // Tells the encoder this is screen content: it should hold sharp edges and
+  // small text rather than smooth motion (SPEC §6).
+  video.contentHint = "text";
+
   const recorded = new MediaStream([video]);
   const sources = [...display.getAudioTracks(), ...(mic?.getAudioTracks() ?? [])];
 
@@ -393,7 +443,14 @@ async function startCapture(useMic: boolean): Promise<Capture> {
     // Created outside the click's task, the context can start suspended — which
     // would record silence rather than fail.
     if (audio.state === "suspended") void audio.resume();
-    const destination = audio.createMediaStreamDestination();
+    // Mono: speech over a screen share gains nothing from a second channel, and
+    // "explicit" + "speakers" downmixes a stereo source instead of dropping the
+    // right channel outright.
+    const destination = new MediaStreamAudioDestinationNode(audio, {
+      channelCount: 1,
+      channelCountMode: "explicit",
+      channelInterpretation: "speakers",
+    });
     for (const track of sources) {
       audio.createMediaStreamSource(new MediaStream([track])).connect(destination);
     }
@@ -407,9 +464,10 @@ async function startCapture(useMic: boolean): Promise<Capture> {
 // --- Streaming assembler -----------------------------------------------------
 
 /**
- * MediaRecorder hands us a Blob per second; the upload wants CHUNK_SIZE-sized
- * plaintext chunks. Slicing Blobs (rather than concatenating ArrayBuffers) keeps
- * the recording on the browser's blob storage, where it can spill to disk.
+ * The engine emits container bytes in whatever sizes the muxer produces; the
+ * upload wants CHUNK_SIZE-sized plaintext chunks. Slicing Blobs (rather than
+ * concatenating ArrayBuffers) keeps the recording on the browser's blob
+ * storage, where it can spill to disk.
  */
 function queuePump(): void {
   pump = pump.then(sendFullChunks).catch(reportPumpError);
@@ -470,8 +528,9 @@ async function startRecording(): Promise<void> {
 
   setStage("picking");
 
+  let acquired: Capture;
   try {
-    capture = await startCapture(micToggle.checked);
+    acquired = await startCapture(micToggle.checked);
   } catch (err) {
     setStage("idle");
     const name = err instanceof DOMException ? err.name : "";
@@ -489,26 +548,23 @@ async function startRecording(): Promise<void> {
     return;
   }
 
+  capture = acquired;
+  const videoTrack = acquired.display.getVideoTracks()[0];
+
   // The browser's own "Stop sharing" bar ends the video track instead of calling
-  // us, and it can be pressed during the awaits below — before there is a
-  // recorder to stop. The listener goes on now so the event is never missed; the
-  // guard around start() below catches the case where it already fired.
-  capture.display.getVideoTracks()[0]?.addEventListener("ended", () => stopRecording());
+  // us, and it can be pressed during the awaits below — before there is an
+  // engine to stop. The listener goes on now so the event is never missed; the
+  // readyState guard below catches the case where it already fired.
+  videoTrack.addEventListener("ended", () => stopRecording());
 
-  const type = pickMimeType();
-  if (!type) {
-    releaseCapture();
-    setStage("idle");
-    showError("This browser cannot record WebM. Try Chrome, Edge, or Firefox.");
-    return;
-  }
-
-  let started: MediaRecorder;
+  // The engine picks its own codec and container; `stopped()` reads the string
+  // it actually settled on once it has stopped (SPEC §6).
+  let started: RecorderEngine;
   try {
-    started = new MediaRecorder(capture.recorded, {
-      mimeType: type,
-      videoBitsPerSecond: settings.videoBitsPerSecond || DEFAULT_VIDEO_BITS_PER_SECOND,
-      audioBitsPerSecond: AUDIO_BITRATE,
+    started = createEngine({
+      quality: settings.quality,
+      preferAv1: settings.preferAv1,
+      fallbackVideoBitsPerSecond: settings.videoBitsPerSecond,
     });
   } catch (err) {
     releaseCapture();
@@ -530,10 +586,25 @@ async function startRecording(): Promise<void> {
     return;
   }
 
+  // Sharing was stopped while the engine and upload were being set up. A dead
+  // track produces no frames rather than an error, so recording would otherwise
+  // sit at 00:00 forever.
+  if (videoTrack.readyState === "ended") {
+    releaseCapture();
+    setStage("idle");
+    void opened.abort();
+    showNote("Screen sharing stopped before the recording began.");
+    return;
+  }
+
   session = opened;
   videoId = id;
-  mimeType = type;
-  recorder = started;
+  // A placeholder so no string from an earlier recording can survive here; the
+  // engine's real one replaces it in stopped().
+  mimeType = started.mimeType;
+  engine = started;
+  stopping = false;
+  engineFailure = null;
   recordedParts = [];
   recordedBytes = 0;
   assembly = [];
@@ -541,16 +612,36 @@ async function startRecording(): Promise<void> {
   pump = Promise.resolve();
   finished = null;
 
-  started.addEventListener("dataavailable", (event) => {
-    if (event.data.size === 0) return;
-    recordedParts.push(event.data);
-    recordedBytes += event.data.size;
-    assembly.push(event.data);
-    assemblyBytes += event.data.size;
-    queuePump(); // returns immediately; the upload happens off this handler
-  });
-  started.addEventListener("error", () => showError("The recorder failed mid-capture."));
-  started.addEventListener("stop", () => void stopped());
+  started.ondata = (bytes: Uint8Array) => {
+    if (bytes.byteLength === 0) return;
+    // The Blob constructor copies the bytes synchronously, so the engine is free
+    // to reuse the buffer once this returns, and Blob parts let the browser spill
+    // the retained recording to disk (SPEC §6). The cast only drops the
+    // SharedArrayBuffer arm of `Uint8Array`, which BlobPart excludes and no
+    // encoder produces.
+    const part = new Blob([bytes as BlobPart]);
+    recordedParts.push(part);
+    recordedBytes += part.size;
+    assembly.push(part);
+    assemblyBytes += part.size;
+    queuePump(); // returns immediately; the upload happens off this callback
+  };
+
+  started.onerror = (err: Error) => {
+    // A dead engine emits nothing and never says so again (SPEC §6), so the
+    // capture has to end here rather than whenever the user next looks up: the
+    // timer would otherwise keep counting over a recording nothing is being
+    // added to, and the multipart upload would sit open behind it. Stopping
+    // takes the normal path, so the bytes already captured reach the preview
+    // and can still be finished or discarded.
+    if (engine !== started || engineFailure) return;
+    engineFailure = err;
+    showError(
+      `Recording stopped — the encoder failed. ${describe(err)} ` +
+        "What was captured up to that point is intact: finish to upload it, or discard it.",
+    );
+    stopRecording();
+  };
 
   startedAt = performance.now();
   timerLabel.textContent = formatClock(0);
@@ -562,9 +653,7 @@ async function startRecording(): Promise<void> {
   }, 250);
 
   try {
-    // Throws if sharing was stopped while the upload was being created: the
-    // stream is inactive and there is nothing left to record.
-    started.start(TIMESLICE_MS);
+    started.start(acquired.recorded);
   } catch (err) {
     window.clearInterval(timerId);
     timerId = 0;
@@ -578,31 +667,62 @@ async function startRecording(): Promise<void> {
   setStage("recording");
 }
 
+/** Both stop paths land here — the Stop button and the track's `ended` event. */
 function stopRecording(): void {
-  if (recorder && recorder.state !== "inactive") recorder.stop();
+  if (!engine || stopping) return;
+  stopping = true;
+  void stopped(engine);
 }
 
-async function stopped(): Promise<void> {
+async function stopped(active: RecorderEngine): Promise<void> {
   window.clearInterval(timerId);
   timerId = 0;
   const durationMs = Math.max(0, Math.round(performance.now() - startedAt));
-  releaseCapture();
-  recorder = null;
-
-  if (recordedBytes === 0) {
-    const abandoned = session;
-    resetRecording();
-    setStage("idle");
-    showError("Nothing was captured.");
-    if (abandoned) void abandoned.abort();
-    return;
-  }
 
   // Draining a backlog can take a while on a bad network (every queued part
   // burns the retry ladder), so say that the stop registered before waiting.
   draining = true;
   stopButton.disabled = true;
   showUploaded(session?.uploadedBytes ?? 0);
+
+  // Flush before anything else: stop() resolves only after its final ondata
+  // call, and those bytes still have to reach the assembler (SPEC §6). The
+  // tracks stay live until it resolves so the encoder can drain them.
+  //
+  // A failure `onerror` already reported is on screen with what happens next;
+  // stop() only hands the same one back, so it is not written over.
+  let engineError: unknown = engineFailure;
+  try {
+    await active.stop();
+  } catch (err) {
+    engineError = err;
+    if (!engineFailure) {
+      showError(`The recording engine failed while finishing up. ${describe(err)}`);
+    }
+  }
+
+  // Now, not at createEngine(): the string read before start() is only a guess.
+  // The WebCodecs engine confirms its codec asynchronously, learns the real
+  // frame size (and so the level digits) from the first frame, and drops
+  // ",opus" if no audio ever arrived. `meta.mimeType` must be what was actually
+  // written (SPEC §6), and the player feeds it straight to MSE (SPEC §8).
+  mimeType = active.mimeType;
+  engine = null;
+  releaseCapture();
+
+  if (recordedBytes === 0) {
+    const abandoned = session;
+    draining = false;
+    resetRecording();
+    setStage("idle");
+    // Without the engine's own error this reads as "you recorded nothing",
+    // which hides the actual reason the recording never started.
+    showError(
+      engineError ? `Nothing was captured. ${describe(engineError)}` : "Nothing was captured.",
+    );
+    if (abandoned) void abandoned.abort();
+    return;
+  }
 
   // Drain the assembler; whatever will not fill a chunk becomes the final part.
   queuePump();
@@ -654,7 +774,7 @@ function previewEvent(types: readonly string[]): Promise<void> {
 }
 
 /**
- * MediaRecorder writes no duration into the WebM header and it is not patched
+ * Neither engine writes a duration into the WebM header, and it is not patched
  * in (SPEC §6: chunk 0 may already be uploaded), so the element reports Infinity
  * and shows no seek bar. Seeking far past the end makes the browser scan for the
  * real duration; the element is paused throughout, so nothing starts playing.
@@ -696,7 +816,9 @@ function setDownloadSource(blob: Blob | null): void {
 /** Drops the recording and its session. The Blobs live until here (SPEC §6). */
 function resetRecording(): void {
   session = null;
-  recorder = null;
+  engine = null;
+  stopping = false;
+  engineFailure = null;
   recordedParts = [];
   recordedBytes = 0;
   assembly = [];
@@ -767,6 +889,9 @@ async function runFinish(current: Finished, active: UploadSession): Promise<void
     createdAt: meta.createdAt,
     durationMs: meta.durationMs,
     link,
+    // Plaintext bytes, i.e. what a viewer downloads — the library turns this
+    // plus the duration into an effective bitrate (SPEC §9).
+    sizeBytes: meta.totalBytes,
   });
   renderLibrary();
 
@@ -810,13 +935,24 @@ window.addEventListener("beforeunload", (event) => {
 });
 
 function checkSupport(): void {
-  const supported =
-    typeof MediaRecorder !== "undefined" &&
-    typeof navigator.mediaDevices?.getDisplayMedia === "function";
+  // Ask the encoder module which engine this browser gets, rather than
+  // re-deriving its rules here and drifting from them. The fallback engine
+  // additionally needs a WebM type it can record: Safari has MediaRecorder but
+  // only in containers this app cannot chunk, encrypt and play back, and the
+  // user should learn that now rather than after picking a screen.
+  const kind = selectEngineKind();
+  const canEncode =
+    kind === "webcodecs" || (kind === "mediarecorder" && selectFallbackMimeType() !== null);
+  const supported = canEncode && typeof navigator.mediaDevices?.getDisplayMedia === "function";
   if (supported) return;
   startButton.disabled = true;
   micToggle.disabled = true;
-  showError("This browser cannot capture the screen. Try Chrome, Edge, or Firefox on a desktop.");
+  showError(
+    canEncode
+      ? "This browser cannot capture the screen. Try Chrome, Edge, or Firefox on a desktop."
+      : "This browser cannot record WebM video. Try Chrome, Edge, or Firefox on a desktop — " +
+          "you can still watch shared links here.",
+  );
 }
 
 setStage("idle");

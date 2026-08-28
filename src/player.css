@@ -153,6 +153,16 @@
   font-size: 0.8125rem;
 }
 
+.footer a {
+  color: var(--text-faint);
+  text-decoration: none;
+}
+
+.footer a:hover {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
 @media (max-width: 600px) {
   .page {
     padding: var(--space-4) var(--space-3) var(--space-3);

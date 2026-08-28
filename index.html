@@ -74,15 +74,40 @@
             </div>
 
             <div class="field">
-              <label for="videoBitsPerSecond">Video bitrate (bits/s)</label>
+              <label for="quality">Recording quality</label>
+              <select id="quality" name="quality">
+                <option value="smaller">Smaller — smallest files</option>
+                <option value="standard" selected>Standard — crisp text</option>
+                <option value="sharper">Sharper — largest files</option>
+              </select>
+              <p class="muted hint">Constant quality, so busy screens cost more bytes than still ones.</p>
+            </div>
+
+            <div class="field">
+              <label for="videoBitsPerSecond">Fallback bitrate (bits/s)</label>
               <input
                 id="videoBitsPerSecond"
                 name="videoBitsPerSecond"
                 type="number"
                 min="100000"
                 step="100000"
-                value="2000000"
+                value="1200000"
               />
+              <p class="muted hint">
+                Only used on browsers without WebCodecs (Firefox, Safari), where recording falls back
+                to MediaRecorder. Ignored in Chrome and Edge.
+              </p>
+            </div>
+
+            <div class="field wide">
+              <label class="toggle">
+                <input id="preferAv1" name="preferAv1" type="checkbox" />
+                <span>Encode with AV1 when this browser supports it</span>
+              </label>
+              <p class="muted hint">
+                AV1 makes recordings roughly 30–50% smaller than VP9, but viewers on Safari without
+                AV1 hardware decode cannot play them. Leave off if you share links widely.
+              </p>
             </div>
           </div>
 

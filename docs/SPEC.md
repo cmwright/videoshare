@@ -71,7 +71,7 @@ Two objects per video, under the id as prefix:
 {
   "v": 1,                      // format version, integer
   "title": "Sprint demo",      // user-entered, may be ""
-  "mimeType": "video/webm;codecs=vp9,opus",  // exact MediaRecorder mimeType used
+  "mimeType": "video/webm;codecs=vp09.00.10.08,opus",  // exact string from the recording engine
   "durationMs": 93250,         // integer, from recording timer
   "totalBytes": 19381222,      // plaintext (pre-encryption) video byte length
   "chunkSize": 8388608,        // plaintext chunk size used
@@ -82,19 +82,54 @@ Two objects per video, under the id as prefix:
 
 ## 6. Recording
 
-- Capture: `getDisplayMedia({ video: { frameRate: { ideal: 30 } }, audio: true })`
-  (system/tab audio only arrives if the user opts in via the picker) plus
+- Capture: `getDisplayMedia({ video: { frameRate: { ideal: 30, max: 30 },
+  width: { max: 1920 }, height: { max: 1080 } }, audio: true })` (system/tab
+  audio only arrives if the user opts in via the picker) plus
   `getUserMedia({ audio: true })` for the default microphone (same device the OS
   gives Meet/Zoom). Mic defaults ON with a visible toggle before capture starts.
+  Set `videoTrack.contentHint = "text"` (screen-content encoder tuning).
 - Audio mixing: if both mic and display audio exist, mix through a single
-  `AudioContext` (`MediaStreamAudioSourceNode`s → `MediaStreamAudioDestinationNode`)
-  into one audio track; combine with the display video track into the recorded
-  `MediaStream`. If only mic, its track is used directly (still fine to route
-  through the AudioContext for one code path).
-- Encoding: `MediaRecorder` with the first supported of
-  `video/webm;codecs=vp9,opus`, then `video/webm;codecs=vp8,opus`, then `video/webm`.
-  `videoBitsPerSecond` from settings (default **2_000_000**), `audioBitsPerSecond`
-  128_000. `start(1000)` (1 s timeslices), accumulate blobs in memory.
+  `AudioContext` (`MediaStreamAudioSourceNode`s → `MediaStreamAudioDestinationNode`
+  configured **mono**, `channelCount: 1`) into one audio track; combine with the
+  display video track into the recorded `MediaStream`. If only mic, still route
+  through the AudioContext for one code path.
+- **Encoding engines** — one interface, two implementations (`src/encoder.ts`):
+
+  ```ts
+  export interface EngineOptions { quality: Quality; preferAv1: boolean;
+    fallbackVideoBitsPerSecond: number; }
+  export interface RecorderEngine {
+    readonly mimeType: string;   // exact container/codec string actually in use,
+                                 // MSE-compatible (MediaSource.isTypeSupported)
+    ondata: (bytes: Uint8Array) => void;  // muxed container bytes, strictly in order
+    onerror: (err: Error) => void;   // engine died mid-recording; fires at most
+                                     // once, never from stop()
+    start(stream: MediaStream): void;
+    stop(): Promise<void>;       // flush; resolves after the final ondata call
+  }
+  export type Quality = "smaller" | "standard" | "sharper";
+  export function createEngine(opts: EngineOptions): RecorderEngine; // picks best available
+  ```
+
+  1. **Primary — WebCodecs engine** (when `VideoEncoder`, `AudioEncoder` and
+     `MediaStreamTrackProcessor` all exist; Chrome/Edge): `VideoEncoder` in
+     **quantizer (constant-quality) mode**, `latencyMode: "quality"`. Codec:
+     AV1 when `preferAv1` and encode support, else VP9 (proper codec strings,
+     e.g. `av01.0.08M.08` / `vp09.00.10.08`; the exact string used flows into
+     `meta.mimeType`). `quality` maps to a per-codec quantizer table (implementer
+     picks sane values ~"visually clean text" for `standard`; document them in
+     code). Backpressure: if `encodeQueueSize` exceeds a small bound, drop
+     incoming **delta** frames. Force a keyframe at least every **8 s** of media
+     time so clusters stay bounded and MSE seeking works. Audio: `AudioEncoder`
+     Opus, mono, **48 kbps**. Muxing: the `webm-muxer` npm package (MIT) in
+     streaming mode — its output callback feeds `ondata`. No in-container
+     duration (the duration bullet below is unchanged).
+  2. **Fallback — MediaRecorder engine** (Firefox etc.): first supported of
+     `video/webm;codecs=vp9,opus`, `vp8,opus`, `video/webm`;
+     `videoBitsPerSecond` from settings (default **1_200_000**),
+     `audioBitsPerSecond` **64_000**, `start(1000)`, blob bytes → `ondata`.
+
+  `meta.mimeType` MUST be the engine's actual string, never the requested one.
 - Stop paths (all must work): the app's Stop button, and the browser's native
   "Stop sharing" bar (video track `ended` event). On stop, all tracks of all
   acquired streams are stopped (mic indicator must turn off).
@@ -112,9 +147,10 @@ Two objects per video, under the id as prefix:
   to local library). Recording requires configured settings (the multipart
   upload is created at record start); if unconfigured, open the settings panel
   instead of starting capture.
-- Recorded Blob slices are retained in memory (as Blobs, not ArrayBuffers)
-  until the share link exists, so a mid-recording upload failure can never
-  lose the recording (see §7 failure handling).
+- The emitted container bytes are retained in memory (as Blob parts, not
+  ArrayBuffers) until the share link exists, so a mid-recording upload failure
+  can never lose the recording (see §7 failure handling); the same Blob backs
+  the preview player and the "Download recording" fallback.
 
 ## 7. Upload (streaming, S3 multipart)
 
@@ -191,10 +227,18 @@ player and storage format are unaffected. `meta.json` remains a single PUT.
   `http://localhost:9000`), `region` (default `us-east-1`), `bucket`,
   `accessKeyId`, `secretAccessKey`, `publicBaseUrl` (base URL where the bucket
   is readable, e.g. `http://localhost:9000/videoshare` or a CDN domain),
-  `videoBitsPerSecond` (default 2_000_000).
+  `quality` (`"smaller" | "standard" | "sharper"`, default `"standard"`),
+  `preferAv1` (boolean, default `false` — AV1 shrinks files ~30-50% but viewers
+  on Safari without AV1 hardware decode can't play; the settings UI must say
+  this), `videoBitsPerSecond` (fallback MediaRecorder engine only, default
+  1_200_000). Loading settings stored by older versions (no quality/preferAv1,
+  old bitrate default) must not error — fill defaults.
 - `videoshare.library` (JSON array of): `{ id, title, createdAt, durationMs,
-  link }` — newest first; list in UI with copy-link and delete-from-list
-  (delete only removes the local entry in v1, it does not delete from bucket).
+  link, sizeBytes? }` — newest first; list in UI with copy-link and
+  delete-from-list (delete only removes the local entry in v1, it does not
+  delete from bucket). When `sizeBytes` is present the UI also shows size and
+  effective bitrate (e.g. "14.2 MB · 1.9 Mbps") so compression is observable.
+  Entries without `sizeBytes` (older) must render fine.
 
 ## 10. Viewer configuration of publicBaseUrl
 
@@ -214,7 +258,7 @@ export interface VideoMeta { v: 1; title: string; mimeType: string; durationMs: 
   totalBytes: number; chunkSize: number; chunkCount: number; createdAt: string; }
 export interface Settings { endpoint: string; region: string; bucket: string;
   accessKeyId: string; secretAccessKey: string; publicBaseUrl: string;
-  videoBitsPerSecond: number; }
+  quality: Quality; preferAv1: boolean; videoBitsPerSecond: number; }
 export interface LibraryEntry { id: string; title: string; createdAt: string;
   durationMs: number; link: string; }
 ```
@@ -265,7 +309,7 @@ tokens and base styles in `src/app.css`.
 
 ## 12. Build & tooling
 
-- `package.json`: deps `aws4fetch` (only runtime dep); devDeps `typescript`,
+- `package.json`: deps `aws4fetch`, `webm-muxer`; devDeps `typescript`,
   `vite`, `vitest`. Scripts: `dev` (vite), `build` (`tsc --noEmit && vite build`),
   `preview`, `test` (`vitest run`), `test:e2e` (`vitest run --config vitest.e2e.config.ts`,
   only meaningful with MinIO up).
@@ -275,6 +319,10 @@ tokens and base styles in `src/app.css`.
 
 ## 13. Tests
 
+- Node cannot run WebCodecs, so the encoder's browser paths are exercised only
+  manually; unit tests cover the pure parts of `encoder.ts` (codec-string
+  construction, quantizer tables, engine selection given injected capability
+  flags) in `tests/encoder.test.ts`.
 - `tests/crypto.test.ts` (vitest, Node WebCrypto): key export/import round-trip;
   block round-trip; tampered byte → throws; wrong AAD (reordered chunk index) →
   throws; chunked encrypt/decrypt round-trip across ≥3 chunks incl. short

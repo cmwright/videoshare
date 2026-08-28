@@ -13,7 +13,8 @@
     "test:e2e": "vitest run --config vitest.e2e.config.ts"
   },
   "dependencies": {
-    "aws4fetch": "^1.0.20"
+    "aws4fetch": "^1.0.20",
+    "webm-muxer": "^5.1.4"
   },
   "devDependencies": {
     "@types/node": "^26.4.0",
