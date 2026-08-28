@@ -1,0 +1,37 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "videoshare-gateway",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-08-27",
+
+  // Non-secret configuration. Edit these, then `npx wrangler deploy`.
+  //
+  // ALLOWED_ORIGINS is the origin(s) of the deployed static site, exactly as a
+  // browser reports them (scheme + host + port, no trailing slash). "*" is
+  // refused at boot: a wildcard would let any page spend this gateway's bucket
+  // credentials on behalf of a signed-in user.
+  "vars": {
+    "BUCKET_ENDPOINT": "https://<account-id>.r2.cloudflarestorage.com",
+    "BUCKET_NAME": "videoshare",
+    "BUCKET_REGION": "auto",
+    "PUBLIC_BASE_URL": "https://videos.example.com",
+    "ALLOWED_ORIGINS": "https://videoshare.example.com",
+    "PRESIGN_EXPIRY_SECONDS": "900"
+  }
+
+  // Secrets — never put these in this file. Set them once per environment:
+  //
+  //   npx wrangler secret put BUCKET_ACCESS_KEY_ID
+  //   npx wrangler secret put BUCKET_SECRET_ACCESS_KEY
+  //   npx wrangler secret put GOOGLE_CLIENT_ID
+  //   npx wrangler secret put ALLOWED_EMAILS
+  //
+  // GOOGLE_CLIENT_ID is public information (the browser sees it), but keeping it
+  // alongside the others means one place to rotate. ALLOWED_EMAILS is the upload
+  // whitelist: comma-separated, each entry a full address or an "@domain.com"
+  // suffix, matched case-insensitively.
+  //
+  // OIDC_JWKS_URL and OIDC_ISSUER exist only so the tests can point verification
+  // at a local key set (SPEC §15.6); leave them unset in production and Google's
+  // are used.
+}

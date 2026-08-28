@@ -8,6 +8,10 @@
 
     "strict": true,
     "isolatedModules": true,
+    // tests/gateway.test.ts pulls gateway/src into this program, and those files
+    // import each other with a real ".ts" extension so Node can run them without
+    // a build step (see gateway/tsconfig.json). Type-checking only, never emits.
+    "allowImportingTsExtensions": true,
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true,

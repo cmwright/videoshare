@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "types": ["node"],
+
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    // Keeps every file runnable by Node's own type stripping (`node src/node.ts`):
+    // no enums, no namespaces, no parameter properties.
+    "erasableSyntaxOnly": true,
+    // Relative imports carry the real `.ts` extension so Node can run the
+    // sources directly; `tsc` rewrites them to `.js` on the way into dist/.
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+
+    "outDir": "dist",
+    "sourceMap": true
+  },
+  "include": ["src"]
+}

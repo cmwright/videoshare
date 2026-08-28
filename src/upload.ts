@@ -1,5 +1,5 @@
 /**
- * Streaming upload of one video (docs/SPEC.md §7).
+ * Streaming upload of one video (docs/SPEC.md §7, §15.5).
  *
  * `{id}/video.bin` is an S3 multipart upload that runs *alongside* the
  * recording: encrypted chunk i (§4) is uploaded as part number i+1, so the
@@ -7,8 +7,14 @@
  * player expects. `{id}/meta.json` stays a single PUT and goes last — a video
  * is complete iff its meta exists.
  *
- * Everything here is plain `fetch` of an aws4fetch-signed request, so the whole
- * path runs unchanged in Node for the e2e tests.
+ * Who authorizes those requests is the one thing that varies: a `Signer` turns
+ * an operation into a ready-to-send URL + headers. `LocalSigner` signs with
+ * aws4fetch from credentials in this browser (legacy mode); `GatewaySigner`
+ * asks the gateway for presigned URLs and never sees a credential (§15). Both
+ * end in the same `fetch`, so the session logic below does not know which it has.
+ *
+ * Everything here is plain `fetch`, so the whole path runs unchanged in Node
+ * for the e2e tests.
  */
 
 import { AwsClient } from "aws4fetch";
@@ -44,52 +50,580 @@ export interface UploadSession {
 const CONTENT_TYPE = "application/octet-stream";
 const XML_CONTENT_TYPE = "application/xml";
 const DOCS = "docs/storage-setup.md";
+const GATEWAY_DOCS = "docs/gateway-setup.md";
 
 /** Backoff before retry 1, 2 and 3 of a part (SPEC §7); an attempt with no delay comes first. */
 const RETRY_DELAYS_MS = [1000, 2000, 4000];
 
 const EMPTY = new Uint8Array(0);
 
+// --- The signing seam (SPEC §15.5) -------------------------------------------
+
+/**
+ * One S3 operation the session needs authorized. Object keys never cross this
+ * seam: a signer derives them from `id` as exactly `{id}/video.bin` and
+ * `{id}/meta.json`, so no part of the session can aim a write at another key.
+ * The `kind` values are the gateway's wire vocabulary (SPEC §15.3).
+ */
+export type SignOp =
+  | { kind: "create"; id: string }
+  | { kind: "part"; id: string; uploadId: string; partNumber: number }
+  | { kind: "complete"; id: string; uploadId: string }
+  | { kind: "abort"; id: string; uploadId: string }
+  | { kind: "put-meta"; id: string };
+
+/** What the session is about to send — a signer that signs payloads needs the bytes. */
+export interface SignRequest {
+  op: SignOp;
+  /** Exact bytes that will be sent; absent for a bodyless request. */
+  body?: Uint8Array;
+  /** `Content-Type` to send, if any. */
+  contentType?: string;
+}
+
+/** A request ready for `fetch`: absolute URL plus the headers carrying its authorization. */
+export interface SignedRequest {
+  url: string;
+  headers: Headers;
+}
+
+/** Authorizes the session's storage requests. See `createLocalSigner` / `createGatewaySigner`. */
+export interface Signer {
+  /** Which of the two modes this is — the UI and the tests care, the session does not. */
+  readonly kind: "local" | "gateway";
+  /** Where the bytes are going, for error messages. */
+  readonly storageLabel: string;
+  /** URL + headers for one operation. Called per attempt, so a retry is re-signed. */
+  sign(req: SignRequest): Promise<SignedRequest>;
+  /** An authorization that just failed must not be reused: drop anything cached for `op`. */
+  forget(op: SignOp): void;
+  /** Advice appended to an HTTP failure message. */
+  statusHint(status: number, method: HttpMethod): string;
+  /** The whole message for a request that never reached an HTTP status. */
+  networkMessage(what: string, method: HttpMethod): string;
+}
+
+/** Every method the session ever sends; GETs are the player's job, not this file's. */
+export type HttpMethod = "PUT" | "POST" | "DELETE";
+
+const METHODS: Record<SignOp["kind"], HttpMethod> = {
+  create: "POST",
+  part: "PUT",
+  complete: "POST",
+  abort: "DELETE",
+  "put-meta": "PUT",
+};
+
+// --- LocalSigner: credentials in this browser (SPEC §7) ----------------------
+
+/**
+ * Signs every request with aws4fetch from the settings panel's credentials —
+ * the original, credential-in-the-browser mode. Throws if settings are
+ * incomplete, so a bad configuration surfaces before any recording starts.
+ */
+export function createLocalSigner(settings: Settings): Signer {
+  requireConfigured(settings);
+  return new LocalSigner(settings);
+}
+
+class LocalSigner implements Signer {
+  readonly kind = "local" as const;
+  private readonly client: AwsClient;
+
+  constructor(private readonly settings: Settings) {
+    this.client = new AwsClient({
+      accessKeyId: settings.accessKeyId,
+      secretAccessKey: settings.secretAccessKey,
+      region: settings.region || "us-east-1",
+      service: "s3",
+    });
+  }
+
+  get storageLabel(): string {
+    return this.settings.endpoint;
+  }
+
+  async sign(req: SignRequest): Promise<SignedRequest> {
+    // lib.dom's BodyInit accepts only ArrayBuffer-backed views; nothing here is
+    // ever backed by a SharedArrayBuffer.
+    const body = (req.body ?? EMPTY) as Uint8Array<ArrayBuffer>;
+
+    const headers: Record<string, string> = {
+      // Signing the real payload hash (rather than aws4fetch's default
+      // UNSIGNED-PAYLOAD) keeps the body out of the signed Request, so the body is
+      // never copied into a second buffer just to be signed.
+      "x-amz-content-sha256": await sha256Hex(body),
+    };
+    if (req.contentType) headers["content-type"] = req.contentType;
+
+    const signed = await this.client.sign(localUrl(this.settings, req.op), {
+      method: METHODS[req.op.kind],
+      headers,
+    });
+    return { url: signed.url, headers: signed.headers };
+  }
+
+  forget(): void {
+    // Nothing is cached: each attempt is signed as it is sent.
+  }
+
+  statusHint(status: number, method: HttpMethod): string {
+    const settings = this.settings;
+    if (status === 403) {
+      return (
+        `The credentials were rejected or may not write here. Check accessKeyId/secretAccessKey, ` +
+        `that the key is allowed to PutObject and AbortMultipartUpload in "${settings.bucket}", and ` +
+        `that the clock on this machine is correct. See ${DOCS}.`
+      );
+    }
+    if (status === 404) {
+      return (
+        `Bucket "${settings.bucket}" was not found at ${settings.endpoint}, or the multipart upload ` +
+        `expired. VideoShare uses path-style URLs ({endpoint}/{bucket}/{key}) — check both values. See ${DOCS}.`
+      );
+    }
+    if (status === 301 || status === 307) {
+      return `The bucket is not in region "${settings.region}". Fix the region in Settings. See ${DOCS}.`;
+    }
+    if (status === 400) {
+      return (
+        `The request was rejected — usually a wrong region ("${settings.region}") or an endpoint that ` +
+        `expects virtual-host style URLs. See ${DOCS}.`
+      );
+    }
+    if (status === 405 || status === 501) {
+      return (
+        `${settings.endpoint} did not accept a ${method}; it may not be an S3-compatible endpoint, or ` +
+        `it may not support multipart uploads. See ${DOCS}.`
+      );
+    }
+    if (status >= 500) {
+      return "The storage server failed. Wait a moment and try again.";
+    }
+    return `See ${DOCS} for storage setup.`;
+  }
+
+  networkMessage(what: string, method: HttpMethod): string {
+    return (
+      `Could not reach ${this.settings.endpoint} to upload ${what}: the request failed before any HTTP ` +
+      `status. That is almost always CORS (the bucket must allow ${method} from ${originLabel()}, ` +
+      `allow the authorization/x-amz-* headers, and expose the ETag header) or an unreachable ` +
+      `endpoint. See examples/s3-cors.json and ${DOCS}.`
+    );
+  }
+}
+
+/** Path-style URL: works for MinIO, R2 and S3 alike. */
+function localUrl(settings: Settings, op: SignOp): string {
+  const base = `${settings.endpoint.replace(/\/+$/, "")}/${settings.bucket}`;
+  if (op.kind === "put-meta") return `${base}/${op.id}/meta.json`;
+
+  const video = `${base}/${op.id}/video.bin`;
+  if (op.kind === "create") return `${video}?uploads`;
+
+  const upload = `uploadId=${encodeQueryValue(op.uploadId)}`;
+  return op.kind === "part" ? `${video}?partNumber=${op.partNumber}&${upload}` : `${video}?${upload}`;
+}
+
+/**
+ * RFC 3986 percent-encoding, matching aws4fetch's canonical query exactly.
+ * `encodeURIComponent` leaves `!'()*` alone but aws4fetch escapes them, so an
+ * uploadId containing one would be signed differently from how it is sent — a
+ * 403 that only some S3 implementations would ever produce.
+ */
+function encodeQueryValue(value: string): string {
+  return encodeURIComponent(value).replace(
+    /[!'()*]/g,
+    (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`,
+  );
+}
+
+// --- GatewaySigner: presigned URLs, no credentials here (SPEC §15) -----------
+
+/** How `GatewaySigner` reaches the gateway and the signed-in user's token. */
+export interface GatewaySignerOptions {
+  /** Gateway base URL from config.js: absolute, or same-origin relative like "/api". */
+  gatewayUrl: string;
+  /** The in-memory Google ID token, or null when there is none (or it is about to expire). */
+  getToken(): string | null;
+  /** Silent re-auth; resolves to a fresh token, or null when the user has to act. */
+  refreshToken(): Promise<string | null>;
+}
+
+/** Part URLs are signed this many ahead, so the sequential part queue never waits on the gateway. */
+const PART_BATCH = 8;
+/** S3's ceiling on part numbers — never ask the gateway to sign past it. */
+const MAX_PART_NUMBER = 10000;
+/** A presigned URL this close to expiry is re-signed rather than risked. */
+const EXPIRY_MARGIN_MS = 60_000;
+/** Assumed lifetime when a URL carries no readable `X-Amz-Date`/`X-Amz-Expires`. */
+const FALLBACK_LIFETIME_MS = 60_000;
+
+interface SignedUrl {
+  url: string;
+  /**
+   * Epoch ms after which this URL is re-signed instead of used. Normally
+   * `expiry − EXPIRY_MARGIN_MS`, but never earlier than half its own lifetime:
+   * a gateway configured with a short PRESIGN_EXPIRY_SECONDS must still be able
+   * to hand out a usable URL rather than one that is stale on arrival.
+   */
+  usableUntil: number;
+}
+
+/**
+ * Trades a Google ID token for presigned URLs (SPEC §15.3). The gateway never
+ * sees or moves object bytes: every URL returned here is fetched browser↔bucket.
+ */
+export function createGatewaySigner(options: GatewaySignerOptions): Signer {
+  return new GatewaySigner(options);
+}
+
+class GatewaySigner implements Signer {
+  readonly kind = "gateway" as const;
+  readonly storageLabel = "The bucket behind the upload gateway";
+
+  /** Presigned part URLs, keyed by `{uploadId}\n{partNumber}`. */
+  private readonly parts = new Map<string, SignedUrl>();
+  /** One request per in-flight batch, so a top-up and a demand never double-sign. */
+  private readonly batches = new Map<string, Promise<void>>();
+  private readonly gateway: string;
+
+  constructor(private readonly options: GatewaySignerOptions) {
+    this.gateway = options.gatewayUrl.replace(/\/+$/, "");
+  }
+
+  async sign(req: SignRequest): Promise<SignedRequest> {
+    const url =
+      req.op.kind === "part"
+        ? await this.partUrl(req.op)
+        : (await this.askForUrl(req.op)).url;
+
+    // No `x-amz-content-sha256`: a query-signed URL is UNSIGNED-PAYLOAD (§15.3),
+    // and a payload hash the signature does not cover only invites a 403.
+    // `content-type` is not a signed header either, but S3 stores what we send,
+    // so the object still gets the type SPEC §3 asks for.
+    const headers = new Headers();
+    if (req.contentType) headers.set("content-type", req.contentType);
+    return { url, headers };
+  }
+
+  forget(op: SignOp): void {
+    if (op.kind === "part") this.parts.delete(partKey(op.uploadId, op.partNumber));
+  }
+
+  statusHint(status: number, method: HttpMethod): string {
+    if (status === 403) {
+      return (
+        `The bucket rejected the presigned URL. It may have expired (a retry signs a fresh one), or ` +
+        `the gateway's bucket credentials may not be allowed to ${method} here. See ${GATEWAY_DOCS}.`
+      );
+    }
+    if (status === 404) {
+      return (
+        `The bucket or the multipart upload was not found — check the gateway's BUCKET_ENDPOINT and ` +
+        `BUCKET_NAME, and note that an upload left open for a long time can expire. See ${GATEWAY_DOCS}.`
+      );
+    }
+    if (status === 400) {
+      return (
+        `The bucket rejected the presigned request — usually the gateway's BUCKET_REGION or ` +
+        `BUCKET_ENDPOINT. See ${GATEWAY_DOCS}.`
+      );
+    }
+    if (status === 405 || status === 501) {
+      return (
+        `The bucket did not accept a ${method}; it may not support multipart uploads. See ${GATEWAY_DOCS}.`
+      );
+    }
+    if (status >= 500) {
+      return "The storage server failed. Wait a moment and try again.";
+    }
+    return `See ${GATEWAY_DOCS} for gateway setup.`;
+  }
+
+  networkMessage(what: string, method: HttpMethod): string {
+    return (
+      `Could not upload ${what}: the ${method} to the presigned URL failed before any HTTP status. ` +
+      `That is almost always the bucket's CORS configuration (it must allow ${method} from ` +
+      `${originLabel()} and expose the ETag header) or an unreachable bucket — the gateway itself ` +
+      `answered, so its own CORS is fine. See examples/s3-cors.json and ${GATEWAY_DOCS}.`
+    );
+  }
+
+  // --- internals -------------------------------------------------------------
+
+  /** One presigned URL for an op the session needs exactly once. */
+  private async askForUrl(op: Exclude<SignOp, { kind: "part" }>): Promise<SignedUrl> {
+    const body = await this.ask({
+      op: op.kind,
+      id: op.id,
+      ...("uploadId" in op ? { uploadId: op.uploadId } : {}),
+    });
+    return checkedUrl(record(body).url, `the ${op.kind} request`);
+  }
+
+  /**
+   * The part queue is sequential, so a round trip per part would idle the
+   * network between parts. Parts are signed `PART_BATCH` at a time and the
+   * window is topped up while the current part uploads.
+   */
+  private async partUrl(op: { id: string; uploadId: string; partNumber: number }): Promise<string> {
+    const cached = this.freshPart(op.uploadId, op.partNumber);
+    if (cached) {
+      // Top up only once the window is half spent, and never awaited: this part
+      // already has its URL, and topping up per part would trade one stall for a
+      // round trip before every single part.
+      if (!this.freshPart(op.uploadId, op.partNumber + PART_BATCH / 2)) {
+        void this.loadParts(op.id, op.uploadId, op.partNumber + 1).catch(() => undefined);
+      }
+      return cached;
+    }
+
+    await this.loadParts(op.id, op.uploadId, op.partNumber);
+    const url = this.freshPart(op.uploadId, op.partNumber);
+    if (!url) {
+      throw new Error(
+        `The upload gateway did not return a URL for part ${op.partNumber}. See ${GATEWAY_DOCS}.`,
+      );
+    }
+    return url;
+  }
+
+  /** Signs the window of `PART_BATCH` parts from `from`, skipping any already held. */
+  private loadParts(id: string, uploadId: string, from: number): Promise<void> {
+    const wanted: number[] = [];
+    for (let n = from; n < from + PART_BATCH && n <= MAX_PART_NUMBER; n++) {
+      if (!this.freshPart(uploadId, n)) wanted.push(n);
+    }
+    if (wanted.length === 0) return Promise.resolve();
+
+    const key = partKey(uploadId, wanted[0]);
+    const running = this.batches.get(key);
+    if (running) return running;
+
+    const task = this.requestParts(id, uploadId, wanted).finally(() => this.batches.delete(key));
+    this.batches.set(key, task);
+    return task;
+  }
+
+  private async requestParts(id: string, uploadId: string, partNumbers: number[]): Promise<void> {
+    const body = record(await this.ask({ op: "part", id, uploadId, partNumbers }));
+    if (!Array.isArray(body.urls)) {
+      throw new Error(`The upload gateway returned no part URLs. See ${GATEWAY_DOCS}.`);
+    }
+    // Expired entries are never read, but a long session would otherwise keep
+    // every URL it has ever been given.
+    this.pruneParts();
+    for (const entry of body.urls) {
+      const part = record(entry);
+      if (typeof part.partNumber !== "number") continue;
+      this.parts.set(
+        partKey(uploadId, part.partNumber),
+        checkedUrl(part.url, `part ${part.partNumber}`),
+      );
+    }
+  }
+
+  private freshPart(uploadId: string, partNumber: number): string | null {
+    const key = partKey(uploadId, partNumber);
+    const entry = this.parts.get(key);
+    if (!entry) return null;
+    if (entry.usableUntil <= Date.now()) {
+      this.parts.delete(key);
+      return null;
+    }
+    return entry.url;
+  }
+
+  private pruneParts(): void {
+    const now = Date.now();
+    for (const [key, entry] of this.parts) {
+      if (entry.usableUntil <= now) this.parts.delete(key);
+    }
+  }
+
+  /**
+   * One `POST {gateway}/sign`. A 401 means the ID token expired or was rotated —
+   * the gateway is stateless, so a fresh token is the only possible fix; try
+   * silently once, then let the caller's retry/degraded path take over (§15.5).
+   */
+  private async ask(payload: Record<string, unknown>): Promise<unknown> {
+    let token = this.options.getToken();
+    if (!token) {
+      token = await this.options.refreshToken();
+      if (!token) throw signInError();
+    }
+
+    let res = await this.post(token, payload);
+    if (res.status === 401) {
+      const fresh = await this.options.refreshToken();
+      if (!fresh) throw signInError();
+      res = await this.post(fresh, payload);
+    }
+
+    if (!res.ok) {
+      const detail = await gatewayDetail(res);
+      if (res.status === 401) throw signInError(detail);
+      if (res.status === 403) {
+        throw new Error(
+          `The upload gateway will not sign uploads for this account${detail}. Ask whoever runs it ` +
+            `to add your email to ALLOWED_EMAILS. See ${GATEWAY_DOCS}.`,
+        );
+      }
+      throw new Error(
+        `The upload gateway refused to sign the request: HTTP ${res.status}` +
+          `${res.statusText ? ` ${res.statusText}` : ""}${detail}. See ${GATEWAY_DOCS}.`,
+      );
+    }
+
+    try {
+      return (await res.json()) as unknown;
+    } catch (cause) {
+      throw new Error(
+        `The upload gateway's answer was not JSON. Check that ${this.gateway} is the gateway and ` +
+          `not the static site. See ${GATEWAY_DOCS}.`,
+        { cause },
+      );
+    }
+  }
+
+  private async post(token: string, payload: Record<string, unknown>): Promise<Response> {
+    try {
+      return await fetch(`${this.gateway}/sign`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+        body: JSON.stringify(payload),
+      });
+    } catch (cause) {
+      throw new Error(
+        `Could not reach the upload gateway at ${this.gateway}: the request failed before any HTTP ` +
+          `status. Check that it is running and that its ALLOWED_ORIGINS includes ${originLabel()}. ` +
+          `See ${GATEWAY_DOCS}.`,
+        { cause },
+      );
+    }
+  }
+}
+
+function partKey(uploadId: string, partNumber: number): string {
+  return `${uploadId}\n${partNumber}`;
+}
+
+function signInError(detail = ""): Error {
+  return new Error(
+    `The upload gateway did not accept this sign-in${detail}. Sign in with Google again to keep ` +
+      `uploading — nothing recorded is lost.`,
+  );
+}
+
+/** `{ error }` from a gateway failure, as a parenthetical for the message. */
+async function gatewayDetail(res: Response): Promise<string> {
+  const text = await res.text().catch(() => "");
+  if (!text) return "";
+  let message = "";
+  try {
+    const parsed = record(JSON.parse(text) as unknown);
+    if (typeof parsed.error === "string") message = parsed.error;
+  } catch {
+    message = text;
+  }
+  message = message.replace(/\s+/g, " ").trim().slice(0, 200);
+  return message ? ` (${message})` : "";
+}
+
+function record(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === "object" ? (value as Record<string, unknown>) : {};
+}
+
+/** The gateway is trusted with credentials, but a mistyped URL should still fail loudly. */
+function checkedUrl(value: unknown, what: string): SignedUrl {
+  if (typeof value !== "string" || !value) {
+    throw new Error(`The upload gateway returned no URL for ${what}. See ${GATEWAY_DOCS}.`);
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error(`The upload gateway returned an unusable URL for ${what}. See ${GATEWAY_DOCS}.`);
+  }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    throw new Error(
+      `The upload gateway returned a "${parsed.protocol}" URL for ${what}; uploads only go over ` +
+        `http or https. See ${GATEWAY_DOCS}.`,
+    );
+  }
+  return { url: value, usableUntil: presignedUsableUntil(parsed) };
+}
+
+/**
+ * When a presigned URL stops working, read off its own `X-Amz-Date` +
+ * `X-Amz-Expires` (SigV4 query auth). The gateway's clock signs it and this
+ * clock reads it, so skew either re-signs early (harmless) or produces a 403
+ * that the retry path re-signs anyway.
+ */
+function presignedUsableUntil(url: URL): number {
+  const stamp = url.searchParams.get("X-Amz-Date") ?? "";
+  const seconds = Number(url.searchParams.get("X-Amz-Expires"));
+  const match = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/.exec(stamp);
+  if (!match || !Number.isFinite(seconds) || seconds <= 0) {
+    return Date.now() + FALLBACK_LIFETIME_MS / 2;
+  }
+  const signedAt = Date.UTC(
+    Number(match[1]),
+    Number(match[2]) - 1,
+    Number(match[3]),
+    Number(match[4]),
+    Number(match[5]),
+    Number(match[6]),
+  );
+  const lifetimeMs = seconds * 1000;
+  return signedAt + lifetimeMs - Math.min(EXPIRY_MARGIN_MS, lifetimeMs / 2);
+}
+
+// --- Session -----------------------------------------------------------------
+
 /**
  * Starts the multipart upload for `{id}/video.bin`. Called at record start, so a
- * failure here (bad credentials, unreachable endpoint) surfaces before the user
- * has recorded anything.
+ * failure here (bad credentials, unreachable endpoint, not signed in) surfaces
+ * before the user has recorded anything.
  */
-export async function createUploadSession(
+export function createUploadSession(
   settings: Settings,
   id: string,
   key: CryptoKey,
   onProgress?: (uploadedBytes: number) => void,
+): Promise<UploadSession>;
+export function createUploadSession(
+  signer: Signer,
+  id: string,
+  key: CryptoKey,
+  onProgress?: (uploadedBytes: number) => void,
+): Promise<UploadSession>;
+export async function createUploadSession(
+  target: Settings | Signer,
+  id: string,
+  key: CryptoKey,
+  onProgress?: (uploadedBytes: number) => void,
 ): Promise<UploadSession> {
-  requireConfigured(settings);
-
-  const client = new AwsClient({
-    accessKeyId: settings.accessKeyId,
-    secretAccessKey: settings.secretAccessKey,
-    region: settings.region || "us-east-1",
-    service: "s3",
-  });
+  const signer = "sign" in target ? target : createLocalSigner(target);
 
   const objectKey = `${id}/video.bin`;
-  const res = await s3Fetch({
-    client,
-    settings,
-    method: "POST",
-    url: `${objectUrl(settings, objectKey)}?uploads`,
-    what: `${objectKey} (starting the multipart upload)`,
-    contentType: CONTENT_TYPE,
-  });
+  const res = await send(
+    signer,
+    { op: { kind: "create", id }, contentType: CONTENT_TYPE },
+    `${objectKey} (starting the multipart upload)`,
+  );
 
   const body = await res.text().catch(() => "");
   const uploadId = /<UploadId>([^<]+)<\/UploadId>/.exec(body)?.[1];
   if (!uploadId) {
     throw new Error(
-      `${settings.endpoint} accepted the multipart upload but returned no UploadId. It may not ` +
+      `${signer.storageLabel} accepted the multipart upload but returned no UploadId. It may not ` +
         `support S3 multipart uploads. See ${DOCS}.`,
     );
   }
 
-  return new MultipartSession(client, settings, id, key, uploadId, onProgress);
+  return new MultipartSession(signer, id, key, uploadId, onProgress);
 }
 
 /** The bucket did not expose the ETag response header — retrying cannot fix that. */
@@ -114,8 +648,7 @@ class MultipartSession implements UploadSession {
   private state: "open" | "done" | "aborted" = "open";
 
   constructor(
-    private readonly client: AwsClient,
-    private readonly settings: Settings,
+    private readonly signer: Signer,
     private readonly id: string,
     private readonly key: CryptoKey,
     private readonly uploadId: string,
@@ -192,13 +725,11 @@ class MultipartSession implements UploadSession {
     // enqueued behind it now that the state is "aborted".
     await this.queue;
     try {
-      await s3Fetch({
-        client: this.client,
-        settings: this.settings,
-        method: "DELETE",
-        url: this.partUrl(null),
-        what: `${this.videoKey()} (abandoning the multipart upload)`,
-      });
+      await send(
+        this.signer,
+        { op: { kind: "abort", id: this.id, uploadId: this.uploadId } },
+        `${this.videoKey()} (abandoning the multipart upload)`,
+      );
     } catch (err) {
       // Best-effort by design: the bucket's "abort incomplete multipart uploads"
       // lifecycle rule (SPEC §14) is the backstop.
@@ -248,15 +779,15 @@ class MultipartSession implements UploadSession {
   private async uploadPart(partNumber: number, block: Uint8Array): Promise<string> {
     for (let attempt = 0; ; attempt++) {
       try {
-        const res = await s3Fetch({
-          client: this.client,
-          settings: this.settings,
-          method: "PUT",
-          url: this.partUrl(partNumber),
-          what: `${this.videoKey()} part ${partNumber}`,
-          body: block,
-          contentType: CONTENT_TYPE,
-        });
+        const res = await send(
+          this.signer,
+          {
+            op: { kind: "part", id: this.id, uploadId: this.uploadId, partNumber },
+            body: block,
+            contentType: CONTENT_TYPE,
+          },
+          `${this.videoKey()} part ${partNumber}`,
+        );
         const etag = res.headers.get("etag");
         if (!etag) {
           throw new MissingEtagError(
@@ -288,15 +819,15 @@ class MultipartSession implements UploadSession {
   }
 
   private async completeUpload(): Promise<void> {
-    const res = await s3Fetch({
-      client: this.client,
-      settings: this.settings,
-      method: "POST",
-      url: this.partUrl(null),
-      what: `${this.videoKey()} (completing the multipart upload)`,
-      body: new TextEncoder().encode(completeXml(this.etags, this.partCount)),
-      contentType: XML_CONTENT_TYPE,
-    });
+    const res = await send(
+      this.signer,
+      {
+        op: { kind: "complete", id: this.id, uploadId: this.uploadId },
+        body: new TextEncoder().encode(completeXml(this.etags, this.partCount)),
+        contentType: XML_CONTENT_TYPE,
+      },
+      `${this.videoKey()} (completing the multipart upload)`,
+    );
 
     // S3 answers CompleteMultipartUpload with 200 and *then* streams an <Error>
     // body if the assembly fails, so a 2xx alone is not success here.
@@ -313,26 +844,19 @@ class MultipartSession implements UploadSession {
   private async putMeta(meta: VideoMeta): Promise<void> {
     const objectKey = `${this.id}/meta.json`;
     const plain = new TextEncoder().encode(JSON.stringify(meta));
-    await s3Fetch({
-      client: this.client,
-      settings: this.settings,
-      method: "PUT",
-      url: objectUrl(this.settings, objectKey),
-      what: objectKey,
-      body: await encryptBlock(this.key, metaAad(this.id), plain),
-      contentType: CONTENT_TYPE,
-    });
+    await send(
+      this.signer,
+      {
+        op: { kind: "put-meta", id: this.id },
+        body: await encryptBlock(this.key, metaAad(this.id), plain),
+        contentType: CONTENT_TYPE,
+      },
+      objectKey,
+    );
   }
 
   private videoKey(): string {
     return `${this.id}/video.bin`;
-  }
-
-  /** `partNumber` null → the upload itself (complete / abort). */
-  private partUrl(partNumber: number | null): string {
-    const base = objectUrl(this.settings, this.videoKey());
-    const upload = `uploadId=${encodeQueryValue(this.uploadId)}`;
-    return partNumber === null ? `${base}?${upload}` : `${base}?partNumber=${partNumber}&${upload}`;
   }
 
   private closedMessage(): string {
@@ -344,65 +868,32 @@ class MultipartSession implements UploadSession {
 
 // --- Signed requests ---------------------------------------------------------
 
-interface S3Request {
-  client: AwsClient;
-  settings: Settings;
-  method: "PUT" | "POST" | "DELETE";
-  url: string;
-  /** What is being uploaded, for error messages. */
-  what: string;
-  body?: Uint8Array;
-  contentType?: string;
-}
-
-async function s3Fetch(req: S3Request): Promise<Response> {
+async function send(signer: Signer, req: SignRequest, what: string): Promise<Response> {
+  const method = METHODS[req.op.kind];
   // lib.dom's BodyInit accepts only ArrayBuffer-backed views; nothing here is
   // ever backed by a SharedArrayBuffer.
   const body = (req.body ?? EMPTY) as Uint8Array<ArrayBuffer>;
 
-  const headers: Record<string, string> = {
-    // Signing the real payload hash (rather than aws4fetch's default
-    // UNSIGNED-PAYLOAD) keeps the body out of the signed Request, so the body is
-    // never copied into a second buffer just to be signed.
-    "x-amz-content-sha256": await sha256Hex(body),
-  };
-  if (req.contentType) headers["content-type"] = req.contentType;
-
-  const signed = await req.client.sign(req.url, { method: req.method, headers });
+  const signed = await signer.sign(req);
 
   let res: Response;
   try {
     res = await fetch(signed.url, {
-      method: req.method,
+      method,
       headers: signed.headers,
       body: req.body ? body : undefined,
     });
   } catch (cause) {
-    throw new Error(networkMessage(req.what, req.method, req.settings), { cause });
+    signer.forget(req.op);
+    throw new Error(signer.networkMessage(what, method), { cause });
   }
   if (!res.ok) {
+    // A signature that produced a failure is not reused: the retry signs a new one.
+    signer.forget(req.op);
     const text = await res.text().catch(() => "");
-    throw new Error(httpMessage(req.what, req.method, req.settings, res.status, res.statusText, text));
+    throw new Error(httpMessage(what, method, signer, res.status, res.statusText, text));
   }
   return res;
-}
-
-/** Path-style URL: works for MinIO, R2 and S3 alike. */
-function objectUrl(settings: Settings, objectKey: string): string {
-  return `${settings.endpoint.replace(/\/+$/, "")}/${settings.bucket}/${objectKey}`;
-}
-
-/**
- * RFC 3986 percent-encoding, matching aws4fetch's canonical query exactly.
- * `encodeURIComponent` leaves `!'()*` alone but aws4fetch escapes them, so an
- * uploadId containing one would be signed differently from how it is sent — a
- * 403 that only some S3 implementations would ever produce.
- */
-function encodeQueryValue(value: string): string {
-  return encodeURIComponent(value).replace(
-    /[!'()*]/g,
-    (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`,
-  );
 }
 
 // --- Validation --------------------------------------------------------------
@@ -489,59 +980,15 @@ function s3ErrorDetail(body: string): string {
 
 function httpMessage(
   what: string,
-  method: string,
-  settings: Settings,
+  method: HttpMethod,
+  signer: Signer,
   status: number,
   statusText: string,
   body: string,
 ): string {
   const detail = s3ErrorDetail(body);
   const head = `Upload of ${what} failed: HTTP ${status}${statusText ? ` ${statusText}` : ""}`;
-  return `${head}${detail ? ` (${detail})` : ""}. ${statusHint(status, method, settings)}`;
-}
-
-function statusHint(status: number, method: string, settings: Settings): string {
-  if (status === 403) {
-    return (
-      `The credentials were rejected or may not write here. Check accessKeyId/secretAccessKey, ` +
-      `that the key is allowed to PutObject and AbortMultipartUpload in "${settings.bucket}", and ` +
-      `that the clock on this machine is correct. See ${DOCS}.`
-    );
-  }
-  if (status === 404) {
-    return (
-      `Bucket "${settings.bucket}" was not found at ${settings.endpoint}, or the multipart upload ` +
-      `expired. VideoShare uses path-style URLs ({endpoint}/{bucket}/{key}) — check both values. See ${DOCS}.`
-    );
-  }
-  if (status === 301 || status === 307) {
-    return `The bucket is not in region "${settings.region}". Fix the region in Settings. See ${DOCS}.`;
-  }
-  if (status === 400) {
-    return (
-      `The request was rejected — usually a wrong region ("${settings.region}") or an endpoint that ` +
-      `expects virtual-host style URLs. See ${DOCS}.`
-    );
-  }
-  if (status === 405 || status === 501) {
-    return (
-      `${settings.endpoint} did not accept a ${method}; it may not be an S3-compatible endpoint, or ` +
-      `it may not support multipart uploads. See ${DOCS}.`
-    );
-  }
-  if (status >= 500) {
-    return "The storage server failed. Wait a moment and try again.";
-  }
-  return `See ${DOCS} for storage setup.`;
-}
-
-function networkMessage(what: string, method: string, settings: Settings): string {
-  return (
-    `Could not reach ${settings.endpoint} to upload ${what}: the request failed before any HTTP ` +
-    `status. That is almost always CORS (the bucket must allow ${method} from ${originLabel()}, ` +
-    `allow the authorization/x-amz-* headers, and expose the ETag header) or an unreachable ` +
-    `endpoint. See examples/s3-cors.json and ${DOCS}.`
-  );
+  return `${head}${detail ? ` (${detail})` : ""}. ${signer.statusHint(status, method)}`;
 }
 
 // --- Small helpers -----------------------------------------------------------

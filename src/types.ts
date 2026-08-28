@@ -43,6 +43,18 @@ export interface Settings {
   videoBitsPerSecond: number;
 }
 
+/**
+ * What `GET {gatewayUrl}/config` answers (SPEC §15.3). Public, no auth — it
+ * carries nothing secret, only what the recorder needs to sign in and to check
+ * that config.js points viewers at the same bucket the gateway writes to.
+ */
+export interface GatewayConfig {
+  /** Base URL where the gateway's bucket is publicly readable. */
+  publicBaseUrl: string;
+  /** OAuth 2.0 client id for Google Identity Services. */
+  googleClientId: string;
+}
+
 /** One row of the local library, persisted at `videoshare.library`. */
 export interface LibraryEntry {
   id: string;

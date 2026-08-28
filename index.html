@@ -17,6 +17,33 @@
         <p class="muted">Record your screen, encrypt it here, share a link.</p>
       </header>
 
+      <!--
+        Gateway mode only (SPEC §15.5). record.ts unhides this when config.js
+        sets gatewayUrl, and removes the settings panel below in the same breath —
+        the two are mutually exclusive by design.
+      -->
+      <section id="auth-panel" class="card auth hidden" aria-label="Sign in">
+        <p id="auth-loading" class="muted hint">Loading Google sign-in…</p>
+
+        <div id="auth-signed-out" class="auth-row hidden">
+          <p class="muted hint">
+            Sign in with Google to record. Uploads are authorized by the gateway, so this browser
+            never holds bucket credentials.
+          </p>
+          <div id="auth-button"></div>
+        </div>
+
+        <div id="auth-signed-in" class="auth-row hidden">
+          <p class="auth-identity">
+            Signed in as <strong id="auth-email"></strong>
+          </p>
+          <button id="sign-out" type="button" class="ghost">Sign out</button>
+        </div>
+
+        <p id="auth-status" class="muted hint" role="status" aria-live="polite"></p>
+        <p id="auth-warning" class="hint error hidden"></p>
+      </section>
+
       <details id="settings-panel" class="card settings">
         <summary id="settings-summary">Storage settings</summary>
 

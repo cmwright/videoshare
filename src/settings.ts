@@ -1,7 +1,8 @@
-import type { LibraryEntry, Quality, Settings } from "./types";
+import type { GatewayConfig, LibraryEntry, Quality, Settings } from "./types";
 
 const SETTINGS_KEY = "videoshare.settings";
 const LIBRARY_KEY = "videoshare.library";
+const GATEWAY_DOCS = "docs/gateway-setup.md";
 
 export const DEFAULT_REGION = "us-east-1";
 export const DEFAULT_QUALITY: Quality = "standard";
@@ -64,8 +65,7 @@ export function removeFromLibrary(id: string): void {
 }
 
 export function publicBaseUrl(): string {
-  const config = (globalThis as typeof globalThis & { VIDEOSHARE?: { publicBaseUrl?: unknown } }).VIDEOSHARE;
-  const value = config && typeof config === "object" ? config.publicBaseUrl : undefined;
+  const value = deployConfig()?.publicBaseUrl;
   if (typeof value !== "string" || !value.trim()) {
     throw new Error(
       "config.js did not set window.VIDEOSHARE.publicBaseUrl. Copy public/config.js next to " +
@@ -74,6 +74,70 @@ export function publicBaseUrl(): string {
     );
   }
   return trimTrailingSlash(value.trim());
+}
+
+/**
+ * Where the optional gateway lives, from config.js — absolute, or same-origin
+ * relative like `"/api"` (SPEC §15.5). Present → gateway mode: no settings
+ * panel, no credentials in this browser, Google sign-in required. Absent (the
+ * shipped default) → legacy mode, §9 unchanged.
+ */
+export function gatewayUrl(): string | null {
+  const value = deployConfig()?.gatewayUrl;
+  if (typeof value !== "string") return null;
+  return trimTrailingSlash(value.trim()) || null;
+}
+
+/**
+ * `GET {base}/config` (SPEC §15.3) — public, unauthenticated, and the only
+ * thing the recorder needs before it can offer sign-in.
+ */
+export async function fetchGatewayConfig(base: string): Promise<GatewayConfig> {
+  let res: Response;
+  try {
+    res = await fetch(`${base}/config`, { headers: { accept: "application/json" } });
+  } catch (cause) {
+    throw new Error(
+      `Could not reach the upload gateway at ${base}. Check that it is running and that its ` +
+        `ALLOWED_ORIGINS includes this site. See ${GATEWAY_DOCS}.`,
+      { cause },
+    );
+  }
+  if (!res.ok) {
+    throw new Error(
+      `The upload gateway at ${base} answered HTTP ${res.status}${res.statusText ? ` ${res.statusText}` : ""} ` +
+        `for its config. See ${GATEWAY_DOCS}.`,
+    );
+  }
+
+  let body: unknown;
+  try {
+    body = (await res.json()) as unknown;
+  } catch (cause) {
+    throw new Error(
+      `The upload gateway's config at ${base}/config was not JSON — check that gatewayUrl in ` +
+        `config.js points at the gateway and not at this site. See ${GATEWAY_DOCS}.`,
+      { cause },
+    );
+  }
+
+  const raw = (body !== null && typeof body === "object" ? body : {}) as Raw<GatewayConfig> & {
+    gateway?: unknown;
+  };
+  const googleClientId = text(raw.googleClientId).trim();
+  if (raw.gateway !== true || !googleClientId) {
+    throw new Error(
+      `${base}/config did not answer like a VideoShare gateway (it must return gateway: true and a ` +
+        `googleClientId from GOOGLE_CLIENT_ID). See ${GATEWAY_DOCS}.`,
+    );
+  }
+  return { publicBaseUrl: trimTrailingSlash(text(raw.publicBaseUrl).trim()), googleClientId };
+}
+
+/** `window.VIDEOSHARE` from config.js, as far as it can be trusted (i.e. not at all). */
+function deployConfig(): { publicBaseUrl?: unknown; gatewayUrl?: unknown } | undefined {
+  const value = (globalThis as typeof globalThis & { VIDEOSHARE?: unknown }).VIDEOSHARE;
+  return value !== null && typeof value === "object" ? (value as Record<string, unknown>) : undefined;
 }
 
 /**

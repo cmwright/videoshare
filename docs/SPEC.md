@@ -361,3 +361,124 @@ tokens and base styles in `src/app.css`.
   security model (fragment key, write-only creds, what it does NOT protect
   against), browser support matrix, future work (camera bubble, streaming
   upload-while-recording, multipart).
+
+## 15. Gateway (optional): server-side credentials, presigned uploads
+
+An optional, **stateless** service that removes all bucket credentials from
+browsers. Core invariant: **the gateway MUST NOT proxy object data — every
+storage byte flows browser↔bucket via presigned URLs. There is no proxy mode
+and none may be added.** The gateway holds the bucket credentials (env vars),
+authenticates uploaders, and signs URLs. It never streams, never stores state,
+and depends on nothing but its env — so one core handler runs identically as a
+Cloudflare Worker, an AWS Lambda (function URL), or a plain Node process.
+
+### 15.1 Package layout
+
+`gateway/` — its own npm package (root repo stays a plain static site):
+```
+gateway/
+├── package.json          # deps: aws4fetch, jose; no framework
+├── tsconfig.json
+├── src/
+│   ├── core.ts           # handleRequest(req: Request, env: GatewayEnv): Promise<Response>
+│   ├── auth.ts           # Google ID-token verification (jose) + whitelist
+│   ├── presign.ts        # SigV4 query-string presigning via aws4fetch
+│   ├── worker.ts         # Cloudflare Worker adapter (export default { fetch })
+│   ├── lambda.ts         # Lambda function-URL adapter (event ↔ Request/Response)
+│   └── node.ts           # plain Node http server adapter
+└── wrangler.jsonc        # Worker deploy config (name videoshare-gateway)
+```
+Adapters are thin translations only; ALL logic lives in core/auth/presign
+(WHATWG Request/Response — native in Workers, Lambda via adapter, Node ≥20).
+
+### 15.2 Environment (identical across adapters)
+
+`BUCKET_ENDPOINT`, `BUCKET_NAME`, `BUCKET_REGION` (default `auto`),
+`BUCKET_ACCESS_KEY_ID`, `BUCKET_SECRET_ACCESS_KEY`, `PUBLIC_BASE_URL`,
+`GOOGLE_CLIENT_ID`, `ALLOWED_EMAILS` (comma-separated; each entry is a full
+email or a `@domain.com` suffix; case-insensitive), `ALLOWED_ORIGINS`
+(comma-separated origins for the gateway's own CORS; `*` forbidden),
+`PRESIGN_EXPIRY_SECONDS` (default 900, max 3600). Test-only overrides
+`OIDC_JWKS_URL` / `OIDC_ISSUER` (§15.6) default to Google's.
+
+### 15.3 Endpoints
+
+All responses JSON; errors are `{ error: string }` with status. The gateway
+answers CORS preflights itself and echoes only origins in `ALLOWED_ORIGINS`.
+
+- `GET /api/config` — public, no auth:
+  `{ gateway: true, publicBaseUrl, googleClientId }`.
+- `POST /api/sign` — requires `Authorization: Bearer <Google ID token>`
+  (verified per §15.4). Body is one of:
+  - `{ op: "create", id }` → presigned CreateMultipartUpload →
+    `{ url, method: "POST" }`
+  - `{ op: "part", id, uploadId, partNumbers: number[] }` (1–100 entries,
+    each 1–10000) → `{ urls: [{ partNumber, url }] }`, method PUT
+  - `{ op: "complete", id, uploadId }` → `{ url, method: "POST" }` (client
+    sends the XML body; SigV4 query auth does not bind the payload —
+    UNSIGNED-PAYLOAD — so no body hash is needed)
+  - `{ op: "abort", id, uploadId }` → `{ url, method: "DELETE" }`
+  - `{ op: "put-meta", id }` → presigned PUT for `{id}/meta.json` →
+    `{ url, method: "PUT" }`
+  Validation (400 on failure): `id` must match `^[A-Za-z0-9_-]{22}$`; object
+  keys are constructed server-side as exactly `{id}/video.bin` /
+  `{id}/meta.json` — the client can never influence any other key; `uploadId`
+  and `partNumbers` are syntax-checked and passed through as query params
+  (URL-encoded). Auth failures: 401 (bad/expired token), 403 (valid token,
+  email not allowed).
+
+### 15.4 Authentication (stateless)
+
+Verify the bearer as a Google ID token using `jose` against the JWKS at
+`OIDC_JWKS_URL` (cached per its HTTP cache headers): RS256 only (reject any
+other `alg`), `iss` must equal `OIDC_ISSUER` (default: accepts both
+`accounts.google.com` and `https://accounts.google.com`), `aud` must equal
+`GOOGLE_CLIENT_ID`, `exp`/`nbf` enforced, `email_verified` must be `true`,
+then `email` checked against `ALLOWED_EMAILS`. No sessions, no cookies, no
+refresh logic server-side. The verified email MAY be logged for audit; the
+token itself must never be logged.
+
+### 15.5 Client behavior (recorder page)
+
+- `public/config.js` gains optional `gatewayUrl` (absolute, or relative like
+  `"/api"` for same-origin deployments). Present → **gateway mode**: the
+  settings panel is not rendered; client fetches `{gatewayUrl}/config`;
+  recording requires Google sign-in (Google Identity Services script, ID token
+  kept in memory only — never localStorage). Absent → **legacy mode**, §9
+  unchanged.
+- `upload.ts` grows a `Signer` seam: `LocalSigner` (aws4fetch with settings
+  creds — legacy mode, current behavior) and `GatewaySigner` (calls
+  `/api/sign`; batches part URLs ahead of need, e.g. 8 at a time, so signing
+  never stalls the upload queue). `UploadSession` logic is otherwise
+  unchanged; presigned URLs are used exactly like signed requests today.
+- On a 401 mid-session, the client re-acquires an ID token silently (GIS
+  `prompt()` with auto-select) and retries once; if that fails, the part
+  queue's existing retry/degraded path applies and the UI shows a re-sign-in
+  prompt without stopping the recording.
+- The player and viewing flow are untouched (public reads, no gateway).
+
+### 15.6 Tests
+
+No insecure test bypasses in the gateway (no magic bearer tokens): e2e and
+unit tests generate an RS256 keypair, serve a local JWKS, set
+`OIDC_JWKS_URL`/`OIDC_ISSUER`, and mint real JWTs — the production verification
+path runs verbatim. Unit tests (Node): token verification (wrong alg/iss/aud/
+exp/unverified email → 401; non-whitelisted → 403; suffix matching), key-shape
+enforcement (op/id/partNumbers validation), presigned URL shape (X-Amz-*
+params, expiry), CORS allowlist. E2E (vitest, `E2E=1`): start the Node adapter
+in-process against local MinIO and drive the full client path — GatewaySigner
+multipart upload (≥3 parts), complete, meta PUT, then anonymous ranged
+download/decrypt byte-compare; plus abort; plus a rejected non-whitelisted
+token. R2's presigned UploadPart support is community-confirmed only, so the
+first real-R2 deployment MUST run a smoke upload before rollout (documented).
+
+### 15.7 Docs & examples
+
+- `docs/gateway-setup.md`: creating the Google OAuth client id (authorized JS
+  origins = site origin), deploying each adapter (wrangler for Workers +
+  secrets; Lambda function URL; Docker/Node next to MinIO), env reference,
+  whitelist management, and the R2 smoke-test step.
+- `examples/docker-compose.yml`: optional `gateway` service (Node adapter)
+  wired to MinIO, off by default (profile), since local Google sign-in needs a
+  real client id with localhost origins.
+- README: gateway mode vs legacy mode, one paragraph + pointer.

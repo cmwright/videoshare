@@ -10,6 +10,7 @@
 import "./app.css";
 import "./record.css";
 
+import { type Auth, type AuthState, createAuth } from "./auth";
 import { CHUNK_OVERHEAD, CHUNK_SIZE, generateKey } from "./crypto";
 import {
   createEngine,
@@ -19,7 +20,11 @@ import {
 } from "./encoder";
 import {
   addToLibrary,
+  DEFAULT_PREFER_AV1,
   DEFAULT_QUALITY,
+  DEFAULT_VIDEO_BITS_PER_SECOND,
+  fetchGatewayConfig,
+  gatewayUrl,
   loadLibrary,
   loadSettings,
   publicBaseUrl,
@@ -27,8 +32,14 @@ import {
   removeFromLibrary,
   saveSettings,
 } from "./settings";
-import type { LibraryEntry, Quality, Settings, VideoMeta } from "./types";
-import { createUploadSession, type UploadSession } from "./upload";
+import type { GatewayConfig, LibraryEntry, Quality, Settings, VideoMeta } from "./types";
+import {
+  createGatewaySigner,
+  createLocalSigner,
+  createUploadSession,
+  type Signer,
+  type UploadSession,
+} from "./upload";
 import { formatBytes, formatDuration, randomId } from "./util";
 
 /** Capture ceiling (SPEC §6): a 4K display downscales, and 30fps is plenty for a screen. */
@@ -52,6 +63,16 @@ const stages = Array.from(document.querySelectorAll<HTMLElement>("[data-stage]")
 const settingsPanel = el<HTMLDetailsElement>("#settings-panel");
 const settingsForm = el<HTMLFormElement>("#settings-form");
 const settingsStatus = el<HTMLElement>("#settings-status");
+
+const authPanel = el<HTMLElement>("#auth-panel");
+const authLoading = el<HTMLElement>("#auth-loading");
+const authSignedOut = el<HTMLElement>("#auth-signed-out");
+const authSignedIn = el<HTMLElement>("#auth-signed-in");
+const authButton = el<HTMLElement>("#auth-button");
+const authEmail = el<HTMLElement>("#auth-email");
+const authStatus = el<HTMLElement>("#auth-status");
+const authWarning = el<HTMLElement>("#auth-warning");
+const signOutButton = el<HTMLButtonElement>("#sign-out");
 
 const micToggle = el<HTMLInputElement>("#mic");
 const startButton = el<HTMLButtonElement>("#start");
@@ -103,6 +124,16 @@ interface Finished {
 }
 
 let stage: Stage = "idle";
+
+/** Set once config.js names a gateway (SPEC §15.5); stays null in legacy mode. */
+let gateway: { auth: Auth; signer: Signer } | null = null;
+/** This browser can capture and encode at all — decided once by checkSupport(). */
+let captureSupported = true;
+/** Gateway mode with no usable ID token: recording must not start. */
+let signInRequired = false;
+/** A mid-session expiry has been announced, so signing back in can say so once. */
+let reauthAnnounced = false;
+
 let capture: Capture | null = null;
 let engine: RecorderEngine | null = null;
 /** Set by whichever stop path arrives first, so the other one is a no-op. */
@@ -313,6 +344,120 @@ settingsForm.addEventListener("submit", (event) => {
   }, 2000);
 });
 
+// --- Sign-in (gateway mode, SPEC §15.5) --------------------------------------
+
+/** Where the gateway lives, or null for legacy mode. Read once: config.js cannot change. */
+const gatewayBase = gatewayUrl();
+
+function updateStartButton(): void {
+  startButton.disabled = !captureSupported || signInRequired;
+}
+
+function showAuthStatus(text: string, isError: boolean): void {
+  authStatus.textContent = text;
+  authStatus.classList.toggle("error", isError);
+  authStatus.classList.toggle("muted", !isError);
+}
+
+function renderAuth(state: AuthState): void {
+  const signedIn = state.status === "signed-in";
+  authLoading.classList.toggle("hidden", state.status !== "loading");
+  // "error" means Google's script never became usable, so offering its button
+  // would be a lie: only the message is left.
+  authSignedOut.classList.toggle("hidden", state.status !== "signed-out");
+  authSignedIn.classList.toggle("hidden", !signedIn);
+  authEmail.textContent = state.email ?? "your Google account";
+  showAuthStatus(state.message ?? "", state.status === "error");
+
+  signInRequired = !signedIn;
+  updateStartButton();
+}
+
+function onAuthChange(state: AuthState): void {
+  renderAuth(state);
+
+  if (state.status === "signed-in") {
+    if (reauthAnnounced) {
+      reauthAnnounced = false;
+      showNote("Signed back in — the upload picks up where it left off.");
+    }
+    return;
+  }
+  // A token that expired mid-session must never end the recording: every byte is
+  // still in this tab, and the parts held up are re-sent by finish() (SPEC §15.5).
+  if (stage === "recording" || stage === "preview" || stage === "finishing") {
+    reauthAnnounced = true;
+    showError(
+      "Your Google sign-in expired. Sign in again above to keep uploading — the recording is " +
+        "still going and nothing has been lost.",
+    );
+    authPanel.scrollIntoView({ block: "nearest" });
+  }
+}
+
+/** Points at the sign-in panel — recording cannot start without a token. */
+function demandSignIn(text: string): void {
+  authPanel.scrollIntoView({ block: "nearest" });
+  showError(text);
+}
+
+/**
+ * The gateway writes to its own bucket; viewers read whichever one config.js
+ * names. If those disagree, uploads succeed and every link points at nothing.
+ */
+function gatewayBaseUrlWarning(config: GatewayConfig): string | null {
+  let deployed: string;
+  try {
+    deployed = publicBaseUrl();
+  } catch (err) {
+    return describe(err);
+  }
+  if (!config.publicBaseUrl || config.publicBaseUrl === deployed) return null;
+  return (
+    `Viewers load videos from ${deployed} (set in config.js), but the gateway uploads to ` +
+    `${config.publicBaseUrl}. Make the two match, or shared links won't play.`
+  );
+}
+
+/**
+ * Gateway mode: the settings panel is removed outright (there are no credentials
+ * for it to hold), Google's script is loaded, and recording waits for a token.
+ */
+async function initGateway(base: string): Promise<void> {
+  settingsPanel.remove();
+  authPanel.classList.remove("hidden");
+  signInRequired = true;
+  updateStartButton();
+
+  let config: GatewayConfig;
+  try {
+    config = await fetchGatewayConfig(base);
+  } catch (err) {
+    authLoading.classList.add("hidden");
+    showAuthStatus(describe(err), true);
+    return;
+  }
+
+  const warning = gatewayBaseUrlWarning(config);
+  if (warning) {
+    authWarning.textContent = warning;
+    authWarning.classList.remove("hidden");
+  }
+
+  const auth = createAuth(config.googleClientId);
+  auth.mount(authButton);
+  auth.onChange(onAuthChange);
+  gateway = {
+    auth,
+    signer: createGatewaySigner({
+      gatewayUrl: base,
+      getToken: () => auth.getToken(),
+      refreshToken: () => auth.refresh(),
+    }),
+  };
+  renderAuth(auth.state);
+}
+
 // --- Library -----------------------------------------------------------------
 
 /**
@@ -515,16 +660,63 @@ function showUploaded(uploadedBytes: number): void {
 
 // --- Recording ---------------------------------------------------------------
 
+/** What a recording needs from whichever mode this deployment is in. */
+interface UploadPlan {
+  signer: Signer;
+  quality: Quality;
+  preferAv1: boolean;
+  videoBitsPerSecond: number;
+}
+
+/**
+ * Resolves who will authorize the upload, or explains what is missing and
+ * returns null. The multipart upload starts with the recording, so this has to
+ * hold before a screen is even picked.
+ */
+function uploadPlan(): UploadPlan | null {
+  if (gatewayBase) {
+    if (!gateway) {
+      demandSignIn("The upload gateway is not ready yet — see the sign-in panel above.");
+      return null;
+    }
+    if (!gateway.auth.getToken()) {
+      demandSignIn("Sign in with Google before recording — the upload starts as you record.");
+      return null;
+    }
+    // There is no settings panel in gateway mode (SPEC §15.5), so the encoder
+    // runs on the same defaults a fresh install would use.
+    return {
+      signer: gateway.signer,
+      quality: DEFAULT_QUALITY,
+      preferAv1: DEFAULT_PREFER_AV1,
+      videoBitsPerSecond: DEFAULT_VIDEO_BITS_PER_SECOND,
+    };
+  }
+
+  const settings = loadSettings();
+  if (!settings) {
+    demandSettings("Add your storage settings before recording — the upload starts as you record.");
+    return null;
+  }
+  try {
+    return {
+      signer: createLocalSigner(settings),
+      quality: settings.quality,
+      preferAv1: settings.preferAv1,
+      videoBitsPerSecond: settings.videoBitsPerSecond,
+    };
+  } catch (err) {
+    demandSettings(describe(err));
+    return null;
+  }
+}
+
 async function startRecording(): Promise<void> {
   if (stage !== "idle") return;
   clearMessage();
 
-  // The multipart upload starts with the recording, so settings must exist first.
-  const settings = loadSettings();
-  if (!settings) {
-    demandSettings("Add your storage settings before recording — the upload starts as you record.");
-    return;
-  }
+  const plan = uploadPlan();
+  if (!plan) return;
 
   setStage("picking");
 
@@ -562,9 +754,9 @@ async function startRecording(): Promise<void> {
   let started: RecorderEngine;
   try {
     started = createEngine({
-      quality: settings.quality,
-      preferAv1: settings.preferAv1,
-      fallbackVideoBitsPerSecond: settings.videoBitsPerSecond,
+      quality: plan.quality,
+      preferAv1: plan.preferAv1,
+      fallbackVideoBitsPerSecond: plan.videoBitsPerSecond,
     });
   } catch (err) {
     releaseCapture();
@@ -574,11 +766,12 @@ async function startRecording(): Promise<void> {
   }
 
   // CreateMultipartUpload before the first frame: bad credentials, a missing
-  // bucket or a CORS gap surface now rather than after a ten-minute take.
+  // bucket, a rejected sign-in or a CORS gap surface now rather than after a
+  // ten-minute take.
   const id = randomId();
   let opened: UploadSession;
   try {
-    opened = await createUploadSession(settings, id, await generateKey(), showUploaded);
+    opened = await createUploadSession(plan.signer, id, await generateKey(), showUploaded);
   } catch (err) {
     releaseCapture();
     setStage("idle");
@@ -921,6 +1114,7 @@ function discard(): void {
 
 startButton.addEventListener("click", () => void startRecording());
 stopButton.addEventListener("click", () => stopRecording());
+signOutButton.addEventListener("click", () => gateway?.auth.signOut());
 finishButton.addEventListener("click", () => void finishUpload());
 retryButton.addEventListener("click", () => void finishUpload());
 discardButton.addEventListener("click", discard);
@@ -943,10 +1137,10 @@ function checkSupport(): void {
   const kind = selectEngineKind();
   const canEncode =
     kind === "webcodecs" || (kind === "mediarecorder" && selectFallbackMimeType() !== null);
-  const supported = canEncode && typeof navigator.mediaDevices?.getDisplayMedia === "function";
-  if (supported) return;
-  startButton.disabled = true;
-  micToggle.disabled = true;
+  captureSupported = canEncode && typeof navigator.mediaDevices?.getDisplayMedia === "function";
+  micToggle.disabled = !captureSupported;
+  updateStartButton();
+  if (captureSupported) return;
   showError(
     canEncode
       ? "This browser cannot capture the screen. Try Chrome, Edge, or Firefox on a desktop."
@@ -956,6 +1150,9 @@ function checkSupport(): void {
 }
 
 setStage("idle");
-initSettings();
+// One or the other, never both: a gateway means credentials live server-side, so
+// the settings panel is not just hidden but removed (SPEC §15.5).
+if (gatewayBase) void initGateway(gatewayBase);
+else initSettings();
 renderLibrary();
 checkSupport();

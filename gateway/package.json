@@ -1,0 +1,25 @@
+{
+  "name": "videoshare-gateway",
+  "version": "1.0.0",
+  "description": "Optional stateless gateway for VideoShare: holds the bucket credentials, verifies Google ID tokens, hands the browser presigned S3 URLs. Never proxies object bytes.",
+  "license": "MIT",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "start": "node src/node.ts",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "aws4fetch": "^1.0.20",
+    "jose": "^6.2.10"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.0",
+    "typescript": "^5.9.3"
+  }
+}

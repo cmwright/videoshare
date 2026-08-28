@@ -44,6 +44,43 @@
   color: var(--danger);
 }
 
+/* Sign-in (gateway mode) ---------------------------------------------------- */
+
+.auth {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.auth > :empty {
+  display: none;
+}
+
+.auth-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-4);
+}
+
+/* The explanation sits above Google's button; the signed-in line shares its row. */
+.auth-row > .hint {
+  flex-basis: 100%;
+}
+
+/* Google renders its own button here; it must not be stretched by the row. */
+#auth-button {
+  flex: none;
+}
+
+.auth-identity {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* Settings ------------------------------------------------------------------ */
 
 .settings summary {

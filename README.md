@@ -138,6 +138,29 @@ still in flight. They do not let them read, list, delete a stored object, or
 reach anything else in the account. The bucket has no anonymous `ListBucket`, so
 video ids — 128 random bits each — cannot be enumerated.
 
+### Optional: getting the credentials out of the browser
+
+The one uncomfortable line in that list is the `localStorage` one. If you want
+the upload credentials off your colleagues' laptops — or you simply want more
+than one person recording without handing the same keys to each of them — there
+is an optional **gateway**: a small stateless service that holds the bucket
+credentials, verifies a Google sign-in against an email whitelist you control,
+and answers with **presigned URLs**. The browser then uploads to those URLs
+directly. The gateway signs; it never carries a byte of video, by design and by
+test, so it stays cheap and small no matter how much you record.
+
+Turning it on is one line in `public/config.js`. The recorder drops its settings
+panel and asks you to sign in instead; everything else — browser-side
+encryption, the key in the fragment, the anonymous player — is untouched, and
+existing share links keep working. It runs as a Cloudflare Worker, a Lambda
+function URL, or a Node process next to your bucket.
+[`docs/gateway-setup.md`](docs/gateway-setup.md) has the walkthrough, and
+`examples/docker-compose.yml` has it wired to the local stack behind a
+`--profile gateway` flag.
+
+Without that line you are in the default mode described above: no server, no
+sign-in, credentials in your own browser.
+
 ### What this does *not* protect against
 
 Be clear-eyed about this list before you record anything sensitive.
@@ -250,13 +273,17 @@ WebM container does.
 npm run dev        # vite dev server
 npm run build      # tsc --noEmit && vite build  ->  dist/
 npm run preview    # serve the built dist/
-npm test           # unit tests (crypto format, offset math, base64url, codec strings)
+npm test           # unit tests (crypto format, offset math, base64url, codec strings,
+                   #             and the gateway's token verification and validation)
 ```
 
-The end-to-end test drives the real streaming multipart upload against the
-compose stack — create, parts, complete, abort — reads the result back the way
-the player does, and checks that the bucket policy is what it claims to be:
-public reads work, anonymous writes 403, listing 403.
+The end-to-end tests drive the real streaming multipart upload against the
+compose stack — create, parts, complete, abort — read the result back the way
+the player does, and check that the bucket policy is what it claims to be:
+public reads work, anonymous writes 403, listing 403. They run the whole loop
+twice: once signing in the browser, and once through the gateway, which boots
+in-process with its own RS256 key set and proves that the video went to the
+bucket and not through it.
 
 ```sh
 docker compose -f examples/docker-compose.yml up -d

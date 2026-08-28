@@ -16,6 +16,15 @@
 #
 # Tear down with `docker compose -f examples/docker-compose.yml down -v`
 # (-v also drops the recorded videos).
+#
+# There is a fourth, optional service: the upload gateway (docs/gateway-setup.md),
+# which keeps the bucket credentials out of the browser entirely. It sits behind
+# the `gateway` compose profile and does not start unless you ask for it, because
+# it needs a Google OAuth client id that only you can create:
+#
+#   VIDEOSHARE_GOOGLE_CLIENT_ID=...apps.googleusercontent.com \
+#   VIDEOSHARE_ALLOWED_EMAILS=you@example.com \
+#     docker compose -f examples/docker-compose.yml --profile gateway up -d
 
 services:
   minio:
@@ -134,6 +143,66 @@ services:
         echo "  Secret access key  videoshare-uploader-secret"
         echo "  Public base URL    http://localhost:9000/videoshare"
         echo
+
+  # OPTIONAL — the upload gateway (docs/SPEC.md §15, docs/gateway-setup.md).
+  #
+  # Off by default: it is only reachable under `--profile gateway`, because
+  # signing in needs a Google OAuth client id that has http://localhost:8080 in
+  # its authorized JavaScript origins, and only you can create one. Supply it as
+  # VIDEOSHARE_GOOGLE_CLIENT_ID (and yourself as VIDEOSHARE_ALLOWED_EMAILS);
+  # leave either unset and the gateway exits at boot saying which is missing —
+  # it validates its whole environment before it listens.
+  #
+  # Then point the recorder at it by uncommenting one line in public/config.js:
+  #
+  #   gatewayUrl: "http://localhost:8787/api"
+  #
+  # and rebuilding (`npm run build`). The Settings panel disappears; recording
+  # asks you to sign in instead.
+  #
+  # Runs the sources straight from ../gateway with Node's own type stripping, so
+  # `npm --prefix gateway install` must have run first — same deal as ../dist for
+  # the web service below. Nothing is written back: the mount is read-only.
+  gateway:
+    profiles: ["gateway"]
+    image: node:24-alpine
+    working_dir: /app
+    command: ["node", "src/node.ts"]
+    depends_on:
+      minio:
+        condition: service_healthy
+    ports:
+      - "8787:8787"
+    volumes:
+      - ../gateway:/app:ro
+    environment:
+      # http://localhost:9000, NOT http://minio:9000 — this is the endpoint the
+      # gateway *signs URLs for*, and it is the browser that dereferences them.
+      # The gateway itself never connects to the bucket at all (SPEC §15: it
+      # signs, it does not proxy), so it does not even need to resolve the name.
+      BUCKET_ENDPOINT: http://localhost:9000
+      BUCKET_NAME: videoshare
+      BUCKET_REGION: us-east-1
+      # The same upload-only key the init job mints. The gateway needs no more
+      # authority than the recorder did: PutObject and AbortMultipartUpload.
+      # What changes is who holds it — a container you run, not every browser.
+      BUCKET_ACCESS_KEY_ID: videoshare-uploader
+      BUCKET_SECRET_ACCESS_KEY: videoshare-uploader-secret
+      PUBLIC_BASE_URL: http://localhost:9000/videoshare
+      # Yours, from console.cloud.google.com → Clients → Create client → Web
+      # application, with http://localhost and http://localhost:8080 as
+      # authorized JavaScript origins. See docs/gateway-setup.md.
+      GOOGLE_CLIENT_ID: ${VIDEOSHARE_GOOGLE_CLIENT_ID:-}
+      # Who may upload: comma-separated, each entry a full address or an
+      # "@domain.com" suffix, matched case-insensitively. There is no default —
+      # an empty whitelist is a closed door, not an open one.
+      ALLOWED_EMAILS: ${VIDEOSHARE_ALLOWED_EMAILS:-}
+      # Exactly where the site is served from, below. Never "*": a wildcard here
+      # would let any page on the internet spend these credentials on behalf of
+      # someone who is signed in.
+      ALLOWED_ORIGINS: http://localhost:8080
+      PRESIGN_EXPIRY_SECONDS: "900"
+      PORT: "8787"
 
   # Serves the built site. `npm run build` must have produced dist/ first —
   # Docker creates an empty directory for a missing bind mount, which shows up
