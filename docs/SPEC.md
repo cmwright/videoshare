@@ -83,7 +83,11 @@ Two objects per video, under the id as prefix:
 ## 6. Recording
 
 - Capture: `getDisplayMedia({ video: { frameRate: { ideal: 30, max: 30 },
-  width: { max: 2560 }, height: { max: 1440 } }, audio: true })` (system/tab
+  width: { ideal: 3840, max: 3840 }, height: { ideal: 2160, max: 2160 } },
+  audio: true })` — `ideal` is load-bearing: without it Chrome captures screens
+  at LOGICAL (CSS-pixel) size, half density on Retina, and no encoder setting
+  can recover the lost text detail; with it Chrome delivers native physical
+  pixels up to the 4K cap and never upscales past the surface's native size. (system/tab
   audio only arrives if the user opts in via the picker) plus
   `getUserMedia({ audio: true })` for the default microphone (same device the OS
   gives Meet/Zoom). Mic defaults ON with a visible toggle before capture starts.

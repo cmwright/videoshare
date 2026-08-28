@@ -42,9 +42,12 @@ import {
 } from "./upload";
 import { formatBytes, formatDuration, randomId } from "./util";
 
-/** Capture ceiling (SPEC §6): a 4K display downscales, and 30fps is plenty for a screen. */
-const MAX_WIDTH = 2560;
-const MAX_HEIGHT = 1440;
+/** Capture target (SPEC §6): `ideal` pulls Chrome up to native PHYSICAL pixels
+ * (its default for screen capture is the logical/CSS size — half density on
+ * Retina, which renders text soft no matter the encoder quality); `max` caps a
+ * 5K+ display at 4K. Chrome never upscales past the surface's native size. */
+const MAX_WIDTH = 3840;
+const MAX_HEIGHT = 2160;
 const MAX_FRAME_RATE = 30;
 
 /** Cap on waiting for the preview element during the duration probe. */
@@ -546,13 +549,11 @@ function releaseCapture(): void {
 async function startCapture(useMic: boolean): Promise<Capture> {
   // getDisplayMedia must run within the click's transient user activation, so it
   // goes first: awaiting a microphone permission prompt before it can expire it.
-  // Capped at 1440p30 (SPEC §6): enough pixels for legible Retina text, while
-  // staying inside what software VP9 encodes in real time without heavy drops.
   const display = await navigator.mediaDevices.getDisplayMedia({
     video: {
       frameRate: { ideal: MAX_FRAME_RATE, max: MAX_FRAME_RATE },
-      width: { max: MAX_WIDTH },
-      height: { max: MAX_HEIGHT },
+      width: { ideal: MAX_WIDTH, max: MAX_WIDTH },
+      height: { ideal: MAX_HEIGHT, max: MAX_HEIGHT },
     },
     audio: true,
   });
