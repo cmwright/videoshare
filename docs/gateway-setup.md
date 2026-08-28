@@ -382,8 +382,8 @@ label.
 
 **Leaving `ANALYTICS_BUCKET` unset is a supported configuration, not a broken
 one.** `/api/config` then answers `analytics: false`, the player sends nothing,
-the beacon routes are `404`, and `stats.html` says so politely. Everything below
-is opt-in.
+the beacon routes are `404`, and the recorder's library shows no analytics at
+all — no expander, no empty panel to wonder about. Everything below is opt-in.
 
 ```
   viewer ─── POST /beacon/{videoId}/{sessionId} ───▶ gateway ──▶ analytics bucket
@@ -410,7 +410,7 @@ credentials. Two rules:
   start if `ANALYTICS_BUCKET` and `BUCKET_NAME` are the same bucket, because the
   video bucket is world-readable by design and watch data must never land in it.
 - **It needs `GET` CORS from the site's origin**, and nothing else. Writes need
-  no CORS at all — the gateway performs them server-side — but the stats page
+  no CORS at all — the gateway performs them server-side — but the recorder page
   fetches session objects straight from their presigned URLs, so the browser does
   a cross-origin `GET` against the bucket. `examples/s3-cors.json` is more
   permissive than this bucket needs; `GET` and `HEAD` from your site's origin is
@@ -465,9 +465,13 @@ curl -i -X POST https://<your-gateway>/api/beacon/aaaaaaaaaaaaaaaaaaaaaa/bbbbbbb
 # HTTP/1.1 204  — unauthenticated on purpose: viewers have no identity
 ```
 
-Rebuild the site (`npm run build`) and open `stats.html`. It is gateway-mode
-only, signs in with the same Google client id, and asks for one video's sessions
-at a time.
+Rebuild the site (`npm run build`) and open the recorder. Every entry in **My
+videos** grows an **Analytics** expander once you are signed in: open one and it
+lists that video's sessions, fetches them straight from the bucket, and decrypts
+them in the tab — views, unique viewers, completions, and a heatmap of which 2%
+of the video got replayed and which got skipped. There is no separate stats page
+and no link to paste: the analytics live on the video's own row, because that is
+where its share link already is.
 
 ### Lambda: smoke-test one real beacon before you roll out
 
@@ -485,10 +489,10 @@ the body as bytes and cannot hit this, and no test that runs on your laptop can
 prove which way the function URL goes.
 
 So prove it on the real thing. Record a fresh video, play a minute of it from its
-share link against the deployed gateway, then open `stats.html`, sign in, and
-paste that same link:
+share link against the deployed gateway, then open the recorder, sign in, and
+expand **Analytics** on that video's library row:
 
-- **One session, decrypted, watch percentage roughly matching what you did** —
+- **One view, decrypted, with a heatmap over the part you actually watched** —
   the beacon survived the round trip. Nothing further to do, ever.
 - **"1 session could not be read"**, on a video whose key has not changed and
   with nothing else in that prefix — that is this failure, and it is the reason
@@ -537,6 +541,7 @@ Two consequences worth saying out loud:
 | Gateway exits naming `ANALYTICS_BUCKET` | Either it is not a legal bucket name, or it is the *same* bucket as `BUCKET_NAME` — which is refused, because that bucket is world-readable. |
 | `404` from `/beacon/…` on a gateway you configured | The reverse proxy is not passing the path through, or `ANALYTICS_BUCKET` is unset on the instance that answered. `/api/beacon/…` and `/beacon/…` both work. |
 | `502` from `/beacon/…` | The bucket rejected the write or the listing; the gateway's log has the video id and the storage status. Usually the credentials lack `PutObject`/`ListBucket` on the analytics bucket, or the bucket does not exist. |
-| Stats page lists sessions, then every download fails | The signing key has no `s3:GetObject` on the analytics bucket (a presigned URL is only as authorized as the key behind it), or the bucket has no `GET` CORS for the site's origin. |
-| Stats page says N sessions could not be read | Expected in small numbers: the write endpoint is unauthenticated, and a video re-uploaded under a new key leaves old sessions undecryptable. |
+| Analytics expander finds sessions, then fails to load them | The signing key has no `s3:GetObject` on the analytics bucket (a presigned URL is only as authorized as the key behind it), or the bucket has no `GET` CORS for the site's origin. |
+| Analytics expander says N sessions could not be read | Expected in small numbers: the write endpoint is unauthenticated, and a video re-uploaded under a new key leaves old sessions undecryptable. |
+| No **Analytics** expander on a library row | Legacy mode (no `gatewayUrl`), `/api/config` answering `analytics: false`, or you are signed out — signed out, the row says "Sign in to see analytics." instead. |
 | *Every* session unreadable, on a **Lambda** gateway | The function URL is likely handing the adapter the `text/plain`-labelled beacon as a UTF-8 string and mangling the ciphertext. That is what §6's one-real-beacon smoke test catches; move to the Worker or Node adapter. |

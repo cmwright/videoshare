@@ -1,47 +1,66 @@
 /**
- * Unit tests for the watch-range arithmetic behind playback analytics
+ * Unit tests for the watch arithmetic behind playback analytics
  * (docs/SPEC.md §16.5, §16.9).
  *
- * `src/watch.ts` is pure on purpose: the viewer's beacon and the stats page have
- * to agree on what "watched 90% of it" means, and the only way to hold two sides
- * of a wire to one answer is to give them one function. So both import these,
- * and Node can test them without a media element:
+ * `src/watch.ts` is pure on purpose: the viewer's beacon and the library
+ * dashboard have to agree on what "watched 90% of it" means and on what a heat
+ * bucket is, and the only way to hold two sides of a wire to one answer is to
+ * give them one function. So both import these, and Node can test them without a
+ * media element:
  *
  * ```ts
  * export function playedRanges(played: TimeRangesLike, durationMs: number): Range[];
- * export function mergeRanges(ranges: readonly Range[]): Range[];
- * export function capRanges(ranges: readonly Range[], max?: number): Range[];
- * export function watchedMs(ranges: readonly Range[]): number;
  * export function coverage(ranges: readonly Range[], durationMs: number): number;
- * export function isCompleted(ranges: readonly Range[], durationMs: number): boolean;
- * export function attentionCurve(sessions: readonly WatchPayload[], buckets?: number): number[];
+ * export function advance(state: HeatState, currentMs: number, durationMs: number): HeatState;
+ * export function heatFromRanges(watched: readonly Range[], durationMs: number, buckets?: number): number[];
+ * export function relativeHeat(payloads: readonly WatchPayload[], buckets?: number): number[];
+ * export function groupByViewer(sessions: readonly WatchSession[]): ViewerReport[];
  * export function parsePayload(value: unknown): WatchPayload | null;
  * ```
  *
- * The recurring theme below is that none of this input is trustworthy. `played`
- * comes from a media element that reports seconds as floats and will happily
- * hand back a range that ends a hair before it starts; `parsePayload`'s input
- * comes off an **unauthenticated** write endpoint (§16.3), so anything holding a
- * share link can put bytes under a video id, and a stats page that trusted them
- * would report whatever they said.
+ * Two recurring themes below. The first is that none of this input is
+ * trustworthy: `played` comes from a media element that reports seconds as
+ * floats and will happily hand back a range that ends a hair before it starts,
+ * and `parsePayload`'s input comes off an **unauthenticated** write endpoint
+ * (§16.3), so anything holding a share link can put bytes under a video id.
+ *
+ * The second is that a seek must never look like watching. §16.6 renders these
+ * numbers as a picture, and a picture that lies is worse than no picture — so
+ * every discontinuity a viewer can produce (a scrub either way, a pause of any
+ * length, a stall) is asserted to add nothing while still leaving the state able
+ * to measure what comes next.
  */
 
 import { describe, expect, it } from "vitest";
 import type { TimeRangesLike } from "../src/gap";
 import {
-  ATTENTION_BUCKETS,
-  attentionCurve,
+  advance,
   BEACON_INTERVAL_MS,
   capRanges,
   COMPLETION_THRESHOLD,
   coverage,
+  createHeatState,
+  groupByViewer,
+  HEAT_BUCKETS,
+  type HeatState,
+  heatFromRanges,
+  heatMs,
   isCompleted,
+  MAX_PLAYBACK_DELTA_MS,
   MAX_WATCH_RANGES,
   mergeRanges,
+  normalizeHeat,
   parsePayload,
   playedRanges,
   type Range,
+  reanchor,
+  relativeHeat,
+  sessionHeat,
+  sumHeat,
   type WatchPayload,
+  type WatchPayloadV1,
+  type WatchPayloadV2,
+  type WatchSession,
   watchedMs,
 } from "../src/watch";
 
@@ -54,8 +73,13 @@ function played(...ranges: readonly (readonly [number, number])[]): TimeRangesLi
   };
 }
 
-/** A valid payload, so each case can vary exactly one thing about it. */
-function payload(over: Partial<WatchPayload> = {}): WatchPayload {
+/** 50 buckets, all `ms` — one full pass of every slice of a 100 s video. */
+function flat(ms: number): number[] {
+  return new Array<number>(HEAT_BUCKETS).fill(ms);
+}
+
+/** A valid v1 payload, so each case can vary exactly one thing about it. */
+function v1(over: Partial<WatchPayloadV1> = {}): WatchPayloadV1 {
   return {
     v: 1,
     browserId: "8f3k2Jd0QpZ1nV7xLmA9Bw",
@@ -68,22 +92,38 @@ function payload(over: Partial<WatchPayload> = {}): WatchPayload {
   };
 }
 
+/** A valid v2 payload — what every beacon writes today. */
+function v2(over: Partial<WatchPayloadV2> = {}): WatchPayloadV2 {
+  return { ...v1(), v: 2, heat: flat(0), ...over };
+}
+
+function session(payload: WatchPayload, lastModified: string): WatchSession {
+  return { payload, lastModified };
+}
+
 const MINUTE = 60_000;
+
+/** A 100 s video: 50 buckets of exactly 2 000 ms each. */
+const DURATION = 100_000;
+const BUCKET_MS = DURATION / HEAT_BUCKETS;
 
 describe("analytics constants", () => {
   it("matches the SPEC values", () => {
     expect(BEACON_INTERVAL_MS).toBe(30_000);
     expect(MAX_WATCH_RANGES).toBe(200);
     expect(COMPLETION_THRESHOLD).toBe(0.9);
-    expect(ATTENTION_BUCKETS).toBe(50);
+    expect(HEAT_BUCKETS).toBe(50);
+    expect(MAX_PLAYBACK_DELTA_MS).toBe(1_500);
   });
 
   it("buckets the video into whole percents", () => {
     // 50 buckets is one per 2%; a number that did not divide 100 would make the
-    // curve's axis labels a lie.
-    expect(100 % ATTENTION_BUCKETS).toBe(0);
+    // heatmap's axis labels a lie.
+    expect(100 % HEAT_BUCKETS).toBe(0);
   });
 });
+
+// --- Coverage: unchanged by v2 -----------------------------------------------
 
 describe("playedRanges — what the element says, in milliseconds", () => {
   it("converts seconds to milliseconds by rounding", () => {
@@ -106,7 +146,7 @@ describe("playedRanges — what the element says, in milliseconds", () => {
 
   it("drops a range that rounds away to nothing", () => {
     // A play/pause with no frame in between: sub-millisecond, and an empty
-    // range in the payload would be noise the stats page has to defend against.
+    // range in the payload would be noise the reader has to defend against.
     expect(playedRanges(played([2.0001, 2.0002]), 10_000)).toEqual([]);
     expect(playedRanges(played([3, 3]), 10_000)).toEqual([]);
   });
@@ -253,7 +293,8 @@ describe("coverage and completion", () => {
   });
 
   it("cannot be pushed past 100% by re-watching", () => {
-    // The union is why: three passes over the same minute is one minute.
+    // The union is why: three passes over the same minute is one minute. Heat
+    // is where re-watching shows up (§16.2), and it is a different number.
     expect(coverage(mergeRanges([[0, 60_000], [0, 60_000], [0, 60_000]]), 60_000)).toBe(1);
     // ...and even an over-long range (a payload from elsewhere) is capped.
     expect(coverage([[0, 200_000]], 100_000)).toBe(1);
@@ -303,110 +344,573 @@ describe("watchedMs", () => {
   });
 });
 
-describe("attentionCurve", () => {
-  const duration = 100_000;
+// --- Heat accumulation -------------------------------------------------------
 
-  it("lights every bucket for a session that watched the whole video", () => {
-    const curve = attentionCurve([payload({ watched: [[0, duration]] })]);
-    expect(curve).toHaveLength(ATTENTION_BUCKETS);
-    expect(curve.every((count) => count === 1)).toBe(true);
+/** Feeds a run of `timeupdate` positions through `advance`, in order. */
+function play(state: HeatState, durationMs: number, ...positions: readonly number[]): HeatState {
+  return positions.reduce((current, ms) => advance(current, ms, durationMs), state);
+}
+
+describe("heat accumulation — advance", () => {
+  it("starts at all zeros with no observation point", () => {
+    const state = createHeatState();
+    expect(state.heat).toEqual(flat(0));
+    expect(state.lastMs).toBeNull();
   });
 
-  it("lights only the buckets a range overlaps", () => {
-    // The first 2% exactly: bucket 0 and nothing else.
-    const curve = attentionCurve([payload({ watched: [[0, 2000]] })]);
-    expect(curve[0]).toBe(1);
-    expect(curve.slice(1).every((count) => count === 0)).toBe(true);
+  it("takes the first call as the observation point and counts nothing", () => {
+    // There is no delta yet: what came before the first `timeupdate` is not
+    // this session's to claim.
+    const state = advance(createHeatState(), 4000, DURATION);
+    expect(state.lastMs).toBe(4000);
+    expect(heatMs(state)).toEqual(flat(0));
   });
 
-  it("does not let a range ending on a boundary light the next bucket", () => {
-    // SPEC §16.6, and the reason the overlap test is strict: [0, 2000) is
-    // bucket 0's territory, and 2000 is where bucket 1 starts.
-    expect(attentionCurve([payload({ watched: [[0, 2000]] })])[1]).toBe(0);
-    expect(attentionCurve([payload({ watched: [[0, 2001]] })])[1]).toBe(1);
+  it("adds each delta to the bucket of the arriving position", () => {
+    // 100 s / 50 = one bucket per 2 000 ms.
+    const state = play(createHeatState(), DURATION, 0, 500, 1500, 2500);
+    const heat = heatMs(state);
+
+    expect(heat[0]).toBe(1500); // 0→500 and 500→1500
+    expect(heat[1]).toBe(1000); // 1500→2500 lands in bucket 1, whole
+    expect(heat.reduce((sum, ms) => sum + ms, 0)).toBe(2500);
   });
 
-  it("counts a range that runs to the final millisecond", () => {
-    // The last bucket ends on the duration itself, so watching to the end
-    // cannot fall off the end of the array.
-    const curve = attentionCurve([payload({ watched: [[98_000, 100_000]] })]);
-    expect(curve[ATTENTION_BUCKETS - 1]).toBe(1);
-    expect(curve[ATTENTION_BUCKETS - 2]).toBe(0);
+  it("does not split a delta that straddles a boundary", () => {
+    // The error is under 1.5 s per crossing, and splitting would buy precision
+    // nothing downstream can use (SPEC §16.5).
+    const heat = heatMs(play(createHeatState(), DURATION, 1500, 2400));
+    expect(heat[0]).toBe(0);
+    expect(heat[1]).toBe(900);
   });
 
-  it("stacks sessions bucket by bucket", () => {
-    const first = payload({ watched: [[0, 50_000]] });
-    const second = payload({ watched: [[0, 50_000]] });
-    const third = payload({ watched: [[50_000, 100_000]] });
-
-    const curve = attentionCurve([first, second, third]);
-    expect(curve[0]).toBe(2);
-    expect(curve[24]).toBe(2);
-    expect(curve[25]).toBe(1);
-    expect(curve[49]).toBe(1);
+  it("counts a delta of exactly MAX_PLAYBACK_DELTA_MS and refuses one past it", () => {
+    expect(heatMs(play(createHeatState(), DURATION, 0, MAX_PLAYBACK_DELTA_MS))[0]).toBe(1500);
+    expect(heatMs(play(createHeatState(), DURATION, 0, MAX_PLAYBACK_DELTA_MS + 1))).toEqual(flat(0));
   });
 
-  it("places each session by fraction of its own duration", () => {
-    // A ten-second video and a ten-minute one both have a "halfway", and the
-    // curve is about shape, not seconds (SPEC §16.6).
-    const short = payload({ durationMs: 10_000, watched: [[0, 5000]] });
-    const long = payload({ durationMs: 600_000, watched: [[0, 300_000]] });
+  it("discards a forwards seek but still moves the observation point", () => {
+    // 1 000 → 20 000 is a scrub, not nineteen seconds of watching. The next
+    // real step must be measured from 20 000, which is what the second
+    // assertion proves.
+    const seeked = play(createHeatState(), DURATION, 1000, 20_000);
+    expect(heatMs(seeked)).toEqual(flat(0));
+    expect(seeked.lastMs).toBe(20_000);
 
-    const curve = attentionCurve([short, long]);
-    expect(curve[0]).toBe(2);
-    expect(curve[24]).toBe(2);
-    expect(curve[25]).toBe(0);
+    const heat = heatMs(advance(seeked, 20_500, DURATION));
+    expect(heat[10]).toBe(500);
+    expect(heat.reduce((sum, ms) => sum + ms, 0)).toBe(500);
   });
 
-  it("excludes sessions with no known duration", () => {
-    // There is no position to place them at. They still count as sessions
-    // everywhere else on the page.
-    const curve = attentionCurve([payload({ durationMs: 0, watched: [[0, 5000]] })]);
-    expect(curve.every((count) => count === 0)).toBe(true);
+  it("discards a backwards seek but still moves the observation point", () => {
+    const seeked = play(createHeatState(), DURATION, 20_000, 5000);
+    expect(heatMs(seeked)).toEqual(flat(0));
+    expect(seeked.lastMs).toBe(5000);
+
+    const heat = heatMs(advance(seeked, 5400, DURATION));
+    expect(heat[2]).toBe(400);
   });
 
-  it("skips the gaps a viewer skipped", () => {
-    const curve = attentionCurve([payload({ watched: [[0, 20_000], [80_000, 100_000]] })]);
-    expect(curve[9]).toBe(1);
-    expect(curve[10]).toBe(0);
-    expect(curve[39]).toBe(0);
-    expect(curve[40]).toBe(1);
+  it("discards a zero-length step", () => {
+    // Some browsers fire `timeupdate` on a paused element; the delta is 0 and
+    // it is not playback.
+    const state = play(createHeatState(), DURATION, 3000, 3000, 3000);
+    expect(heatMs(state)).toEqual(flat(0));
+    expect(state.lastMs).toBe(3000);
+  });
+
+  it("accumulates about twice a section's length when it is watched twice", () => {
+    // The whole point of heat, and precisely what `watched` refuses to say.
+    let state = play(createHeatState(), DURATION, 0, 1000, 2000);
+    state = reanchor(state, 0); // the viewer scrubs back to the start
+    state = play(state, DURATION, 1000, 2000);
+
+    const heat = heatMs(state);
+    expect(heat[0]).toBe(2000);
+    expect(heat[1]).toBe(2000);
+  });
+
+  it("puts a position exactly on a bucket edge in the higher bucket", () => {
+    const heat = heatMs(play(createHeatState(), DURATION, 1500, BUCKET_MS));
+    expect(heat[0]).toBe(0);
+    expect(heat[1]).toBe(500);
+  });
+
+  it("puts the very last millisecond in bucket 49, not bucket 50", () => {
+    const heat = heatMs(play(createHeatState(), DURATION, DURATION - 500, DURATION));
+    expect(heat).toHaveLength(HEAT_BUCKETS);
+    expect(heat[HEAT_BUCKETS - 1]).toBe(500);
+  });
+
+  it("clamps a position past the duration to the last bucket", () => {
+    // An element can report a currentTime a frame past its own duration.
+    const heat = heatMs(play(createHeatState(), DURATION, DURATION + 500, DURATION + 900));
+    expect(heat[HEAT_BUCKETS - 1]).toBe(400);
+  });
+
+  it("clamps a negative position to the first bucket", () => {
+    const heat = heatMs(play(createHeatState(), DURATION, -900, -500));
+    expect(heat[0]).toBe(400);
+  });
+
+  it("accumulates nothing without a usable duration, and still advances", () => {
+    for (const durationMs of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const state = play(createHeatState(), durationMs, 1000, 1400, 1800);
+      expect(heatMs(state), String(durationMs)).toEqual(flat(0));
+      expect(state.lastMs, String(durationMs)).toBe(1800);
+    }
+  });
+
+  it("starts counting from the moment a duration turns up mid-playback", () => {
+    // SPEC §16.5: a session that only ever learns its duration part-way through
+    // accumulates from that moment on, rather than nothing at all.
+    let state = play(createHeatState(), 0, 1000, 1400);
+    expect(heatMs(state)).toEqual(flat(0));
+
+    state = advance(state, 1800, DURATION);
+    expect(heatMs(state)[0]).toBe(400);
+  });
+
+  it("ignores a non-finite position rather than poisoning the state", () => {
+    // An element with no media loaded reports NaN; anchoring to it would make
+    // every later delta NaN.
+    const state = play(createHeatState(), DURATION, 1000);
+    const same = advance(state, Number.NaN, DURATION);
+
+    expect(same.lastMs).toBe(1000);
+    expect(heatMs(advance(same, 1400, DURATION))[0]).toBe(400);
+    expect(reanchor(state, Number.POSITIVE_INFINITY).lastMs).toBe(1000);
+  });
+
+  it("keeps accumulation in floating milliseconds and rounds only at the end", () => {
+    // Rounding four times a second would drift by minutes over a long video.
+    let state = advance(createHeatState(), 0, DURATION);
+    for (let i = 1; i <= 1000; i++) state = advance(state, i * 0.4, DURATION);
+    expect(heatMs(state)[0]).toBe(400);
+  });
+
+  it("mutates neither the state it is given nor its heat array", () => {
+    const start = play(createHeatState(), DURATION, 0, 500);
+    const before = [...start.heat];
+
+    advance(start, 1000, DURATION);
+    reanchor(start, 90_000);
+
+    expect(start.lastMs).toBe(500);
+    expect([...start.heat]).toEqual(before);
   });
 
   it("honours a bucket count of its own", () => {
-    expect(attentionCurve([payload({ watched: [[0, 25_000]] })], 4)).toEqual([1, 0, 0, 0]);
-    expect(attentionCurve([], 4)).toEqual([0, 0, 0, 0]);
-  });
-
-  it("answers a whole array for no sessions at all", () => {
-    expect(attentionCurve([])).toHaveLength(ATTENTION_BUCKETS);
+    const state = play(createHeatState(4), DURATION, 0, 500, 60_000, 60_400);
+    expect(heatMs(state)).toEqual([500, 0, 400, 0]);
   });
 });
 
+describe("heat accumulation — reanchor", () => {
+  it("moves the observation point and touches no bucket", () => {
+    const state = play(createHeatState(), DURATION, 1000, 1400);
+    const moved = reanchor(state, 50_000);
+
+    expect(moved.lastMs).toBe(50_000);
+    expect(heatMs(moved)).toEqual(heatMs(state));
+  });
+
+  it("drops the delta across a pause, however long the pause was", () => {
+    // `beacon.ts` re-anchors on `play`; the video sat still, so nothing about
+    // that stretch was watched.
+    let state = play(createHeatState(), DURATION, 0, 1000);
+    state = reanchor(state, 1000); // resumed where it stopped, an hour later
+    state = advance(state, 1400, DURATION);
+
+    expect(heatMs(state)[0]).toBe(1400);
+  });
+
+  it("drops the delta across a scrub, so scrubbing adds ~nothing", () => {
+    // `seeking`/`seeked` both re-anchor: even a scrub whose landing is within
+    // MAX_PLAYBACK_DELTA_MS of where it left costs its delta.
+    let state = play(createHeatState(), DURATION, 0, 1000);
+    state = reanchor(state, 1900); // seeking
+    state = reanchor(state, 90_000); // seeked, somewhere else entirely
+    state = advance(state, 90_300, DURATION);
+
+    const heat = heatMs(state);
+    expect(heat[0]).toBe(1000);
+    expect(heat[45]).toBe(300);
+    expect(heat.reduce((sum, ms) => sum + ms, 0)).toBe(1300);
+  });
+});
+
+// --- v1 compatibility --------------------------------------------------------
+
+describe("heatFromRanges — a v1 session's heat, derived", () => {
+  it("gives a bucket its exact overlap with the union", () => {
+    const heat = heatFromRanges([[4000, 6000]], DURATION);
+    expect(heat[2]).toBe(BUCKET_MS);
+    expect(heat.filter((ms) => ms > 0)).toHaveLength(1);
+  });
+
+  it("splits a range that straddles a boundary", () => {
+    const heat = heatFromRanges([[1000, 3000]], DURATION);
+    expect(heat[0]).toBe(1000);
+    expect(heat[1]).toBe(1000);
+  });
+
+  it("counts a range that ends on the duration itself", () => {
+    // The last bucket ends on `durationMs` inclusive, so watching to the final
+    // millisecond cannot fall off the end of the array.
+    const heat = heatFromRanges([[98_000, DURATION]], DURATION);
+    expect(heat[HEAT_BUCKETS - 1]).toBe(BUCKET_MS);
+    expect(heat[HEAT_BUCKETS - 2]).toBe(0);
+  });
+
+  it("never exceeds one bucket span — v1 reads as 1x at most", () => {
+    // The union is disjoint by construction, so this is a property, not a
+    // clamp: a v1 payload cannot know it was replayed (SPEC §16.2).
+    for (const watched of [
+      [[0, DURATION]] as Range[],
+      [[0, DURATION * 2]] as Range[],
+      [[0, 20_000], [20_000, 40_000]] as Range[],
+    ]) {
+      for (const ms of heatFromRanges(watched, DURATION)) {
+        expect(ms).toBeLessThanOrEqual(BUCKET_MS);
+      }
+    }
+  });
+
+  it("lights every bucket for a session that watched the whole video", () => {
+    expect(heatFromRanges([[0, DURATION]], DURATION)).toEqual(flat(BUCKET_MS));
+  });
+
+  it("leaves the gaps a viewer skipped empty", () => {
+    const heat = heatFromRanges([[0, 20_000], [80_000, DURATION]], DURATION);
+    expect(heat[9]).toBe(BUCKET_MS);
+    expect(heat[10]).toBe(0);
+    expect(heat[39]).toBe(0);
+    expect(heat[40]).toBe(BUCKET_MS);
+  });
+
+  it("is all zeros without a usable duration", () => {
+    for (const durationMs of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(heatFromRanges([[0, 5000]], durationMs), String(durationMs)).toEqual(flat(0));
+    }
+  });
+
+  it("honours a bucket count of its own", () => {
+    expect(heatFromRanges([[0, 25_000]], DURATION, 4)).toEqual([25_000, 0, 0, 0]);
+    expect(heatFromRanges([], DURATION, 4)).toEqual([0, 0, 0, 0]);
+  });
+});
+
+describe("sessionHeat — the one place the version matters", () => {
+  it("returns a v2 payload's heat as it was sent", () => {
+    const heat = flat(0);
+    heat[3] = 7777;
+    expect(sessionHeat(v2({ heat }))).toEqual(heat);
+  });
+
+  it("does not alias a v2 payload's heat array", () => {
+    const payload = v2();
+    sessionHeat(payload)[0] = 999;
+    expect(payload.heat[0]).toBe(0);
+  });
+
+  it("derives a v1 payload's heat from its watch union", () => {
+    expect(sessionHeat(v1({ watched: [[0, DURATION]] }))).toEqual(flat(BUCKET_MS));
+    expect(sessionHeat(v1({ watched: [[4000, 6000]] }))).toEqual(
+      heatFromRanges([[4000, 6000]], DURATION),
+    );
+  });
+
+  it("reads a v1 session that replayed a section as watched-once, not twice", () => {
+    // A v1 payload has no way to know, and inventing intensity it never
+    // measured would be the picture lying (SPEC §16.2).
+    const replayed = sessionHeat(v1({ watched: [[0, 4000]] }));
+    expect(replayed[0]).toBe(BUCKET_MS);
+    expect(replayed[1]).toBe(BUCKET_MS);
+  });
+
+  it("gives every payload the same shape, whatever its version", () => {
+    expect(sessionHeat(v1())).toHaveLength(HEAT_BUCKETS);
+    expect(sessionHeat(v2())).toHaveLength(HEAT_BUCKETS);
+  });
+});
+
+// --- Aggregation -------------------------------------------------------------
+
+describe("sumHeat", () => {
+  it("adds sessions bucket by bucket", () => {
+    const a = flat(0);
+    a[0] = 1000;
+    const b = flat(0);
+    b[0] = 500;
+    b[49] = 250;
+
+    const total = sumHeat([v2({ heat: a }), v2({ heat: b })]);
+    expect(total[0]).toBe(1500);
+    expect(total[49]).toBe(250);
+  });
+
+  it("stacks sessions of differing durations, because a bucket is 2% of each", () => {
+    // A ten-second video and a ten-minute one both have a "halfway", and the
+    // heatmap is about shape, not seconds.
+    const short = v1({ durationMs: 10_000, watched: [[0, 5000]] });
+    const long = v1({ durationMs: 600_000, watched: [[0, 300_000]] });
+
+    const total = sumHeat([short, long]);
+    expect(total[0]).toBe(200 + 12_000);
+    expect(total[24]).toBe(200 + 12_000);
+    expect(total[25]).toBe(0);
+  });
+
+  it("mixes v1 and v2 sessions without either knowing", () => {
+    const heat = flat(0);
+    heat[0] = 5000;
+    const total = sumHeat([v2({ heat }), v1({ watched: [[0, BUCKET_MS]] })]);
+    expect(total[0]).toBe(5000 + BUCKET_MS);
+  });
+
+  it("answers a whole array for no sessions at all", () => {
+    expect(sumHeat([])).toEqual(flat(0));
+  });
+});
+
+describe("relativeHeat — the x-against-one-pass number", () => {
+  it("reads 1.0 for a bucket every session played exactly once through", () => {
+    const sessions = [v2({ heat: flat(BUCKET_MS) }), v2({ heat: flat(BUCKET_MS) })];
+    for (const times of relativeHeat(sessions)) expect(times).toBeCloseTo(1, 10);
+  });
+
+  it("reads 1.0 for a bucket half the sessions played twice", () => {
+    // The denominator is one pass per session, so the same total time spread
+    // over half the sessions is still one pass on average (SPEC §16.5).
+    const twice = flat(0);
+    twice[7] = BUCKET_MS * 2;
+
+    const sessions = [v2({ heat: twice }), v2({ heat: twice }), v2(), v2()];
+    expect(relativeHeat(sessions)[7]).toBeCloseTo(1, 10);
+  });
+
+  it("reads 2.4 for a bucket the sessions played about two and a half times", () => {
+    const heat = flat(0);
+    heat[12] = BUCKET_MS * 2.4;
+    expect(relativeHeat([v2({ heat })])[12]).toBeCloseTo(2.4, 10);
+  });
+
+  it("matches bucketMs / (sessions x bucketDurationMs) for equal durations", () => {
+    const heat = flat(0);
+    heat[3] = 9000;
+    const sessions = [v2({ heat }), v2({ heat }), v2({ heat })];
+
+    expect(relativeHeat(sessions)[3]).toBeCloseTo(
+      (9000 * 3) / (3 * BUCKET_MS),
+      10,
+    );
+  });
+
+  it("stays honest when the durations differ", () => {
+    // One pass of bucket 0 for each: 200 ms for the short video, 12 000 ms for
+    // the long one. Both played it once, so the answer is 1.0 — not whatever a
+    // single video's length would have said.
+    const short = v1({ durationMs: 10_000, watched: [[0, 200]] });
+    const long = v1({ durationMs: 600_000, watched: [[0, 12_000]] });
+    expect(relativeHeat([short, long])[0]).toBeCloseTo(1, 10);
+  });
+
+  it("excludes sessions with no known duration from both sides", () => {
+    const heat = flat(0);
+    heat[5] = BUCKET_MS;
+    const timed = [v2({ heat })];
+
+    const before = relativeHeat(timed);
+    // Its own heat is zeros by §16.5 — and even a hand-written one carrying
+    // numbers is excluded, because there is no duration to divide by.
+    const untimed = v2({ durationMs: 0, heat: flat(99_999) });
+    expect(relativeHeat([...timed, untimed])).toEqual(before);
+    expect(before[5]).toBeCloseTo(1, 10);
+  });
+
+  it("is all zeros when nothing has a duration at all", () => {
+    expect(relativeHeat([v2({ durationMs: 0 }), v1({ durationMs: 0 })])).toEqual(flat(0));
+    expect(relativeHeat([])).toEqual(flat(0));
+  });
+});
+
+describe("normalizeHeat — the height channel", () => {
+  it("puts the largest bucket at 1 and the rest in proportion", () => {
+    expect(normalizeHeat([0, 250, 500, 1000])).toEqual([0, 0.25, 0.5, 1]);
+  });
+
+  it("is all zeros for an all-zero input", () => {
+    // No division, and 50 bars still get drawn — as hairlines.
+    expect(normalizeHeat(flat(0))).toEqual(flat(0));
+    expect(normalizeHeat([])).toEqual([]);
+  });
+
+  it("is not relativeHeat: it shows shape, not intensity", () => {
+    // Two sessions that both played the second half twice. Height says "this
+    // half is where the attention was"; the x number says how much.
+    const heat = flat(0);
+    for (let b = 25; b < HEAT_BUCKETS; b++) heat[b] = BUCKET_MS * 2;
+
+    expect(normalizeHeat(heat)[25]).toBe(1);
+    expect(relativeHeat([v2({ heat })])[25]).toBeCloseTo(2, 10);
+  });
+});
+
+describe("groupByViewer", () => {
+  const alice = "8f3k2Jd0QpZ1nV7xLmA9Bw";
+  const bob = "Qr4TgYs2Nb6HcE0uWkP1Zx";
+
+  it("collapses one browser's repeat viewings into one viewer", () => {
+    const viewers = groupByViewer([
+      session(v1({ browserId: alice, sessionId: "a1", watched: [[0, 10_000]] }), "2026-08-27T10:00:00.000Z"),
+      session(v1({ browserId: alice, sessionId: "a2", watched: [[0, 20_000]] }), "2026-08-27T12:00:00.000Z"),
+    ]);
+
+    expect(viewers).toHaveLength(1);
+    expect(viewers[0].browserId).toBe(alice);
+    expect(viewers[0].plays).toBe(2);
+    expect(viewers[0].lastWatched).toBe("2026-08-27T12:00:00.000Z");
+  });
+
+  it("sums a viewer's sessions bucket by bucket", () => {
+    const heat = flat(0);
+    heat[0] = 1000;
+    const viewers = groupByViewer([
+      session(v2({ browserId: alice, heat }), "2026-08-27T10:00:00.000Z"),
+      session(v2({ browserId: alice, heat }), "2026-08-27T11:00:00.000Z"),
+    ]);
+    expect(viewers[0].heat[0]).toBe(2000);
+  });
+
+  it("takes the best coverage, not the last", () => {
+    // Someone who watched it all on Tuesday and opened it for ten seconds on
+    // Friday has seen the video.
+    const viewers = groupByViewer([
+      session(v1({ browserId: alice, watched: [[0, 95_000]] }), "2026-08-25T10:00:00.000Z"),
+      session(v1({ browserId: alice, watched: [[0, 10_000]] }), "2026-08-28T10:00:00.000Z"),
+    ]);
+    expect(viewers[0].coverage).toBeCloseTo(0.95, 10);
+  });
+
+  it("reports null coverage when no session of theirs has a duration", () => {
+    const viewers = groupByViewer([
+      session(v1({ browserId: alice, durationMs: 0, watched: [[0, 10_000]] }), "2026-08-27T10:00:00.000Z"),
+    ]);
+    expect(viewers[0].coverage).toBeNull();
+  });
+
+  it("orders by last activity, most recent first", () => {
+    const viewers = groupByViewer([
+      session(v1({ browserId: alice }), "2026-08-26T10:00:00.000Z"),
+      session(v1({ browserId: bob }), "2026-08-28T10:00:00.000Z"),
+    ]);
+    expect(viewers.map((viewer) => viewer.browserId)).toEqual([bob, alice]);
+  });
+
+  it("breaks a tie on browserId, so the order is deterministic", () => {
+    const at = "2026-08-27T10:00:00.000Z";
+    const viewers = groupByViewer([
+      session(v1({ browserId: bob }), at),
+      session(v1({ browserId: alice }), at),
+    ]);
+    // "8f3k…" sorts before "Qr4T…" — and would either way, every run.
+    expect(viewers.map((viewer) => viewer.browserId)).toEqual([alice, bob]);
+  });
+
+  it("refuses to collapse a malformed browserId with anything", () => {
+    // Junk written through the unauthenticated endpoint must not be able to
+    // make a video look less watched than it is (SPEC §16.5).
+    const viewers = groupByViewer([
+      session(v1({ browserId: "", sessionId: "s1" }), "2026-08-27T10:00:00.000Z"),
+      session(v1({ browserId: "", sessionId: "s2" }), "2026-08-27T11:00:00.000Z"),
+      session(v1({ browserId: "not-an-id", sessionId: "s3" }), "2026-08-27T12:00:00.000Z"),
+    ]);
+
+    expect(viewers).toHaveLength(3);
+    expect(viewers.every((viewer) => viewer.plays === 1)).toBe(true);
+    // ...and reports what it was actually given, verbatim.
+    expect(viewers.map((viewer) => viewer.browserId).sort()).toEqual(["", "", "not-an-id"]);
+  });
+
+  it("survives a lastModified it cannot parse", () => {
+    const viewers = groupByViewer([
+      session(v1({ browserId: alice }), "not a date"),
+      session(v1({ browserId: bob }), "2026-08-28T10:00:00.000Z"),
+    ]);
+    expect(viewers.map((viewer) => viewer.browserId)).toEqual([bob, alice]);
+  });
+
+  it("answers nothing for no sessions", () => {
+    expect(groupByViewer([])).toEqual([]);
+  });
+});
+
+// --- Parsing -----------------------------------------------------------------
+
 describe("parsePayload — nothing from the wire is trusted", () => {
   it("accepts what a beacon actually sends, through JSON", () => {
-    const sent = payload();
+    const sent = v2();
+    expect(parsePayload(JSON.parse(JSON.stringify(sent)) as unknown)).toEqual(sent);
+  });
+
+  it("still accepts a v1 payload, and always will", () => {
+    const sent = v1();
     expect(parsePayload(JSON.parse(JSON.stringify(sent)) as unknown)).toEqual(sent);
   });
 
   it("keeps only the fields the format defines", () => {
-    const parsed = parsePayload({ ...payload(), ip: "203.0.113.7", extra: true });
+    const parsed = parsePayload({ ...v2(), ip: "203.0.113.7", extra: true });
     expect(parsed).not.toBeNull();
     expect(Object.keys(parsed as WatchPayload).sort()).toEqual([
       "browserId",
       "completed",
       "durationMs",
       "firstPlayedAt",
+      "heat",
       "sessionId",
       "v",
       "watched",
     ]);
   });
 
+  it("ignores a stray heat on a v1 payload", () => {
+    // A v1 object carrying one is still a v1 payload; the field is ignored,
+    // like every other unknown field (SPEC §16.2).
+    const parsed = parsePayload({ ...v1(), heat: flat(1234) });
+    expect(parsed).toEqual(v1());
+    expect(Object.keys(parsed as WatchPayload)).not.toContain("heat");
+  });
+
   it("rejects a version it does not understand", () => {
-    for (const v of [0, 2, "1", null, undefined]) {
-      expect(parsePayload({ ...payload(), v }), JSON.stringify(v)).toBeNull();
+    for (const v of [0, 3, "2", "1", 1.5, null, undefined]) {
+      expect(parsePayload({ ...v2(), v }), JSON.stringify(v)).toBeNull();
     }
+  });
+
+  it("requires a v2 heat of exactly HEAT_BUCKETS entries", () => {
+    for (const heat of [flat(0).slice(1), [...flat(0), 0], [], undefined]) {
+      expect(parsePayload({ ...v2(), heat }), `${String(heat?.length)} entries`).toBeNull();
+    }
+    expect(parsePayload({ ...v2(), heat: flat(0) })).not.toBeNull();
+  });
+
+  it("requires every heat bucket to be a whole, non-negative number", () => {
+    for (const bad of [1.5, -1, "1000", null, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const heat: unknown[] = flat(0);
+      heat[17] = bad;
+      expect(parsePayload({ ...v2(), heat }), JSON.stringify(bad)).toBeNull();
+    }
+  });
+
+  it("rejects a heat that is not an array", () => {
+    for (const heat of [{}, "0".repeat(HEAT_BUCKETS), 0]) {
+      expect(parsePayload({ ...v2(), heat }), JSON.stringify(heat)).toBeNull();
+    }
+  });
+
+  it("accepts an all-zero heat, which a session with no duration sends", () => {
+    expect(parsePayload({ ...v2(), durationMs: 0, heat: flat(0) })).not.toBeNull();
   });
 
   it("rejects a missing or mistyped field rather than filling a default", () => {
@@ -418,21 +922,21 @@ describe("parsePayload — nothing from the wire is trusted", () => {
       "completed",
       "firstPlayedAt",
     ] as const) {
-      const missing: Record<string, unknown> = { ...payload() };
+      const missing: Record<string, unknown> = { ...v2() };
       delete missing[key];
       expect(parsePayload(missing), `missing ${key}`).toBeNull();
     }
-    expect(parsePayload({ ...payload(), completed: "yes" })).toBeNull();
-    expect(parsePayload({ ...payload(), browserId: 7 })).toBeNull();
-    expect(parsePayload({ ...payload(), firstPlayedAt: 1_756_328_640_000 })).toBeNull();
+    expect(parsePayload({ ...v2(), completed: "yes" })).toBeNull();
+    expect(parsePayload({ ...v2(), browserId: 7 })).toBeNull();
+    expect(parsePayload({ ...v2(), firstPlayedAt: 1_756_328_640_000 })).toBeNull();
   });
 
   it("rejects milliseconds that are not whole and non-negative", () => {
     for (const durationMs of [1.5, -1, Number.NaN, Number.POSITIVE_INFINITY, "100000", null]) {
-      expect(parsePayload({ ...payload(), durationMs }), JSON.stringify(durationMs)).toBeNull();
+      expect(parsePayload({ ...v2(), durationMs }), JSON.stringify(durationMs)).toBeNull();
     }
-    expect(parsePayload({ ...payload(), watched: [[0, 1.5]] })).toBeNull();
-    expect(parsePayload({ ...payload(), watched: [[-1, 100]] })).toBeNull();
+    expect(parsePayload({ ...v2(), watched: [[0, 1.5]] })).toBeNull();
+    expect(parsePayload({ ...v2(), watched: [[-1, 100]] })).toBeNull();
   });
 
   it("rejects ranges that are not ranges", () => {
@@ -446,7 +950,7 @@ describe("parsePayload — nothing from the wire is trusted", () => {
       [["0", "100"]],
       [null],
     ]) {
-      expect(parsePayload({ ...payload(), watched }), JSON.stringify(watched)).toBeNull();
+      expect(parsePayload({ ...v2(), watched }), JSON.stringify(watched)).toBeNull();
     }
   });
 
@@ -454,31 +958,34 @@ describe("parsePayload — nothing from the wire is trusted", () => {
     // A beacon merges before it sends (§16.2), so anything else is either a bug
     // or someone hand-writing objects into the bucket — and overlap would
     // double-count watch time.
-    expect(parsePayload({ ...payload(), watched: [[5000, 6000], [0, 1000]] })).toBeNull();
-    expect(parsePayload({ ...payload(), watched: [[0, 5000], [4000, 6000]] })).toBeNull();
+    expect(parsePayload({ ...v2(), watched: [[5000, 6000], [0, 1000]] })).toBeNull();
+    expect(parsePayload({ ...v2(), watched: [[0, 5000], [4000, 6000]] })).toBeNull();
     // Touching is tolerated: it covers exactly the same milliseconds.
-    expect(parsePayload({ ...payload(), watched: [[0, 5000], [5000, 6000]] })).not.toBeNull();
+    expect(parsePayload({ ...v2(), watched: [[0, 5000], [5000, 6000]] })).not.toBeNull();
   });
 
   it("accepts an empty watch list and a zero duration", () => {
     // Neither is what a beacon sends, but both are internally consistent, and
-    // the stats page handles them (a session with no known duration).
-    expect(parsePayload({ ...payload(), watched: [] })).not.toBeNull();
-    expect(parsePayload({ ...payload(), durationMs: 0, watched: [[0, 5000]] })).not.toBeNull();
+    // the dashboard handles them (a session with no known duration).
+    expect(parsePayload({ ...v2(), watched: [] })).not.toBeNull();
+    expect(parsePayload({ ...v2(), durationMs: 0, watched: [[0, 5000]] })).not.toBeNull();
   });
 
   it("returns null rather than throwing, whatever it is handed", () => {
-    for (const value of [null, undefined, 42, "…", true, [], [payload()], new Date()]) {
+    for (const value of [null, undefined, 42, "…", true, [], [v2()], new Date()]) {
       expect(parsePayload(value), JSON.stringify(value)).toBeNull();
     }
   });
 
   it("does not alias the object it was given", () => {
-    // The stats page holds these for the life of the page; a parsed payload
-    // must not keep a live reference into JSON.parse's output.
-    const raw = payload();
-    const parsed = parsePayload(raw) as WatchPayload;
+    // The dashboard holds these for the life of the page; a parsed payload must
+    // not keep a live reference into JSON.parse's output.
+    const raw = v2();
+    const parsed = parsePayload(raw) as WatchPayloadV2;
     raw.watched[0][1] = 1;
+    raw.heat[0] = 1;
+
     expect(parsed.watched[0][1]).toBe(50_000);
+    expect(parsed.heat[0]).toBe(0);
   });
 });

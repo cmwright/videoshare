@@ -170,10 +170,18 @@ sign-in, credentials in your own browser.
 A gateway can also collect **playback analytics**, and this is the one feature
 that changes what `view.html` does. Point the gateway's `ANALYTICS_BUCKET` at a
 second, **private** bucket and the player starts reporting: every 30 seconds
-while a video plays, and once more when the tab goes away, it sends what has been
-watched so far to the gateway, which writes it to that bucket. A third page,
-`stats.html`, reads it back — sessions, unique viewers, average coverage,
-completions, and a curve of which parts people actually watched.
+while a video plays, on pause, and once more when the tab goes away, it sends what
+has been watched so far to the gateway, which writes it to that bucket. There is no third
+page: every entry in **My videos** grows an **Analytics** expander once you are
+signed in, and opening one reads that video's data back — views, unique viewers,
+completions, and a **replay heatmap** of which 2% of the video got watched twice
+and which got skipped, overall and per viewer. Watch data lives on the row of the
+video it is about, which is also the row that already holds its share link.
+
+The heatmap is time actually spent, not coverage: a section played through twice
+reads about 2×, and scrubbing across the video adds nothing at all. Videos
+recorded before this existed report what they knew — which parts were watched at
+least once — and are never shown as hotter than that.
 
 Every one of those reports is encrypted in the viewer's tab first, with **the
 same AES key that is in the share link** — the key no server ever sees. So the

@@ -356,14 +356,15 @@ export function publicBaseUrl(): string;                  // from window.VIDEOSH
 machine in §6, including the internal Blob→8 MiB-chunk assembler that feeds
 `UploadSession.addChunk`). `player.ts` — page controller for `view.html` (owns §8).
 
-`watch.ts` / `beacon.ts` / `stats.ts` — playback analytics (§16), split the way §8's
-arithmetic is: `watch.ts` is pure watch-range and aggregation math (no DOM, so Node
-tests and the stats page both import it), `beacon.ts` is the browser-side tracker and
-flush, and `stats.ts` is the page controller for `stats.html`. Full signatures in
-§16.5/§16.6.
+`watch.ts` / `beacon.ts` / `dashboard.ts` — playback analytics (§16), split the way
+§8's arithmetic is: `watch.ts` is pure watch-range, heat and aggregation math (no DOM,
+so Node tests and both halves of §16 import it), `beacon.ts` is the browser-side
+tracker and flush on `view.html`, and `dashboard.ts` is the analytics expander
+`record.ts` hangs on each library row (§16.6). Full signatures in §16.5/§16.6.
 
-Page-specific styles live in `src/record.css` / `src/player.css` / `src/stats.css`;
-shared design tokens and base styles in `src/app.css`.
+Page-specific styles live in `src/record.css` / `src/player.css`; shared design tokens
+and base styles in `src/app.css`. The dashboard's heatmap styles are `record.css`'s —
+it renders into the recorder's library.
 
 ## 12. Build & tooling
 
@@ -371,8 +372,10 @@ shared design tokens and base styles in `src/app.css`.
   `vite`, `vitest`. Scripts: `dev` (vite), `build` (`tsc --noEmit && vite build`),
   `preview`, `test` (`vitest run`), `test:e2e` (`vitest run --config vitest.e2e.config.ts`,
   only meaningful with MinIO up).
-- Vite multi-page: rollup inputs `index.html` + `view.html` + `stats.html` (§16.6).
-  `public/config.js` copied verbatim to `dist/`.
+- Vite multi-page: rollup inputs `index.html` + `view.html` — §1's two pages, and
+  after §16.6 the only two. `dist/` is not committed, so a `stats.html` or a `stats`
+  chunk in it is a stale local build and `npm run build` on a clean tree must produce
+  neither. `public/config.js` copied verbatim to `dist/`.
 - TypeScript `strict: true`. No frameworks, no other runtime deps.
 
 ## 13. Tests
@@ -390,10 +393,12 @@ shared design tokens and base styles in `src/app.css`.
   store reported rather than thrown.
 - `tests/watch.test.ts` (vitest, Node): the pure helpers of `watch.ts` (§16.5) —
   seconds→ms normalization, clamping, merging and the 200-range cap; `coverage`
-  and `isCompleted` around the 0.9 threshold and at `durationMs = 0`;
-  attention-curve bucket boundaries and multi-session counting; strict payload
-  parsing. §16.9 has the detail, plus what §16 adds to `tests/crypto.test.ts`,
-  `tests/gateway.test.ts` and `tests/e2e.gateway.test.ts`.
+  and `isCompleted` around the 0.9 threshold and at `durationMs = 0`; heat
+  accumulation (normal steps, discarded seeks in both directions, re-anchoring,
+  bucket boundaries, unknown duration); the v1→heat derivation; per-viewer
+  grouping, summing and the two normalizations; strict payload parsing of both
+  versions. §16.9 has the detail, plus what §16 adds to `tests/beacon.test.ts`,
+  `tests/crypto.test.ts`, `tests/gateway.test.ts` and `tests/e2e.gateway.test.ts`.
 - `tests/crypto.test.ts` (vitest, Node WebCrypto): key export/import round-trip;
   block round-trip; tampered byte → throws; wrong AAD (reordered chunk index) →
   throws; chunked encrypt/decrypt round-trip across ≥3 chunks incl. short
@@ -599,8 +604,8 @@ about the viewer:
 
 - **`browserId`** — persisted in the *viewer's* localStorage under
   `videoshare.viewer` (a bare string, not JSON). Minted on first use and reused
-  afterwards, so the stats page can collapse repeat viewings by one browser into one
-  "viewer". When storage is unavailable or refuses (§9's rules), an ephemeral
+  afterwards, so the library dashboard (§16.6) can collapse repeat viewings by one
+  browser into one "viewer". When storage is unavailable or refuses (§9's rules), an ephemeral
   in-memory id is used **silently** — a viewer is never asked to fix their browser.
   It is written only when a beacon will actually be sent, so a legacy deployment
   leaves nothing behind on `view.html`. This is the only key `view.html` writes; it
@@ -612,11 +617,12 @@ about the viewer:
 
 ```jsonc
 {
-  "v": 1,                             // format version, integer
+  "v": 2,                             // format version, integer
   "browserId": "8f3k2Jd0QpZ1nV7xLmA9Bw",
   "sessionId": "Qr4TgYs2Nb6HcE0uWkP1Zx",
   "durationMs": 93250,
   "watched": [[0, 41200], [58000, 93250]],   // [startMs, endMs), merged, sorted, disjoint
+  "heat": [1865, 1902, 0, /* … 50 in all … */ 4310],  // ms of playback per 2% bucket
   "completed": false,
   "firstPlayedAt": "2026-08-27T21:04:00.000Z"  // ISO 8601 UTC
 }
@@ -627,10 +633,28 @@ about the viewer:
 - `watched` — integer milliseconds, derived from the media element's `played`
   TimeRanges at flush time (§16.5). Union semantics: a stretch watched three times
   appears once, so this is "seen at least once", never "time spent". At most
-  `MAX_WATCH_RANGES` (200) entries.
+  `MAX_WATCH_RANGES` (200) entries. Unchanged by v2: coverage and completion are
+  still computed from it and mean exactly what they meant before.
+- `heat` — exactly `HEAT_BUCKETS` (50) non-negative integers, one per 2% of *this
+  session's own* `durationMs`. Entry *b* is the **milliseconds of actual playback**
+  spent inside bucket *b*, accumulated during playback by §16.5's rule and **not** a
+  union: a section watched twice holds roughly twice its own length, and scrubbing
+  across the video adds ~nothing. This is the "time spent" number `watched` refuses to
+  be, and the two ship together because they answer different questions. All zeros is
+  a legitimate value (a session whose duration was never known — see §16.5).
 - `completed` — `coverage ≥ COMPLETION_THRESHOLD` (0.9), recomputed at every flush by
-  the same helper the stats page uses, so the two sides agree by construction.
+  the same helper the reader uses, so the two sides agree by construction.
 - `firstPlayedAt` — the first `play` of this session; stable across every flush.
+
+**Versions.** Every beacon writes `v: 2`. Version 1 — the same object without `heat` —
+is **read-only** and stays readable forever: the reader accepts it and derives a heat
+array from `watched` alone (`heatFromRanges`, §16.5), which is the milliseconds of each
+bucket the union covers. A v1 session therefore reads as binary intensity capped at 1×
+and can never look hotter than watched-once, which is exactly as much as a v1 payload
+knows. Any other `v` — `0`, `3`, `"2"`, absent — is not a payload at all: `parsePayload`
+returns null and the session is **skipped and counted** with the ones that fail to
+decrypt (§16.6). A v1 object carrying a stray `heat` field is still a v1 payload; the
+field is ignored, like every other unknown field.
 
 Encryption is exactly §4's single block — `IV (12) ‖ ciphertext ‖ tag (16)`, same
 AES-GCM key as the video — with AAD `"{videoId}:analytics:{sessionId}"`
@@ -643,6 +667,10 @@ cap (§16.3) is therefore a cap on an entire session, which is what
 `MAX_WATCH_RANGES` exists to guarantee: a merged list longer than 200 is coalesced
 across its **smallest gaps first** (`capRanges`) until it fits, so the error is
 bounded by the narrowest gaps in the list and the shape of the curve survives.
+`heat` cannot grow the body the way `watched` could: it is always 50 numbers, and even
+at absurd values (a bucket holding a full day of replayed playback, ~8 digits each) it
+adds well under 1 KiB of JSON. The cap stays `MAX_WATCH_RANGES`'s job, and §16.9 pins
+that with an assertion on a pathological v2 payload rather than an argument.
 
 ### 16.3 Beacon endpoint (viewer → gateway → bucket)
 
@@ -697,8 +725,8 @@ under prefix `{videoId}/` with `ListObjectsV2`, server-side, and answers:
   (§15.2). The browser fetches the ciphertext **straight from the bucket** — the
   gateway never streams a stored byte back (§15).
 - Pagination is followed to `MAX_LISTED_SESSIONS` (1000). Stopping early sets
-  `truncated: true` rather than silently trimming, and the stats page says so on the
-  page.
+  `truncated: true` rather than silently trimming, and the dashboard says so in the
+  expander it was asked from.
 - Keys that do not match `{videoId}/{22 base64url}.bin` are skipped: nothing else
   belongs in that prefix, and if something is there it is not a session.
 - Malformed `videoId` → **400**; analytics disabled → **404**; any method but
@@ -732,8 +760,8 @@ under prefix `{videoId}/` with `ListObjectsV2`, server-side, and answers:
   accepted.
 - The analytics bucket MUST be **private**: no public domain attached, no anonymous
   read policy. It needs no CORS for writes (the gateway writes it) but DOES need
-  `GET` CORS from the site origin, because the stats page fetches presigned URLs from
-  it directly (§16.10).
+  `GET` CORS from the site origin, because the library dashboard fetches presigned
+  URLs from it directly (§16.10).
 - Logging: the beacon handler writes **no per-request log line** — not the session id,
   not a size, not an origin. A failed write logs the video id and the storage status
   and nothing else. No IP-bearing header (`CF-Connecting-IP`, `X-Forwarded-For`,
@@ -766,32 +794,159 @@ declared separately: the gateway is its own package and imports nothing from `sr
 
 Two modules, split on testability the same way §8's arithmetic lives in `gap.ts`.
 
-`watch.ts` — pure, no DOM, imported by Node tests and by the stats page:
+`watch.ts` — pure, no DOM, no clock, imported by Node tests, by `beacon.ts` and by the
+library dashboard:
 
 ```ts
 export type Range = [startMs: number, endMs: number];
-export interface WatchPayload { v: 1; browserId: string; sessionId: string;
+
+export interface WatchPayloadV1 { v: 1; browserId: string; sessionId: string;
   durationMs: number; watched: Range[]; completed: boolean; firstPlayedAt: string; }
-export const BEACON_INTERVAL_MS: number;     // 30_000
-export const MAX_WATCH_RANGES: number;       // 200
-export const COMPLETION_THRESHOLD: number;   // 0.9
-export const ATTENTION_BUCKETS: number;      // 50 → one bucket per 2% of duration
+export interface WatchPayloadV2 extends Omit<WatchPayloadV1, "v"> { v: 2; heat: number[]; }
+export type WatchPayload = WatchPayloadV1 | WatchPayloadV2;
+
+export const BEACON_INTERVAL_MS: number;      // 30_000
+export const MAX_WATCH_RANGES: number;        // 200
+export const COMPLETION_THRESHOLD: number;    // 0.9
+export const HEAT_BUCKETS: number;            // 50 → one bucket per 2% of duration
+export const MAX_PLAYBACK_DELTA_MS: number;   // 1_500 — a bigger step is a seek, not playback
+
+// Coverage, unchanged.
 export function playedRanges(played: TimeRangesLike, durationMs: number): Range[];
 export function mergeRanges(ranges: readonly Range[]): Range[];
 export function capRanges(ranges: readonly Range[], max?: number): Range[];
 export function watchedMs(ranges: readonly Range[]): number;
 export function coverage(ranges: readonly Range[], durationMs: number): number;   // 0..1
 export function isCompleted(ranges: readonly Range[], durationMs: number): boolean;
-export function attentionCurve(sessions: readonly WatchPayload[], buckets?: number): number[];
+
+// Heat accumulation: a pure reducer; `beacon.ts` holds one state and feeds it events.
+export interface HeatState { readonly heat: readonly number[]; readonly lastMs: number | null; }
+export function createHeatState(buckets?: number): HeatState;
+export function advance(state: HeatState, currentMs: number, durationMs: number): HeatState;
+export function reanchor(state: HeatState, currentMs: number): HeatState;
+export function heatMs(state: HeatState): number[];    // rounded integers, length = buckets
+
+// Heat reading: what the dashboard aggregates from decrypted payloads.
+export interface WatchSession { payload: WatchPayload; lastModified: string; }
+export interface ViewerReport { browserId: string; plays: number; heat: number[];
+  coverage: number | null; lastWatched: string; }
+export function heatFromRanges(watched: readonly Range[], durationMs: number, buckets?: number): number[];
+export function sessionHeat(payload: WatchPayload, buckets?: number): number[];
+export function sumHeat(payloads: readonly WatchPayload[], buckets?: number): number[];
+export function relativeHeat(payloads: readonly WatchPayload[], buckets?: number): number[];
+export function normalizeHeat(heat: readonly number[]): number[];   // 0..1 against the largest bucket
+export function groupByViewer(sessions: readonly WatchSession[]): ViewerReport[];
+
 export function parsePayload(value: unknown): WatchPayload | null;   // strict; null, never throws
 ```
 
-What the helpers pin: seconds → ms by `Math.round`; every range clamped to
-`[0, durationMs]` (or left as-is when `durationMs` is 0); ranges with `end ≤ start`
-after rounding dropped; output sorted by start, non-overlapping, with touching ranges
-merged; then `capRanges`. `coverage` = `watchedMs / durationMs`, capped at 1, and `0`
-when `durationMs ≤ 0`. `TimeRangesLike` is `gap.ts`'s — the same structural type the
-real `TimeRanges` satisfies.
+What the coverage helpers pin, unchanged by v2: seconds → ms by `Math.round`; every
+range clamped to `[0, durationMs]` (or left as-is when `durationMs` is 0); ranges with
+`end ≤ start` after rounding dropped; output sorted by start, non-overlapping, with
+touching ranges merged; then `capRanges`. `coverage` = `watchedMs / durationMs`, capped
+at 1, and `0` when `durationMs ≤ 0`. `TimeRangesLike` is `gap.ts`'s — the same
+structural type the real `TimeRanges` satisfies.
+
+**Heat accumulation**, pinned exactly, because two sides have to agree on it and a
+seek must never look like watching:
+
+- `HeatState` is immutable — `advance` and `reanchor` return a new state and mutate
+  nothing, so a test can hold both sides of a step. `createHeatState()` is all-zero
+  heat and `lastMs: null` (no observation point yet).
+- `advance(state, currentMs, durationMs)` is one `timeupdate`. With
+  `deltaMs = currentMs - state.lastMs`:
+  - `state.lastMs === null` → no delta exists; the call only sets the observation
+    point to `currentMs`.
+  - `deltaMs ≤ 0` or `deltaMs > MAX_PLAYBACK_DELTA_MS` → **discarded**. A backwards
+    step is a seek back, a step over 1.5 s is a seek forward or a stall the viewer did
+    not watch through, and neither is playback. The observation point still moves to
+    `currentMs`, so the next step is measured from where the video actually is.
+  - otherwise `deltaMs` is added to bucket
+    `min(HEAT_BUCKETS - 1, max(0, floor(currentMs / durationMs * HEAT_BUCKETS)))` —
+    the bucket of the **arriving** position, whole. A delta straddling a boundary is
+    not split: the error is under 1.5 s per boundary crossing, and splitting would buy
+    precision nothing downstream can use.
+  - `durationMs` not finite or `≤ 0` → there is no bucket to name, so every delta is
+    discarded and heat stays all zeros while the observation point still advances. A
+    session that only ever learns its duration mid-playback therefore accumulates from
+    that moment on, and one that never learns it ships 50 zeros (§16.2).
+- `reanchor(state, currentMs)` sets the observation point to `currentMs` and touches
+  no bucket. It is what a discontinuity costs: the delta across it is dropped.
+- `heatMs(state)` rounds each bucket to an integer. Accumulation itself is in floating
+  milliseconds — rounding 4 times a second would drift by minutes over a long video.
+- Heat is **media time, not wall-clock time**: the deltas come from `currentTime`, so a
+  viewer at 2× accumulates the same heat over a stretch as a viewer at 1×. But a delta
+  is roughly `timeupdate cadence × playback rate`, so the rate at which heat starts
+  falling past `MAX_PLAYBACK_DELTA_MS` and quietly under-counting is **set by a cadence
+  this module does not control**, not by a fixed multiple:
+  - at the ~250 ms cadence a foreground tab fires, deltas pass 1.5 s above roughly 6×;
+  - in a tab the browser has throttled — backgrounded, or on an energy saver — the
+    cadence can fall to about 1 Hz, and the cutoff falls with it to roughly 1.5×. A
+    viewer listening at 2× in a background tab therefore ships **near-zero heat** for a
+    full real listen, not a slightly low number.
+
+  Coverage, `completed` and the header counts of §16.6 are unaffected in every one of
+  these cases: they are read from `video.played` at flush time, which no cadence
+  touches. Only the heatmap under-counts. That is accepted, not fixed: the alternative
+  is a sampling timer, and this section's whole shape is that there isn't one. Raising
+  `MAX_PLAYBACK_DELTA_MS` is not the fix either — the cap is what stops a seek from
+  painting heat across a video nobody played, and a throttled tab's 1 Hz cadence is
+  indistinguishable from a stall at the only place the decision is made.
+
+**Heat reading**, equally pinned, because §16.6 renders these numbers as a picture and
+a picture that lies is worse than no picture:
+
+- `heatFromRanges(watched, durationMs)` — bucket *b* spans
+  `[b·durationMs/50, (b+1)·durationMs/50)`, the last one ending on `durationMs`
+  inclusive; the bucket's value is the summed overlap in milliseconds between the union
+  and that span, rounded. Because `watched` is disjoint, no bucket can exceed its own
+  span: v1 reads as 1× at most, by construction. `durationMs ≤ 0` → all zeros.
+- `sessionHeat(payload)` — `payload.heat` for v2, `heatFromRanges(payload.watched,
+  payload.durationMs)` for v1. This is the **only** place a version
+  difference is allowed to matter; every consumer above it reads one shape.
+- `sumHeat(payloads)` — per bucket, the sum of `sessionHeat` over the payloads.
+  Sessions of differently-timed videos still stack, because a bucket is 2% of *each
+  session's own* duration.
+- `relativeHeat(payloads)` — the "×" number §16.6 puts in every bar's tooltip:
+
+  ```
+  relative[b] = sumHeat(payloads)[b] / Σ  (s.durationMs / HEAT_BUCKETS)
+                                     s ∈ payloads, s.durationMs > 0
+  ```
+
+  The denominator is the playback time one pass through that bucket would take, summed
+  over the sessions that have a duration — so for equal-duration sessions it is exactly
+  `bucketMs / (sessions × bucketDurationMs)`, and it stays honest when the durations
+  differ instead of quietly picking one video's length for everyone. `1.0` means "on
+  average these sessions played this slice once through"; `2.4` means they played it
+  about two and a half times. Sessions with `durationMs ≤ 0` are excluded from **both**
+  sides (their heat is all zeros by §16.5, so counting them in the denominator would
+  only dilute the answer) while still counting as sessions in §16.6's header. An empty
+  denominator → all zeros.
+- `normalizeHeat(heat)` — each bucket over the largest bucket, `0..1`; an all-zero
+  input gives all zeros. This is the **height** channel of §16.6's bars, and it is
+  deliberately not `relativeHeat`: height shows shape within one video, the tooltip
+  and the hot threshold show intensity against 1×.
+- `groupByViewer(sessions)` — one `ViewerReport` per distinct `browserId`, with
+  `plays` = that viewer's session count, `heat` = `sumHeat` over their payloads,
+  `coverage` = the **best** (highest) `coverage(watched, durationMs)` among their
+  sessions with a known duration, or `null` when none has one, and `lastWatched` = the
+  greatest `lastModified` of their sessions (the listing's timestamp — §16.3 — because
+  a payload carries no last-activity time). Sorted by `lastWatched` descending, ties
+  broken by `browserId` ascending so the order is deterministic in a test. A
+  `browserId` that is not 22 base64url characters is **never collapsed with anything**:
+  each such session becomes its own single-play viewer (keyed internally by its
+  `sessionId`) and reports that `browserId` verbatim.
+- `ATTENTION_BUCKETS` and `attentionCurve` are **removed**, replaced by `HEAT_BUCKETS`
+  (the same 50) and the aggregates above. The curve counted *how many sessions touched
+  a bucket* — the binary question heat answers with more resolution, and the one
+  `heatFromRanges` recovers exactly for a v1 payload. After §16.6's rewrite nothing
+  imports it, and an export nothing imports is not a contract.
+- `parsePayload` stays strict and still never throws: `v` must be `1` or `2`; for `v: 2`
+  `heat` must be an array of exactly `HEAT_BUCKETS` non-negative integers, and anything
+  else — 49 entries, a float, a negative, a string — makes the whole payload null. The
+  write endpoint is unauthenticated (§16.3), so a heat array is as untrusted as a range
+  list.
 
 `beacon.ts` — the browser half (needs `navigator`, `document`, WebCrypto):
 
@@ -804,9 +959,22 @@ export function viewerId(): string;              // `videoshare.viewer`; in-memo
 
 - The flush timer starts on the first `play` and is cleared at `ended` and at
   `pagehide`. There is **no polling loop beyond it**: ranges are read from
-  `video.played` at flush time, not sampled.
-- Flush triggers: every `BEACON_INTERVAL_MS` while the timer runs, on `ended`, on
-  `visibilitychange` → `hidden`, and on `pagehide`.
+  `video.played` at flush time, not sampled, and heat rides the element's own
+  `timeupdate` (below) rather than a clock of ours.
+- Flush triggers: every `BEACON_INTERVAL_MS` while the timer runs, on `pause`, on
+  `ended`, on `visibilitychange` → `hidden`, and on `pagehide`. `pause` is immediate
+  and needs no debounce: browsers fire `pause` just before `ended`, and the flush
+  already refuses to re-send a body identical to the last one the browser accepted, so
+  the pair costs one write, not two.
+- Heat (§16.2) is accumulated with `watch.ts`'s reducer over one `HeatState` held for
+  the session: every `timeupdate` calls `advance(state, video.currentTime * 1000,
+  durationMs)` — the browser fires it only while playback is progressing, a few times
+  a second — and `seeking`, `seeked` and `play` call `reanchor(state,
+  video.currentTime * 1000)` instead. That is the whole reset rule: a scrub loses the
+  delta across itself and adds ~nothing, a pause of any length adds nothing because
+  the `play` on the other side re-anchors, and a section watched twice accumulates
+  about twice its own length. `heatMs(state)` is read at flush time, beside
+  `playedRanges`.
 - **No beacon at all** when: `config.js` sets no `gatewayUrl`; `/config` did not
   answer `analytics: true`; nothing has been played yet (`watched` is empty); or the
   page is the recorder. Beacons come from `view.html` only — `record.ts` never calls
@@ -815,61 +983,136 @@ export function viewerId(): string;              // `videoshare.viewer`; in-memo
   that throws. Nothing reaches the viewer, nothing retries in a loop; the next
   scheduled flush carries the same cumulative state anyway.
 - `player.ts` starts it after `meta` is loaded and the gateway config has resolved,
-  and does nothing else differently. Both `player.ts` and `stats.ts` parse
-  `#{id}.{key}` through one exported `parseShareFragment()` in `util.ts` (§11) so the
-  §2 format lives in one place — a pure refactor, playback behaviour unchanged.
+  and does nothing else differently. Both `player.ts` and the library dashboard
+  (§16.6) parse `#{id}.{key}` through one exported `parseShareFragment()` in `util.ts`
+  (§11) so the §2 format lives in one place — a pure refactor, playback behaviour
+  unchanged.
 
-### 16.6 Stats page (`stats.html`, `src/stats.ts`, `src/stats.css`)
+### 16.6 Library dashboard (`index.html`, `src/dashboard.ts`)
 
-A third page, built like the other two (§12 rollup inputs), and **gateway mode only**.
+**There is no stats page.** Watch data belongs next to the video it is about, and the
+recorder already lists every video this browser made (§9's library). So each library
+entry grows an **Analytics expander**, and `stats.html`, `src/stats.ts` and
+`src/stats.css` are **deleted** — along with the rollup input that built them (§12).
 
-- No `gatewayUrl` in `config.js` → the page renders one honest paragraph: analytics
-  needs a gateway with an analytics bucket, pointing at `docs/gateway-setup.md`. It
-  loads no Google script and makes no network call.
-- `gatewayUrl` present but `/config` answers `analytics: false` → the same treatment,
-  a different sentence.
-- Otherwise: Google sign-in through `src/auth.ts` (§15.5's module, unchanged — token
-  in memory only), then pick a video either from the **local library**
-  (`videoshare.library`, same origin as the recorder) or by pasting a share link.
-  Either way the id and key come from `#{id}.{key}` via `parseShareFragment`.
-- Then `GET {gatewayUrl}/beacon/{id}` with the bearer → fetch each session's
-  ciphertext **directly from its presigned url** → `decryptBlock(key,
-  analyticsAad(id, sessionId), block)` → `parsePayload`. A session that fails to
-  decrypt or to parse is **skipped and counted**, and the page shows "N sessions could
-  not be read" rather than hiding them: the write endpoint is unauthenticated, so junk
-  is possible, and so is a video re-uploaded under a new key.
-- **The key is never sent to the gateway.** Only the id appears in a request path. A
-  pasted link is read, parsed and dropped — never written to `location`, to
-  `history`, or into a form that could be submitted.
+When the expander exists at all:
 
-Aggregates, all computed in the browser from decrypted payloads:
+| `config.js` | `/config` | signed in | library entry shows |
+| --- | --- | --- | --- |
+| no `gatewayUrl` (legacy) | — | — | nothing — no expander, no hint, no request |
+| `gatewayUrl` | `analytics: false` | — | nothing, same as legacy |
+| `gatewayUrl` | `analytics: true` | no | one muted line: **"Sign in to see analytics."** |
+| `gatewayUrl` | `analytics: true` | yes | the expander, collapsed |
 
-- **Total sessions** — decryptable objects; one per viewing instance.
-- **Unique viewers** — distinct `browserId` values. A payload whose `browserId` is not
-  22 base64url characters counts as its own viewer and is never collapsed with
-  another.
-- **Average watch coverage** — the mean of `coverage(watched, durationMs)` over
-  sessions with `durationMs > 0`, as a percentage. Coverage is *fraction of the video
-  seen at least once*; re-watching cannot push it past 100%.
-- **Completions** — sessions with `completed === true`, i.e. coverage ≥ 90% (§16.2).
-- **Attention curve** — `ATTENTION_BUCKETS` (50) buckets of 2% of duration each;
-  bucket *b* covers `[b/50, (b+1)/50)` of *that session's own* `durationMs`, and a
-  session adds 1 to the bucket if any watched range overlaps it at all (a range ending
-  exactly on a boundary does not light the next bucket). Sessions with
-  `durationMs ≤ 0` are excluded from the curve and from the coverage average, while
-  still counting as sessions. Rendered as plain CSS bars — **no chart library, no
-  canvas, no external asset**.
-- **Per-session table** — started (`firstPlayedAt`), watched %, watched time
-  (`formatDuration`), and the `browserId` truncated to its first 6 characters. No IP
-  column, because no IP exists to put in one.
+The signed-out case is a **hint, not an absence**: the operator turned analytics on,
+the data exists, and a blank row would read as "this video has none". It is one line
+of muted text in the row, it makes no network call, and it is not a `<details>` —
+there is nothing to open. Signing in re-renders the library and the hints become
+expanders; signing out turns them back — which means `record.ts`'s auth-change handler
+gains a `renderLibrary()` call it does not have today, and that is the whole coupling
+between the two.
+
+The expander itself, matching what `index.html` already does with `<details>` /
+`<summary>` for its two panels:
+
+- `<details>` with a `<summary>` reading **"Analytics"**, collapsed by default. Nothing
+  is fetched until one is opened, so a library of forty videos still costs the one
+  `/config` request the recorder already makes.
+- On **first open**: read the entry's stored `link` (§9's `LibraryEntry.link`) through
+  `parseShareFragment` for `{ id, keyB64 }` → `importKeyB64` →
+  `GET {gatewayUrl}/beacon/{id}` with the Google bearer (§15.4, the same token the
+  uploader holds, from `src/auth.ts` in memory) → fetch each session's ciphertext
+  **directly from its presigned url**, at most `SESSION_CONCURRENCY` (6) at a time →
+  `decryptBlock(key, analyticsAad(id, sessionId), block)` → `parsePayload` (v1 and v2,
+  §16.2) → render. Each kept session is a `WatchSession`: the payload plus the
+  listing's `lastModified`.
+- A session that fails to decrypt or to parse is **skipped and counted**, never hidden:
+  the write endpoint is unauthenticated, so junk is possible, and so is a video
+  re-uploaded under a new key.
+- **Result caching** is per video id and lasts the page's lifetime: collapsing and
+  re-expanding re-renders what was fetched, and re-rendering the library does not
+  refetch. A small **"reload"** link inside the expander refetches and replaces the
+  cached result — the one affordance for "someone watched it since I opened this". A
+  load that *failed* is not cached: reopening retries it, because the usual cause is a
+  token that has since been refreshed.
+- **The key never leaves the page.** Only the 22-character id appears in a request
+  path; the fragment is parsed in memory and never written to `location`, to `history`,
+  or into a form. This is the same rule §16 opens with, and it is the reason the
+  dashboard lives on the page that already holds the share links.
+
+What it renders, all computed in the browser from decrypted payloads (`watch.ts`,
+§16.5):
+
+- **Header line** — total views (kept sessions, one per viewing instance) · unique
+  viewers (`groupByViewer(...).length`) · completions (`completed === true`, i.e.
+  coverage ≥ 90%, §16.2); then, **only when they are not zero/false**, "N sessions
+  could not be read" and a note that the listing was `truncated` at
+  `MAX_LISTED_SESSIONS`. Zero sessions is its own line — "No views yet." — not an
+  empty heatmap.
+- **Overall heatmap** — `HEAT_BUCKETS` (50) bars, one per 2% of the video, rendered as
+  plain CSS bars: **no chart library, no canvas, no external asset, no inline SVG
+  sprite**. Two channels, and they are different numbers on purpose:
+  - **height** = `normalizeHeat(sumHeat(payloads))[b]`, so the tallest bucket is full
+    height and the shape of attention within *this* video is legible whatever the
+    absolute numbers are. An empty bucket keeps a hairline so 50 bars stay 50 bars.
+  - **intensity** = `relativeHeat(payloads)[b]`, the ×-against-one-pass number. A
+    bucket at or above `1.0` must read **visibly hotter** than one below it — that is
+    the whole point of the heat data, and a rendering where 0.4 and 2.4 look the same
+    fails this section. The threshold is a class or a custom property on the bar; the
+    exact palette is `record.css`'s business.
+  - **tooltip** = each bar's `title`, exactly `~N.Nx` — `relativeHeat[b].toFixed(1)`,
+    e.g. `~2.4x`. Nothing else in the attribute.
+- **One row per unique viewer**, in `groupByViewer` order (most recent activity first):
+  the `browserId` truncated to its **first 8 characters** followed by an ellipsis; the
+  play count as "N plays" ("1 play" in the singular); that viewer's own heatmap, summed
+  over their sessions and rendered exactly like the overall one (its own
+  `normalizeHeat`, its own `relativeHeat` over that viewer's payloads); their best
+  session's coverage as a percentage, or "—" when no session of theirs has a known
+  duration; and the last-watched date from `lastModified`, formatted with
+  `toLocaleString()` like the rest of the library. No IP column, because no IP exists
+  to put in one.
+
+**Errors stay inside the expander.** A 401 (token expired), a 403, a 404, a 502, a
+network failure, a listing that returns nothing readable, an entry whose `link` has no
+parseable fragment — each renders as one quiet muted sentence where the content would
+have gone, and the expander stays open so the reader can hit "reload". None of them
+touches the page-level status area, none blocks a recording or an upload, and none is
+thrown: this is a panel about a video, not the page's business. A 401 says so plainly
+("Sign in again to load analytics.") rather than silently re-prompting, because the
+sign-in control is a few centimetres up the same page.
+
+`src/dashboard.ts` is the reader half, and it is its own module rather than more of
+`record.ts` (1,300 lines before this) for the reason `gap.ts`, `watch.ts` and
+`beacon.ts` are their own: fetch-decrypt-aggregate-render is a subject, and `record.ts`
+is the recorder's state machine. It owns no page state beyond its cache and hands
+`record.ts` DOM:
+
+```ts
+export interface AnalyticsDeps {
+  gatewayUrl: string;
+  /** The current Google ID token, or null. Read per request, never captured. */
+  token: () => string | null;
+}
+export const SESSION_CONCURRENCY: number;      // 6
+export const VIEWER_PREFIX: number;            // 8 characters, then an ellipsis
+/** The collapsed <details> for one entry — analytics on, signed in. */
+export function analyticsExpander(entry: LibraryEntry, deps: AnalyticsDeps): HTMLElement;
+/** The one-line "Sign in to see analytics." row — analytics on, signed out. */
+export function analyticsHint(): HTMLElement;
+```
+
+`record.ts` decides which of the two (or neither) a row gets, from the gateway config
+and the auth state it already tracks. Styles go in `record.css` beside the library's;
+`stats.css` is deleted, not moved.
 
 ### 16.7 Legacy mode
 
 Zero behaviour change, and stated so it can be tested rather than hoped for: with no
 `gatewayUrl`, `view.html` makes exactly the requests §8 already makes, writes no
-localStorage key, mints no ids, loads no Google script, and contains no timer;
-`stats.html` explains itself and stops. §9's settings and §10's "viewers are
-strangers" are otherwise untouched.
+localStorage key, mints no ids, loads no Google script, and contains no timer; and
+`index.html`'s library renders plain rows — no expander, no hint, no bearer, no
+listing call (§16.6). §9's settings and §10's "viewers are strangers" are otherwise
+untouched.
 
 ### 16.8 Privacy guarantees
 
@@ -878,7 +1121,9 @@ What an operator of the gateway and the analytics bucket **can** learn:
 - that *some* browser watched video `{id}`, and roughly when — the object's
   `LastModified`, refreshed by each flush;
 - how many sessions exist for an id, and the ciphertext size of each, from which a
-  coarse guess at the *number* of watched ranges is possible and nothing more;
+  coarse guess at the *number* of watched ranges is possible and nothing more —
+  `heat` is 50 numbers in every payload, so it moves that size by a few dozen bytes of
+  digits and says nothing about which buckets hold them;
 - the `sessionId`, since it is the object key — a random per-page-load label that
   links to no person, no browser, and no other video;
 - whatever their transport layer logs on its own. A CDN's or load balancer's access
@@ -899,16 +1144,61 @@ analytics.**
 
 ### 16.9 Tests
 
-- `tests/watch.test.ts` (vitest, Node) — §13's entry. Range normalization
-  (seconds→ms rounding, clamping to duration, overlapping/touching/out-of-order input,
-  zero-length after rounding); a 400-range `played` list capped to 200 with the
-  smallest gaps closed first; `coverage`/`isCompleted` either side of 0.9 and at
-  `durationMs = 0`; `attentionCurve` boundary behaviour and multi-session counting;
-  `parsePayload` rejecting a wrong `v`, missing fields, non-integer milliseconds, and
-  unsorted or overlapping ranges.
+- `tests/watch.test.ts` (vitest, Node) — §13's entry, and the only suite that has to
+  hold the two sides of §16 to one answer:
+  - Coverage, unchanged: range normalization (seconds→ms rounding, clamping to
+    duration, overlapping/touching/out-of-order input, zero-length after rounding); a
+    400-range `played` list capped to 200 with the smallest gaps closed first;
+    `coverage`/`isCompleted` either side of 0.9 and at `durationMs = 0`;
+    `parsePayload` rejecting missing fields, non-integer milliseconds, and unsorted or
+    overlapping ranges.
+  - Heat accumulation: a run of normal `advance` steps landing in the expected
+    buckets; a forwards seek (delta > `MAX_PLAYBACK_DELTA_MS`) and a backwards seek
+    (delta ≤ 0) both discarded **while the observation point still moves**, proven by
+    the next in-range step counting from the new position; `reanchor` dropping the
+    delta across a pause and across a scrub; the boundary cases — a position exactly on
+    a bucket edge landing in the higher bucket, `currentMs === durationMs` landing in
+    bucket 49 rather than 50, a position past the duration clamped to 49, a negative
+    position clamped to 0; `durationMs` of `0`, `NaN` and `Infinity` accumulating
+    nothing while leaving the state advanced; and immutability (the input state
+    unchanged after both calls).
+  - v1 compatibility: `heatFromRanges` overlap arithmetic including a range that
+    covers a bucket exactly, one that straddles a boundary, one ending on `durationMs`,
+    and `durationMs ≤ 0` → zeros; `sessionHeat` returning the array as sent for v2 and
+    the derived one for v1; the derived array never exceeding one bucket-span (1×).
+  - Aggregation: `sumHeat` across sessions of **differing** durations;
+    `relativeHeat`'s formula asserted numerically, including that a bucket played once
+    per session reads `1.0`, that a bucket played twice by half the sessions reads
+    `1.0`, and that sessions with `durationMs ≤ 0` change neither side; `normalizeHeat`
+    against the largest bucket and on an all-zero input; `groupByViewer` collapsing
+    repeat sessions, ordering by `lastModified` descending with the `browserId`
+    tiebreak, taking the **best** coverage rather than the last, reporting `null`
+    coverage when no session has a duration, and refusing to collapse a malformed
+    `browserId` with anything.
+  - `parsePayload` version handling: `v: 1` accepted without `heat` and with a stray
+    one; `v: 2` accepted with exactly 50 non-negative integers and rejected with 49, 51,
+    a float, a negative, a string entry, or no `heat` at all; `v` of `0`, `3`, `"2"` or
+    absent → null.
+- `tests/beacon.test.ts` keeps its `viewerId` suite unchanged and moves its payload
+  suite to v2: the encrypt → decrypt → `parsePayload` round trip on a `v: 2` body with
+  a 50-entry `heat`; the same body unreadable under another session's AAD; and the
+  body-cap assertion extended to the **pathological** case — `MAX_WATCH_RANGES` (200)
+  ranges *and* 50 eight-digit heat buckets — still encrypting to under
+  `MAX_BEACON_BYTES` (16384) with room to spare, so §16.2's size claim is a test and
+  not a paragraph.
+- `startWatchBeacon`'s event wiring stays outside the Node suites, as it is today:
+  there is no media element in Node, and inventing one would test the stub. That is
+  precisely why the heat reducer is pure — the arithmetic that a `pause`, a seek or a
+  resume changes is `watch.ts`'s and is tested there, and what `beacon.ts` adds on top
+  is which event name calls which function.
 - `tests/crypto.test.ts` gains: `analyticsAad` round-trip, and a block that decrypts
   under `{id}:analytics:{sessionA}` failing under `{id}:analytics:{sessionB}` and
   under `{id}:meta`.
+- The `attentionCurve` suite goes with the function (§16.5): its subject — how many
+  sessions touched each slice — is answered better by the heat aggregates above, and a
+  test for an export nothing imports is a test of nothing. There was never a
+  `stats.ts` suite to delete; what the page did is now `watch.ts` arithmetic, testable
+  without a DOM at all.
 - `tests/gateway.test.ts` gains a `POST /beacon` suite (id validation → 400, oversized
   body → 413, analytics disabled → 404, wrong method → 405, unlisted origin → 403;
   happy path → 204 with exactly one PutObject at `{id}/{session}.bin` against a stub
@@ -942,14 +1232,21 @@ analytics.**
 - `docs/gateway-setup.md`: an `ANALYTICS_BUCKET` section — creating a **private**
   second bucket on R2/S3/MinIO (no public domain attached, no anonymous read policy),
   the fact that it needs no CORS for writes because the gateway writes it but does
-  need `GET` CORS from the site origin for the presigned stats fetches, that leaving
-  the variable unset is a supported configuration, and §16.9's one-real-beacon smoke
-  test for Lambda deployments — written the same way §15.7's R2 step is, with the
-  failure it catches and what to do about it.
+  need `GET` CORS from the site origin for the dashboard's presigned session fetches,
+  that leaving the variable unset is a supported configuration, and §16.9's
+  one-real-beacon smoke test for Lambda deployments — written the same way §15.7's R2
+  step is, with the failure it catches and what to do about it. That smoke test reads
+  its result off the **library dashboard** (§16.6): record a video, watch a minute of
+  it from its share link, then open the recorder, sign in, and expand Analytics on that
+  entry. One view with a plausible heatmap means the beacon survived; "1 session could
+  not be read" on a video whose key has not changed is the failure it exists to catch.
 - `examples/docker-compose.yml`: the `mc` init job creates the analytics bucket
   (private, no anonymous policy) and sets its GET CORS; the `gateway` profile passes
   `ANALYTICS_BUCKET`.
 - `README.md`: one honest paragraph in the security model — the server learns that and
   roughly when a video id was watched and how big each session object is; it never
   learns watch ranges, viewer identity, or an IP address, because none is read. Watch
-  data is readable only by holders of the share link.
+  data is readable only by holders of the share link. Its description of *where you
+  read the data* is the library expander, not a third page: no sentence in the README
+  may promise a `stats.html` that the build no longer emits (§12), and what the
+  dashboard shows is views, unique viewers, completions and the replay heatmap (§16.6).

@@ -12,6 +12,7 @@ import "./record.css";
 
 import { type Auth, type AuthState, createAuth } from "./auth";
 import { CHUNK_OVERHEAD, CHUNK_SIZE, generateKey } from "./crypto";
+import { type AnalyticsDeps, analyticsExpander, analyticsHint } from "./dashboard";
 import {
   createEngine,
   type RecorderEngine,
@@ -167,6 +168,14 @@ let recordingPrefs: RecordingPrefs = {
 let captureSupported = true;
 /** Gateway mode with no usable ID token: recording must not start. */
 let signInRequired = false;
+/**
+ * What the library rows need to offer analytics (SPEC §16.6): the gateway must
+ * have said `analytics: true`, and there must be a token to list with. Null deps
+ * or `analytics: false` means a plain row — no expander, no hint, no request,
+ * which is also exactly what legacy mode gets.
+ */
+let analyticsDeps: AnalyticsDeps | null = null;
+let analyticsEnabled = false;
 /** A mid-session expiry has been announced, so signing back in can say so once. */
 let reauthAnnounced = false;
 
@@ -500,7 +509,14 @@ function renderAuth(state: AuthState): void {
 }
 
 function onAuthChange(state: AuthState): void {
+  const wasSignedOut = signInRequired;
   renderAuth(state);
+  // Signing in turns each library row's "Sign in to see analytics." hint into an
+  // expander, and signing out turns it back (SPEC §16.6) — the whole coupling
+  // between sign-in and the library. Only on an actual change: a silent token
+  // refresh emits "signed-in" again, and rebuilding the rows for it would shut
+  // an expander somebody was reading.
+  if (wasSignedOut !== signInRequired) renderLibrary();
 
   if (state.status === "signed-in") {
     if (reauthAnnounced) {
@@ -569,6 +585,8 @@ async function initGateway(base: string): Promise<void> {
   // is the operator's choice, not something the gateway authorizes (SPEC §15.5).
   initRecordingPanel();
 
+  analyticsEnabled = config.analytics;
+
   const warning = gatewayBaseUrlWarning(config);
   if (warning) {
     authWarning.textContent = warning;
@@ -586,7 +604,11 @@ async function initGateway(base: string): Promise<void> {
       refreshToken: () => auth.refresh(),
     }),
   };
+  // Read per request, never captured: the expander asks for a token when it is
+  // about to list, not when the row was drawn (SPEC §16.6).
+  analyticsDeps = { gatewayUrl: base, token: () => auth.getToken() };
   renderAuth(auth.state);
+  renderLibrary();
 }
 
 // --- Library -----------------------------------------------------------------
@@ -649,7 +671,25 @@ function libraryRow(entry: LibraryEntry): HTMLLIElement {
   });
 
   item.append(details, copy, remove);
+  const analytics = analyticsPanel(entry);
+  // Its own line under the row's controls, because a heatmap is not a button.
+  if (analytics) item.append(analytics);
   return item;
+}
+
+/**
+ * The row's analytics affordance, or null when there is none (SPEC §16.6).
+ *
+ * Legacy mode and a gateway with `analytics: false` get nothing at all — no
+ * expander, no hint, no request. With analytics on, a signed-out recorder gets
+ * one muted line rather than a blank space: the operator turned this on and the
+ * data exists, so an absence would read as "this video has none".
+ */
+function analyticsPanel(entry: LibraryEntry): HTMLElement | null {
+  if (!analyticsEnabled || !analyticsDeps) return null;
+  // `signInRequired` is exactly "there is no usable ID token right now", which
+  // is what listing a video's sessions needs (SPEC §15.4).
+  return signInRequired ? analyticsHint() : analyticsExpander(entry, analyticsDeps);
 }
 
 function renderLibrary(): void {

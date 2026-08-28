@@ -1265,7 +1265,7 @@ describe("GET /beacon/{videoId}", () => {
     expect((answer.json as unknown as Listing).sessions).toHaveLength(1);
   });
 
-  it("puts CORS headers on the listing so the stats page can read it", async () => {
+  it("puts CORS headers on the listing so the library dashboard can read it", async () => {
     const videoId = randomId();
     store(videoId, 1);
     const answer = await beacon(`/beacon/${videoId}`, {

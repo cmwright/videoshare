@@ -10,8 +10,14 @@
  *   the one that must never, under any browser setting, become an error a
  *   stranger who came to watch a video has to deal with (§16.1).
  * - the beacon body — the payload format, and the AAD that binds it to one
- *   video and one session. This is the shape the stats page parses back, so the
- *   round trip below is the two halves of §16 meeting in the middle.
+ *   video and one session. This is the shape the library dashboard parses back,
+ *   so the round trip below is the two halves of §16 meeting in the middle.
+ *
+ * What `startWatchBeacon` adds on top — which event name calls which function —
+ * stays outside the Node suites, as it is today: there is no media element here,
+ * and inventing one would test the stub. That is precisely why the heat reducer
+ * is pure; the arithmetic a `pause`, a seek or a resume changes lives in
+ * `watch.ts` and is tested there (§16.9).
  *
  * `viewerId()` caches per page load, so each case re-imports the module through
  * `vi.resetModules()` — a fresh import is a fresh page load.
@@ -20,7 +26,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { analyticsAad, decryptBlock, encryptBlock, generateKey } from "../src/crypto";
 import { randomId } from "../src/util";
-import { MAX_WATCH_RANGES, parsePayload, type Range, type WatchPayload } from "../src/watch";
+import {
+  HEAT_BUCKETS,
+  MAX_WATCH_RANGES,
+  parsePayload,
+  type Range,
+  type WatchPayloadV2,
+} from "../src/watch";
 
 const VIEWER_KEY = "videoshare.viewer";
 const ID_RE = /^[A-Za-z0-9_-]{22}$/;
@@ -116,7 +128,7 @@ describe("viewerId", () => {
 
   it("reuses the id a previous visit stored", async () => {
     // The point of the key: three viewings by one browser collapse into one
-    // viewer on the stats page.
+    // viewer on the library dashboard.
     const existing = randomId();
     storage.setItem(VIEWER_KEY, existing);
 
@@ -192,12 +204,12 @@ describe("viewerId", () => {
 
 /**
  * The payload a flush builds, as JSON — the same object `beacon.ts` assembles
- * from `viewerId()`, the session id and `playedRanges()`. Written out here
- * because what is under test is the *format* both sides depend on.
+ * from `viewerId()`, the session id, `playedRanges()` and `heatMs()`. Written
+ * out here because what is under test is the *format* both sides depend on.
  */
-function body(over: Partial<WatchPayload> = {}): WatchPayload {
+function body(over: Partial<WatchPayloadV2> = {}): WatchPayloadV2 {
   return {
-    v: 1,
+    v: 2,
     browserId: randomId(),
     sessionId: randomId(),
     durationMs: 93_250,
@@ -205,6 +217,8 @@ function body(over: Partial<WatchPayload> = {}): WatchPayload {
       [0, 41_200],
       [58_000, 93_250],
     ],
+    // 50 buckets of milliseconds actually played, one per 2% (SPEC §16.2).
+    heat: Array.from({ length: HEAT_BUCKETS }, (_, b) => (b < 22 ? 1865 : 0)),
     completed: false,
     firstPlayedAt: "2026-08-27T21:04:00.000Z",
     ...over,
@@ -230,6 +244,7 @@ describe("beacon payload", () => {
     const parsed = parsePayload(JSON.parse(new TextDecoder().decode(plain)) as unknown);
 
     expect(parsed).toEqual(payload);
+    expect((parsed as WatchPayloadV2).heat).toHaveLength(HEAT_BUCKETS);
   });
 
   it("cannot be read under another session's id", async () => {
@@ -250,25 +265,31 @@ describe("beacon payload", () => {
     await expect(decryptBlock(key, analyticsAad(randomId(), payload.sessionId), block)).rejects.toThrow();
   });
 
-  it("stays inside the gateway's body cap even at MAX_WATCH_RANGES", async () => {
+  it("stays inside the gateway's body cap at its most pathological", async () => {
     // Every flush carries the whole session (§16.2), so the 16 KiB cap is a cap
-    // on an entire viewing — and MAX_WATCH_RANGES is what guarantees it. The
-    // ranges below are the most expensive shape: seven-digit millisecond
-    // boundaries throughout.
+    // on an entire viewing — and MAX_WATCH_RANGES is what guarantees it. This is
+    // the most expensive payload the format can express: 200 ranges with
+    // seven-digit millisecond boundaries throughout, *and* fifty heat buckets
+    // each holding a full day of replayed playback (eight digits apiece).
+    //
+    // §16.2 claims heat cannot grow the body the way `watched` could. That claim
+    // is this assertion, not a paragraph.
     const watched: Range[] = Array.from(
       { length: MAX_WATCH_RANGES },
       (_, i): Range => [1_000_000 + i * 9999, 1_000_000 + i * 9999 + 8888],
     );
+    const heat = Array.from({ length: HEAT_BUCKETS }, () => 86_400_000);
     const key = await generateKey();
-    const payload = body({ durationMs: 3_600_000, watched, completed: true });
+    const payload = body({ durationMs: 3_600_000, watched, heat, completed: true });
 
-    const block = await encryptBlock(
-      key,
-      analyticsAad(randomId(), payload.sessionId),
-      utf8.encode(JSON.stringify(payload)),
-    );
+    const json = utf8.encode(JSON.stringify(payload));
+    const block = await encryptBlock(key, analyticsAad(randomId(), payload.sessionId), json);
 
     expect(block.length).toBeLessThan(MAX_BEACON_BYTES);
+    // Room to spare, and heat is the small half of what is left: 50 numbers of
+    // eight digits and a comma is well under a kilobyte.
+    expect(MAX_BEACON_BYTES - block.length).toBeGreaterThan(4096);
+    expect(JSON.stringify(heat).length).toBeLessThan(1024);
   });
 
   it("is opaque: nothing about the watch is visible in the bytes", async () => {
@@ -289,6 +310,7 @@ describe("beacon payload", () => {
     expect(asText).not.toContain(payload.browserId);
     expect(asText).not.toContain(payload.sessionId);
     expect(asText).not.toContain("watched");
+    expect(asText).not.toContain("heat");
     expect(asText).not.toContain("firstPlayedAt");
   });
 });

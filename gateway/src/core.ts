@@ -115,7 +115,8 @@ export async function handleRequest(request: Request, env: GatewayEnv): Promise<
           publicBaseUrl: config.publicBaseUrl,
           googleClientId: config.googleClientId,
           // SPEC §16.4. A site that reads `false` — or reads nothing, from an
-          // older gateway — sends no beacons and shows no stats page.
+          // older gateway — sends no beacons, and its library rows grow no
+          // analytics expander (§16.6).
           analytics: instance.analytics !== null,
         },
         200,
@@ -189,7 +190,8 @@ async function handleSign(
  * Unauthenticated is not an oversight. Viewers have no identity and must never
  * be asked for one; what stands in for authorization is that the payload is
  * encrypted under a key only holders of the share link have, so an unwanted
- * write is junk the stats page counts and skips rather than data anyone can read.
+ * write is junk the library dashboard counts and skips (§16.6) rather than data
+ * anyone can read.
  */
 async function handleBeaconWrite(
   request: Request,

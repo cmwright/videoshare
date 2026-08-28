@@ -74,9 +74,10 @@ const SHARE_FRAGMENT_RE = /^([A-Za-z0-9_-]{22})\.([A-Za-z0-9_-]{43})$/;
  * Null for anything that is not exactly `{id}.{key}` — a truncated paste, a
  * bare id, an empty hash.
  *
- * The player and the stats page both come at a video this way, which is why the
- * format lives here rather than in either of them. Note that the key never
- * leaves this parse: callers turn it into a `CryptoKey` and drop the string.
+ * The player and the library dashboard both come at a video this way, which is
+ * why the format lives here rather than in either of them. Note that the key
+ * never leaves this parse: callers turn it into a `CryptoKey` and drop the
+ * string.
  */
 export function parseShareFragment(fragment: string): { id: string; keyB64: string } | null {
   let raw = fragment.startsWith("#") ? fragment.slice(1) : fragment;

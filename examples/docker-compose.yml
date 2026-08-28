@@ -132,7 +132,7 @@ services:
         # ANALYTICS_BUCKET at the public one.
         #
         # It needs no CORS for writes — the gateway writes it server-side — but
-        # the stats page fetches session objects straight from presigned URLs,
+        # the recorder page fetches session objects straight from presigned URLs,
         # so it does need GET CORS from the site's origin. That is the same
         # server-wide MINIO_API_CORS_ALLOW_ORIGIN as everything else here.
         mc mb --ignore-existing local/videoshare-analytics
@@ -143,7 +143,7 @@ services:
         #
         # GetObject on the analytics bucket looks surprising for a service that
         # never reads an object — but a presigned URL inherits the authority of
-        # the key that signed it, so without it the stats page's downloads would
+        # the key that signed it, so without it the dashboard's downloads would
         # come back 403. ListBucket is scoped to the bucket itself (no /*),
         # which is what ListObjectsV2 authorizes against, and it is granted on
         # the analytics bucket alone: video ids stay unguessable.
@@ -260,7 +260,8 @@ services:
       PUBLIC_BASE_URL: http://localhost:9000/videoshare
       # Playback analytics (SPEC §16). Comment this out and analytics is simply
       # off: /api/config answers analytics:false, the player sends no beacons,
-      # and stats.html says so. That is a supported setup, not a broken one.
+      # and the recorder's library shows no analytics at all. That is a
+      # supported setup, not a broken one.
       ANALYTICS_BUCKET: videoshare-analytics
       # Yours, from console.cloud.google.com → Clients → Create client → Web
       # application, with http://localhost and http://localhost:8080 as

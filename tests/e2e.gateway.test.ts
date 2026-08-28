@@ -43,7 +43,7 @@ import {
 import { createGatewaySigner, createUploadSession } from "../src/upload";
 import type { Signer } from "../src/upload";
 import { randomId } from "../src/util";
-import { parsePayload } from "../src/watch";
+import { HEAT_BUCKETS, parsePayload } from "../src/watch";
 import type { VideoMeta } from "../src/types";
 
 const E2E = process.env.E2E === "1";
@@ -530,11 +530,12 @@ describe.skipIf(!E2E)("gateway end-to-end", () => {
     /** What the player would send after `durationMs` of a watch (SPEC §16.2). */
     function payload(sessionId: string, watched: [number, number][]) {
       return {
-        v: 1,
+        v: 2,
         browserId: randomId(),
         sessionId,
         durationMs: 93_250,
         watched,
+        heat: Array.from({ length: HEAT_BUCKETS }, (_, b) => (b < 22 ? 1865 : 0)),
         completed: false,
         firstPlayedAt: "2026-08-27T21:04:00.000Z",
       };
@@ -663,7 +664,7 @@ describe.skipIf(!E2E)("gateway end-to-end", () => {
       // which is what a viewer's watch data actually has to survive.
       const sessionId = randomId();
       const sent = {
-        v: 1,
+        v: 2,
         browserId: randomId(),
         sessionId,
         durationMs: 93_250,
@@ -671,6 +672,7 @@ describe.skipIf(!E2E)("gateway end-to-end", () => {
           [0, 41_200],
           [58_000, 93_250],
         ],
+        heat: Array.from({ length: HEAT_BUCKETS }, (_, b) => (b < 22 ? 1865 : 0)),
         completed: false,
         firstPlayedAt: "2026-08-27T21:04:00.000Z",
       };
@@ -709,7 +711,7 @@ describe.skipIf(!E2E)("gateway end-to-end", () => {
         new TextDecoder().decode(await decryptBlock(viewerKey, analyticsAad(id, sessionId), fetched)),
       ) as unknown;
       expect(back).toEqual(sent);
-      // And it is what the stats page will accept, not merely valid JSON.
+      // And it is what the library dashboard will accept, not merely valid JSON.
       expect(parsePayload(back)).toEqual(sent);
     });
 

@@ -9,10 +9,11 @@ export default defineConfig({
   build: {
     target: "es2022",
     rollupOptions: {
+      // §1's two pages, and after §16.6 the only two: watch data is read from
+      // the library expander on index.html, not from a third page.
       input: {
         index: page("index.html"),
         view: page("view.html"),
-        stats: page("stats.html"),
       },
     },
   },

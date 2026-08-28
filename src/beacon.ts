@@ -27,7 +27,17 @@
 
 import { analyticsAad, encryptBlock } from "./crypto";
 import { randomId } from "./util";
-import { BEACON_INTERVAL_MS, isCompleted, playedRanges, type WatchPayload } from "./watch";
+import {
+  advance,
+  BEACON_INTERVAL_MS,
+  createHeatState,
+  type HeatState,
+  heatMs,
+  isCompleted,
+  playedRanges,
+  reanchor,
+  type WatchPayloadV2,
+} from "./watch";
 
 /** The only key `view.html` ever writes (SPEC §16.1). A bare string, not JSON. */
 const VIEWER_KEY = "videoshare.viewer";
@@ -65,8 +75,8 @@ let cachedViewerId: string | null = null;
 /**
  * This browser's random viewer id, persisted at `videoshare.viewer`.
  *
- * It exists so the stats page can collapse three viewings by one person into
- * one viewer, and it is inside the ciphertext — the server cannot link two
+ * It exists so the library dashboard can collapse three viewings by one person
+ * into one viewer, and it is inside the ciphertext — the server cannot link two
  * sessions to one browser even under the same video id.
  *
  * A browser that refuses storage gets an ephemeral id and is never told: a
@@ -102,9 +112,12 @@ export function viewerId(): string {
  *
  * There is no polling loop: watched ranges are read from the element's own
  * `played` at flush time, which is the browser's record of exactly this, kept
- * whether or not anyone asks. The flush timer starts at the first `play` and
- * stops at `ended` and `pagehide`, so a page left open on a finished video
- * costs nothing.
+ * whether or not anyone asks, and heat rides the element's own `timeupdate`.
+ * The flush timer starts at the first `play` and stops at `ended` and
+ * `pagehide`, so a page left open on a finished video costs nothing.
+ *
+ * Flushes happen every `BEACON_INTERVAL_MS` while that timer runs, on `pause`,
+ * on `ended`, on `visibilitychange` → hidden, and on `pagehide` (SPEC §16.5).
  */
 export function startWatchBeacon(video: HTMLMediaElement, opts: BeaconOptions): WatchBeacon {
   /** One session = one page load = one storage object (SPEC §16.1). */
@@ -113,6 +126,13 @@ export function startWatchBeacon(video: HTMLMediaElement, opts: BeaconOptions): 
   const aad = analyticsAad(opts.videoId, sessionId);
 
   let firstPlayedAt: string | null = null;
+  /**
+   * Time spent per 2% bucket, accumulated from the element's own `timeupdate`
+   * (SPEC §16.5). There is no clock of ours behind this: the deltas are media
+   * time, so a viewer at 2× accumulates the same heat over a stretch as one at
+   * 1×, and a paused tab contributes nothing because nothing fires.
+   */
+  let heat: HeatState = createHeatState();
   let timer: number | null = null;
   /** One flush in flight at a time, so two cumulative states cannot race to the same key. */
   let sending = false;
@@ -140,14 +160,17 @@ export function startWatchBeacon(video: HTMLMediaElement, opts: BeaconOptions): 
     // is not a session (SPEC §16.5).
     if (watched.length === 0) return null;
 
-    const body: WatchPayload = {
-      v: 1,
+    const body: WatchPayloadV2 = {
+      v: 2,
       // Minted here rather than at start-up: the localStorage key is written
       // only when a beacon is actually about to be sent (SPEC §16.1).
       browserId: viewerId(),
       sessionId,
       durationMs,
       watched,
+      // Time spent, where `watched` is seen-at-least-once. The two ship together
+      // because they answer different questions (SPEC §16.2).
+      heat: heatMs(heat),
       completed: isCompleted(watched, durationMs),
       firstPlayedAt,
     };
@@ -188,9 +211,36 @@ export function startWatchBeacon(video: HTMLMediaElement, opts: BeaconOptions): 
     timer = null;
   };
 
+  /** Where the video is now, in milliseconds — the unit `watch.ts` works in. */
+  const positionMs = (): number => video.currentTime * 1000;
+
   const onPlay = (): void => {
     firstPlayedAt ??= new Date().toISOString();
+    // The delta across a pause is not playback, however long the pause was, so
+    // the resume re-anchors rather than counting it (SPEC §16.5).
+    heat = reanchor(heat, positionMs());
     startTimer();
+  };
+
+  /**
+   * The browser fires this only while playback is progressing, a few times a
+   * second — which is exactly the sampling `advance` is built for, and the
+   * reason there is no timer here.
+   */
+  const onTimeUpdate = (): void => {
+    heat = advance(heat, positionMs(), duration());
+  };
+
+  /** A scrub loses the delta across itself, so it adds ~nothing (SPEC §16.5). */
+  const onSeek = (): void => {
+    heat = reanchor(heat, positionMs());
+  };
+
+  const onPause = (): void => {
+    // Immediate, and no debounce: browsers fire `pause` just before `ended`, and
+    // the flush refuses to re-send a body identical to the last one accepted, so
+    // the pair costs one write rather than two (SPEC §16.5).
+    flush();
   };
 
   const onEnded = (): void => {
@@ -210,13 +260,21 @@ export function startWatchBeacon(video: HTMLMediaElement, opts: BeaconOptions): 
     stopped = true;
     stopTimer();
     video.removeEventListener("play", onPlay);
+    video.removeEventListener("pause", onPause);
     video.removeEventListener("ended", onEnded);
+    video.removeEventListener("timeupdate", onTimeUpdate);
+    video.removeEventListener("seeking", onSeek);
+    video.removeEventListener("seeked", onSeek);
     document.removeEventListener("visibilitychange", onVisibility);
     window.removeEventListener("pagehide", stop);
   };
 
   video.addEventListener("play", onPlay);
+  video.addEventListener("pause", onPause);
   video.addEventListener("ended", onEnded);
+  video.addEventListener("timeupdate", onTimeUpdate);
+  video.addEventListener("seeking", onSeek);
+  video.addEventListener("seeked", onSeek);
   document.addEventListener("visibilitychange", onVisibility);
   window.addEventListener("pagehide", stop);
 
