@@ -1,114 +1,310 @@
-/* Player page (view.html). Design tokens come from app.css, loaded first. */
+/* Share page (view.html). Shared tokens and base styles come from app.css,
+   loaded first; everything here is page-local.
 
-.page {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-4);
-  min-height: 100vh;
-  max-width: 960px;
-  margin: 0 auto;
-  padding: var(--space-6) var(--space-4) var(--space-4);
+   Design thesis: the video is the only hero. Wordmark, title, meta and footer
+   are quiet chrome at 12–20px in neutral gray; the accent appears in the logo
+   mark, links, focus rings and the spinner head, and nowhere else. Elevation is
+   a hairline plus a soft shadow in light mode, a hairline alone in dark.
+
+   Every state — cold load, warm buffering, autoplay blocked, error, JS off —
+   occupies the player's footprint, so the layout never jumps between them. */
+
+:root {
+  /* Page-local radii. The shared --radius-* scale is left alone for the recorder. */
+  --radius-stage: 12px;
+  --radius-card: 12px;
+  --radius-chip: 8px;
+  --radius-pill: 999px;
+
+  --topbar-height: 56px;
+  --column-width: 1040px;
+  --gutter: var(--space-5);
+
+  /* Stage height budget: keeps the whole player above the fold on a 13" laptop.
+     svh (not vh) so mobile browser chrome cannot push the controls off-screen. */
+  --stage-vh: 72vh;
+
+  /* The stage's rendered height, recomputed here so a state panel can stand in
+     for the player's footprint without an aspect-ratio box of its own — an
+     aspect-ratio box with a hard min-height cannot grow, and a 300-character
+     error detail at 360px would be clipped instead of wrapping. As a floor it
+     only ever adds height, so long copy still expands the panel. */
+  --stage-height: min(
+    calc((min(var(--column-width), 100vw) - 2 * var(--gutter)) * 9 / 16),
+    var(--stage-vh)
+  );
+
+  /* The video surface is its own environment and must not re-tint per theme —
+     a light-mode overlay over a near-black frame would be unreadable. These
+     four are deliberately absent from the dark block below. */
+  --stage-bg: #08090b; /* not #000: pairs with the hairline instead of punching a hole in the page */
+  --on-stage-accent: #60a5fa; /* the light-mode accent is too dark on near-black */
+  --on-stage-text: rgb(255 255 255 / 0.82);
+  --on-stage-faint: rgb(255 255 255 / 0.55);
+  --on-stage-chip: rgb(12 14 18 / 0.72);
+  --on-stage-hairline: rgb(255 255 255 / 0.12);
+  --scrim: rgb(8 9 11 / 0.55);
+
+  /* A ring, not a border: the aspect box stays exactly 16:9. */
+  --stage-ring: 0 0 0 1px rgb(16 20 26 / 0.1), var(--shadow-md);
 }
 
-/* Title + date/duration, revealed once meta.json decrypts */
+@supports (width: 1svh) {
+  :root {
+    --stage-vh: 72svh;
+  }
+}
 
-.video-header {
+@media (prefers-color-scheme: dark) {
+  :root {
+    /* No drop shadow: a black shadow on near-black is invisible. The inset
+       highlight is what separates the stage from the page instead. */
+    --stage-ring: 0 0 0 1px #2a3039, inset 0 1px 0 rgb(255 255 255 / 0.04);
+  }
+}
+
+/* --- Page frame ----------------------------------------------------------- */
+
+body {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  min-height: 100svh;
+}
+
+.page {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: var(--column-width);
+  margin: 0 auto;
+  padding: var(--space-6) var(--gutter);
+}
+
+/* --- Topbar --------------------------------------------------------------- */
+
+.topbar {
+  flex: none;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.topbar-inner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  height: var(--topbar-height);
+  max-width: var(--column-width);
+  margin: 0 auto;
+  padding: 0 var(--gutter);
+}
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.2;
+  letter-spacing: -0.006em;
+  text-decoration: none;
+}
+
+.brand:hover {
+  color: var(--accent);
+}
+
+.brand:focus-visible {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.brand-mark {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  display: block;
+}
+
+/* A 16:9 frame with a play triangle — the page's single accent moment
+   besides links and focus rings. */
+.brand-mark-frame {
+  fill: var(--accent);
+}
+
+.brand-mark-play {
+  fill: var(--accent-contrast);
+  stroke-linejoin: round;
+}
+
+.badge-secure {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  background: var(--surface-sunken);
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.badge-lock {
+  flex: none;
+  width: 12px;
+  height: 12px;
+  display: block;
+}
+
+.badge-lock-body {
+  fill: var(--text-faint);
+}
+
+.badge-lock-shackle {
+  fill: none;
+  stroke: var(--text-faint);
+  stroke-width: 1.5;
+  stroke-linecap: round;
+}
+
+/* --- Title + meta, revealed once meta.json decrypts ----------------------- */
+
+.title-block,
+.title-skeleton {
+  margin-bottom: var(--space-4);
+}
+
+.title-block {
   display: flex;
   flex-direction: column;
   gap: var(--space-1);
 }
 
 #video-title {
-  font-size: 1.35rem;
+  color: var(--text);
+  font-size: 20px;
+  font-weight: 600;
+  line-height: 1.3;
+  letter-spacing: -0.015em;
+  text-wrap: balance;
   overflow-wrap: anywhere;
+  /* A pasted 200-character title must not shove the player below the fold. */
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
 }
 
 .video-meta {
   color: var(--text-muted);
-  font-size: 0.875rem;
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 1.45;
+  font-variant-numeric: tabular-nums;
 }
 
-/* Video */
+/* Skeleton: two bars standing in for a title that has not decrypted yet. */
+
+.title-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.skeleton-bar {
+  display: block;
+  max-width: 100%;
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  /* Opacity, not a sweeping gradient shimmer — wrong register for this product. */
+  animation: skeleton-pulse 1.6s ease-in-out infinite;
+}
+
+.skeleton-bar-title {
+  width: 260px;
+  height: 20px;
+}
+
+.skeleton-bar-meta {
+  width: 148px;
+  height: 12px;
+}
+
+@keyframes skeleton-pulse {
+  50% {
+    opacity: 0.55;
+  }
+}
+
+/* The real title replaces the skeleton; so does an error panel. No JS involved. */
+
+#video-header:not(.hidden) ~ .title-skeleton,
+.page:has(#error-card:not(.hidden)) .title-skeleton {
+  display: none;
+}
+
+/* --- Stage ---------------------------------------------------------------- */
 
 .stage {
   position: relative;
   aspect-ratio: 16 / 9;
-  max-height: 78vh;
+  /* Hug the video's shape on short/wide windows rather than growing black
+     side-bars, and stay fully visible without scrolling. */
+  width: min(100%, calc(var(--stage-vh) * 16 / 9));
+  margin-inline: auto;
   overflow: hidden;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  background: #000;
-  box-shadow: var(--shadow-md);
+  border-radius: var(--radius-stage);
+  background: var(--stage-bg);
+  box-shadow: var(--stage-ring);
 }
 
-.stage video {
+#video {
   display: block;
   width: 100%;
   height: 100%;
   object-fit: contain;
-  background: #000;
+  /* The stage carries the letterbox colour, so an off-aspect recording
+     letterboxes into the same near-black instead of a second, darker box. */
+  background: transparent;
 }
 
-.play-overlay {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: var(--space-3);
-  background: rgb(0 0 0 / 0.45);
-}
+/* Native controls stay. ::-webkit-media-controls is deliberately untouched:
+   it is fragile, browser-specific, and a hand-rolled skin looks worse than
+   the OS one it replaces. */
 
-.play-button {
-  width: 72px;
-  height: 72px;
-  padding: 0;
-  border: none;
-  border-radius: 50%;
-  background: #fff;
-  color: #14181f;
-  box-shadow: 0 4px 16px rgb(0 0 0 / 0.35);
-  transition: transform 0.12s ease, background-color 0.12s ease;
-}
-
-.play-button:hover:not(:disabled) {
-  background: #fff;
-  border-color: transparent;
-  transform: scale(1.05);
-}
-
-.play-button svg {
-  width: 30px;
-  height: 30px;
-  margin-left: 4px; /* optically centre the triangle in the circle */
-}
-
-.play-hint {
-  color: rgb(255 255 255 / 0.85);
-  font-size: 0.875rem;
-  text-align: center;
-}
-
-/* Loading status */
+/* --- 10.1 / 10.2  Loading and buffering ----------------------------------- */
 
 .status {
+  position: absolute;
+  z-index: 1;
   display: flex;
   align-items: center;
-  gap: var(--space-2);
-  min-height: 1.25rem;
-  color: var(--text-muted);
-  font-size: 0.875rem;
+  margin: 0;
+  color: var(--on-stage-text);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.2;
+  /* Never intercept a click meant for the video or its controls. */
+  pointer-events: none;
+}
+
+#status-text {
+  font-variant-numeric: tabular-nums;
 }
 
 .spinner {
   flex: none;
-  width: 12px;
-  height: 12px;
-  border: 2px solid var(--border-strong);
-  border-top-color: var(--accent);
+  border: 2px solid var(--on-stage-hairline);
+  border-top-color: var(--on-stage-accent);
   border-radius: 50%;
-  animation: spin 0.7s linear infinite;
+  animation: spin 0.8s linear infinite;
 }
 
 @keyframes spin {
@@ -117,63 +313,391 @@
   }
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .spinner {
-    animation-duration: 2.4s;
-  }
-  .play-button {
-    transition: none;
+/* Cold: nothing has painted yet, so the status owns the whole stage. */
+
+#stage:not(.has-frames) .status {
+  inset: 0;
+  flex-direction: column;
+  justify-content: center;
+  gap: var(--space-3);
+  background: var(--stage-bg);
+}
+
+#stage:not(.has-frames) .spinner {
+  width: 22px;
+  height: 22px;
+}
+
+/* Warm: a frame is on screen, so the same element shrinks to a corner pill.
+   Top-left, never bottom — the native controls live there. */
+
+#stage.has-frames .status {
+  top: var(--space-3);
+  left: var(--space-3);
+  gap: var(--space-2);
+  padding: 6px 12px;
+  border: 1px solid var(--on-stage-hairline);
+  border-radius: var(--radius-pill);
+  background: var(--on-stage-chip);
+  backdrop-filter: blur(8px) saturate(120%);
+  -webkit-backdrop-filter: blur(8px) saturate(120%);
+  animation: status-in 0.16s ease both;
+}
+
+#stage.has-frames .spinner {
+  width: 12px;
+  height: 12px;
+}
+
+/* `.hidden` is display:none, so the pill can only be transitioned in. */
+@keyframes status-in {
+  from {
+    opacity: 0;
   }
 }
 
-/* Errors */
+/* --- 10.3  Autoplay blocked ----------------------------------------------- */
 
-.error-card {
+.play-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
   display: flex;
   flex-direction: column;
-  gap: var(--space-2);
-  border-color: color-mix(in srgb, var(--danger) 40%, var(--border));
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-3);
+  background: var(--scrim);
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
 }
 
-.error-card h2 {
-  color: var(--danger);
+.play-button {
+  width: 64px;
+  height: 64px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: #ffffff;
+  color: #10141a;
+  box-shadow: 0 6px 24px rgb(0 0 0 / 0.45);
+  transition: transform 0.12s ease;
 }
 
-.error-card p {
+.play-button:hover:not(:disabled) {
+  background: #ffffff;
+  border-color: transparent;
+  transform: scale(1.04);
+}
+
+/* This button sits over arbitrary video frames, so the accent ring is not
+   dependable: white outline for dark frames, dark halo for white ones. */
+.play-button:focus-visible {
+  outline: 2px solid #ffffff;
+  outline-offset: 3px;
+  box-shadow: 0 6px 24px rgb(0 0 0 / 0.45), 0 0 0 6px rgb(8 9 11 / 0.55);
+}
+
+.play-button svg {
+  width: 28px;
+  height: 28px;
+  margin-left: 3px; /* optically centre the triangle in the circle */
+}
+
+.play-hint {
+  max-width: 30ch;
+  color: var(--on-stage-text);
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 1.45;
+  text-align: center;
+  text-wrap: balance; /* keeps "press play" off a line of its own */
+}
+
+/* --- 10.4  Errors, and 10.5 <noscript> ------------------------------------ */
+
+/* Panel variant — the default, and the common case: the error landed before a
+   frame painted, so player.ts hid the stage and this takes over its footprint.
+   Equivalent to `#stage.hidden ~ #error-card`, written as the base so the
+   <noscript> panel (styled by the head-injected rule) inherits it too.
+
+   The title stays --text, not red: a red headline on a red-tinted card is the
+   debug-console look. One red glyph is the product look. */
+
+.state-panel {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  width: min(100%, calc(var(--stage-vh) * 16 / 9));
+  min-height: max(280px, var(--stage-height));
+  margin-inline: auto;
+  padding: var(--space-6);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+  text-align: center;
+}
+
+@media (prefers-color-scheme: dark) {
+  .state-panel {
+    box-shadow: none;
+  }
+}
+
+.state-icon {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  margin-bottom: var(--space-4);
+  border-radius: var(--radius-md);
+  background: var(--danger-soft);
+}
+
+.state-glyph {
+  width: 20px;
+  height: 20px;
+  display: block;
+}
+
+.state-glyph-ring,
+.state-glyph-bar {
+  fill: none;
+  stroke: var(--danger);
+  stroke-width: 1.6;
+  stroke-linecap: round;
+}
+
+.state-glyph-dot {
+  fill: var(--danger);
+}
+
+.state-panel h2 {
+  color: var(--text);
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1.35;
+  letter-spacing: -0.01em;
+}
+
+.state-panel p {
+  margin-top: var(--space-2);
+  max-width: 52ch;
   color: var(--text-muted);
+  font-size: 14px;
+  font-weight: 400;
+  line-height: 1.55;
+  text-wrap: pretty;
+  /* Detail strings carry CORS header names and bare bucket URLs. */
   overflow-wrap: anywhere;
 }
 
-/* Footer */
+/* No buttons anywhere in here: player.ts has no retry path, and a dead button
+   is worse than none. */
 
-.footer {
-  margin-top: auto;
-  padding-top: var(--space-5);
-  text-align: center;
-  font-size: 0.8125rem;
+/* Banner variant — the player is still on screen (a mid-playback media error),
+   so the error becomes a compact row beneath it instead of a second 16:9 box. */
+
+#stage:not(.hidden) ~ #error-card {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  column-gap: var(--space-3);
+  align-items: start;
+  width: min(100%, calc(var(--stage-vh) * 16 / 9));
+  min-height: 0;
+  margin-top: var(--space-4);
+  padding: var(--space-4);
+  border-color: var(--danger-border);
+  background: var(--danger-soft);
+  text-align: left;
 }
 
-.footer a {
+#stage:not(.hidden) ~ #error-card .state-icon {
+  grid-row: 1 / span 2;
+  width: 20px;
+  height: 20px;
+  margin-bottom: 0;
+  border-radius: 0;
+  background: none;
+}
+
+#stage:not(.hidden) ~ #error-card h2 {
+  font-size: 15px;
+}
+
+#stage:not(.hidden) ~ #error-card p {
+  max-width: none;
+  font-size: 13px;
+}
+
+/* --- Footer --------------------------------------------------------------- */
+
+.site-footer {
+  flex: none;
+  border-top: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.5;
+}
+
+.footer-inner {
+  max-width: var(--column-width);
+  margin: 0 auto;
+  padding: var(--space-5) var(--gutter);
+  text-align: center;
+}
+
+.site-footer a {
   color: var(--text-faint);
   text-decoration: none;
 }
 
-.footer a:hover {
+.site-footer a:hover {
   color: var(--accent);
   text-decoration: underline;
 }
 
+.site-footer a:focus-visible {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+/* --- Responsive ----------------------------------------------------------- */
+
 @media (max-width: 600px) {
-  .page {
-    padding: var(--space-4) var(--space-3) var(--space-3);
+  :root {
+    --topbar-height: 52px;
+    --gutter: var(--space-4);
+    --radius-stage: 10px;
   }
 
-  .stage {
-    border-radius: var(--radius-md);
+  .page {
+    padding: var(--space-5) var(--gutter);
+  }
+
+  .title-block,
+  .title-skeleton {
+    margin-bottom: var(--space-3);
+  }
+
+  #video-title {
+    font-size: 18px;
+  }
+
+  .skeleton-bar-title {
+    width: 200px;
   }
 
   .play-button {
-    width: 60px;
-    height: 60px;
+    width: 56px;
+    height: 56px;
+  }
+
+  .state-panel {
+    padding: var(--space-5);
+  }
+
+  .state-icon {
+    margin-bottom: var(--space-3);
+  }
+
+  .footer-inner {
+    padding: var(--space-4) var(--gutter);
+  }
+
+  /* The badge collapses to the lock alone; the label stays in the accessibility
+     tree rather than being replaced by an aria-label on a non-focusable span. */
+  .badge-secure {
+    padding: 5px;
+  }
+
+  .badge-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+}
+
+/* Landscape phone: the topbar plus the player have to fit without scrolling. */
+@media (max-height: 520px) {
+  :root {
+    --topbar-height: 48px;
+    /* A share of the viewport is not enough here: at 390px tall the topbar and
+       the title line are most of the budget, so subtract them outright and the
+       whole player fits above the fold instead of 84% of a number it can't
+       afford. 140px = topbar 48 + page padding 24 + title block 58, rounded up. */
+    --stage-vh: calc(100vh - 140px);
+  }
+
+  .page {
+    padding-block: var(--space-3);
+  }
+
+  .title-block,
+  .title-skeleton {
+    margin-bottom: var(--space-3);
+  }
+
+  /* In a 390px-tall window a second title line costs more than it is worth:
+     it is the one thing that would push the player below the fold. */
+  #video-title {
+    -webkit-line-clamp: 1;
+    line-clamp: 1;
+  }
+
+  .site-footer {
+    display: none;
+  }
+}
+
+@supports (width: 1svh) {
+  @media (max-height: 520px) {
+    :root {
+      --stage-vh: calc(100svh - 140px);
+    }
+  }
+}
+
+/* --- Reduced motion ------------------------------------------------------- */
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  .skeleton-bar {
+    animation: none;
+    opacity: 0.7;
+  }
+
+  .play-button {
+    transition: none;
+  }
+
+  .play-button:hover:not(:disabled) {
+    transform: none;
+  }
+
+  #stage.has-frames .status {
+    animation: none;
+  }
+
+  /* The spinner keeps turning, slower and dimmer. A single 12–22px indicator is
+     a status affordance, not vestibular motion — removing it would leave the
+     viewer unable to tell a working page from a hung one. */
+  .spinner {
+    animation-duration: 1.5s;
+    border-top-color: color-mix(in srgb, var(--on-stage-accent) 65%, transparent);
   }
 }

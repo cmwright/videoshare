@@ -30,12 +30,15 @@ import { randomId } from "./util";
 import {
   advance,
   BEACON_INTERVAL_MS,
+  beginSeek,
   createHeatState,
+  endSeek,
   type HeatState,
   heatMs,
   isCompleted,
   playedRanges,
   reanchor,
+  syncSeek,
   type WatchPayloadV2,
 } from "./watch";
 
@@ -226,14 +229,47 @@ export function startWatchBeacon(video: HTMLMediaElement, opts: BeaconOptions): 
    * The browser fires this only while playback is progressing, a few times a
    * second — which is exactly the sampling `advance` is built for, and the
    * reason there is no timer here.
+   *
+   * `syncSeek` runs first because `seeked` is the only event that ends a seek,
+   * and one that never arrives — a `load()` or an `src` swap, a browser
+   * abandoning a seek across a fullscreen transition — would suppress every
+   * remaining delta of the session while `watched` and coverage still looked
+   * normal. The element's own `seeking` is the state `seeked` is queued from, so
+   * this costs nothing when the event does arrive (SPEC §16.5).
    */
   const onTimeUpdate = (): void => {
-    heat = advance(heat, positionMs(), duration());
+    const at = positionMs();
+    heat = syncSeek(heat, video.seeking, at);
+    heat = advance(heat, at, duration());
   };
 
-  /** A scrub loses the delta across itself, so it adds ~nothing (SPEC §16.5). */
-  const onSeek = (): void => {
-    heat = reanchor(heat, positionMs());
+  /**
+   * A seek is in flight until it lands, and nothing in between is playback
+   * (SPEC §16.5).
+   *
+   * These two are not symmetric, and that is the point. A drag across the
+   * scrubber fires `seeking` on every pointer move — the element aborts the
+   * seek in progress and starts another, so only the last one is ever
+   * `seeked` — and it keeps firing `timeupdate` at the positions being scanned
+   * past. Re-anchoring on each `seeking` left every one of those steps looking
+   * exactly like playback, which painted a scanned span with heat nobody
+   * watched. Suppressing the whole interval is the only rule that does not
+   * depend on how a browser happens to interleave the two events.
+   *
+   * No other *event* clears the flag. `play` re-anchors and leaves it set (a
+   * viewer can hit play with the scrubber still held); `ratechange` changes the
+   * size of the next delta and not its meaning; a stall's `waiting`/`playing`
+   * pair does not move `currentTime`, and a seek that rebuffers fires them
+   * mid-flight where treating them as a resume would reopen exactly this leak.
+   * The one thing that does clear it besides `seeked` is the element's own
+   * `seeking` reading false — see `onTimeUpdate`.
+   */
+  const onSeeking = (): void => {
+    heat = beginSeek(heat);
+  };
+
+  const onSeeked = (): void => {
+    heat = endSeek(heat, positionMs());
   };
 
   const onPause = (): void => {
@@ -263,8 +299,8 @@ export function startWatchBeacon(video: HTMLMediaElement, opts: BeaconOptions): 
     video.removeEventListener("pause", onPause);
     video.removeEventListener("ended", onEnded);
     video.removeEventListener("timeupdate", onTimeUpdate);
-    video.removeEventListener("seeking", onSeek);
-    video.removeEventListener("seeked", onSeek);
+    video.removeEventListener("seeking", onSeeking);
+    video.removeEventListener("seeked", onSeeked);
     document.removeEventListener("visibilitychange", onVisibility);
     window.removeEventListener("pagehide", stop);
   };
@@ -273,8 +309,8 @@ export function startWatchBeacon(video: HTMLMediaElement, opts: BeaconOptions): 
   video.addEventListener("pause", onPause);
   video.addEventListener("ended", onEnded);
   video.addEventListener("timeupdate", onTimeUpdate);
-  video.addEventListener("seeking", onSeek);
-  video.addEventListener("seeked", onSeek);
+  video.addEventListener("seeking", onSeeking);
+  video.addEventListener("seeked", onSeeked);
   document.addEventListener("visibilitychange", onVisibility);
   window.addEventListener("pagehide", stop);
 

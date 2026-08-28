@@ -638,8 +638,9 @@ about the viewer:
 - `heat` — exactly `HEAT_BUCKETS` (50) non-negative integers, one per 2% of *this
   session's own* `durationMs`. Entry *b* is the **milliseconds of actual playback**
   spent inside bucket *b*, accumulated during playback by §16.5's rule and **not** a
-  union: a section watched twice holds roughly twice its own length, and scrubbing
-  across the video adds ~nothing. This is the "time spent" number `watched` refuses to
+  union: a section watched twice holds roughly twice its own length, a section watched
+  once holds roughly its own length whatever the browser's sampling cadence, and
+  scrubbing across the video adds nothing. This is the "time spent" number `watched` refuses to
   be, and the two ship together because they answer different questions. All zeros is
   a legitimate value (a session whose duration was never known — see §16.5).
 - `completed` — `coverage ≥ COMPLETION_THRESHOLD` (0.9), recomputed at every flush by
@@ -820,10 +821,14 @@ export function coverage(ranges: readonly Range[], durationMs: number): number; 
 export function isCompleted(ranges: readonly Range[], durationMs: number): boolean;
 
 // Heat accumulation: a pure reducer; `beacon.ts` holds one state and feeds it events.
-export interface HeatState { readonly heat: readonly number[]; readonly lastMs: number | null; }
+export interface HeatState { readonly heat: readonly number[]; readonly lastMs: number | null;
+  readonly seeking: boolean; }
 export function createHeatState(buckets?: number): HeatState;
 export function advance(state: HeatState, currentMs: number, durationMs: number): HeatState;
 export function reanchor(state: HeatState, currentMs: number): HeatState;
+export function beginSeek(state: HeatState): HeatState;                  // `seeking`
+export function endSeek(state: HeatState, currentMs: number): HeatState; // `seeked`
+export function syncSeek(state: HeatState, elementSeeking: boolean, currentMs: number): HeatState;
 export function heatMs(state: HeatState): number[];    // rounded integers, length = buckets
 
 // Heat reading: what the dashboard aggregates from decrypted payloads.
@@ -850,28 +855,92 @@ structural type the real `TimeRanges` satisfies.
 **Heat accumulation**, pinned exactly, because two sides have to agree on it and a
 seek must never look like watching:
 
-- `HeatState` is immutable — `advance` and `reanchor` return a new state and mutate
+- `HeatState` is immutable — every function here returns a new state and mutates
   nothing, so a test can hold both sides of a step. `createHeatState()` is all-zero
-  heat and `lastMs: null` (no observation point yet).
+  heat, `lastMs: null` (no observation point yet) and `seeking: false`.
 - `advance(state, currentMs, durationMs)` is one `timeupdate`. With
   `deltaMs = currentMs - state.lastMs`:
   - `state.lastMs === null` → no delta exists; the call only sets the observation
     point to `currentMs`.
+  - `state.seeking` → **discarded**, whatever the delta is (below). The observation
+    point still moves.
   - `deltaMs ≤ 0` or `deltaMs > MAX_PLAYBACK_DELTA_MS` → **discarded**. A backwards
     step is a seek back, a step over 1.5 s is a seek forward or a stall the viewer did
     not watch through, and neither is playback. The observation point still moves to
     `currentMs`, so the next step is measured from where the video actually is.
-  - otherwise `deltaMs` is added to bucket
-    `min(HEAT_BUCKETS - 1, max(0, floor(currentMs / durationMs * HEAT_BUCKETS)))` —
-    the bucket of the **arriving** position, whole. A delta straddling a boundary is
-    not split: the error is under 1.5 s per boundary crossing, and splitting would buy
-    precision nothing downstream can use.
+  - otherwise `deltaMs` is **pro-rated across the buckets its own media-time span
+    `[state.lastMs, currentMs]` covers**, each bucket taking the milliseconds actually
+    spent inside it. Writing `w = durationMs / HEAT_BUCKETS`,
+    `first = bucket(state.lastMs)` and `last = bucket(currentMs)` for the clamped
+    `bucket(t) = min(HEAT_BUCKETS - 1, max(0, floor(t / durationMs · HEAT_BUCKETS)))`:
+
+    ```
+    first = last  →  heat[first] += currentMs - state.lastMs
+
+    otherwise, for b in first..last:
+        from = (b = first) ? state.lastMs : b·w
+        to   = (b = last)  ? currentMs    : (b+1)·w
+        heat[b] += max(0, to - from)
+    ```
+
+    The span is walked as a contiguous chain — `state.lastMs` → the first boundary
+    above it → … → `last·w` → `currentMs` — so the pieces sum to `deltaMs` **exactly**,
+    and the end buckets swallow whatever part of the span lies outside `[0, durationMs]`
+    (an element reporting a frame past its own duration, or a negative position). No
+    rounding happens here; `heatMs` rounds once, at the end, so a bucket can be off by
+    at most half a millisecond.
+  - Pro-rating is not a refinement, it is the rule the picture depends on. Crediting a
+    delta whole to the arriving bucket is only harmless while a bucket is much wider
+    than a step, and **it is not**: a 27 s recording has 540 ms buckets against a
+    ~250 ms foreground cadence, so buckets took 2 or 3 whole steps at random and an
+    even watch rendered as a ±39% sawtooth; and a single accepted step can be nearly
+    three times a bucket wide (1.5 s against 540 ms), landing whole and spiking one
+    bucket to 2.8× a full pass out of nothing. The invariant this restores is the one
+    §16.6 reads as a number: **one pass through a stretch, at any cadence, puts at most
+    one bucket-span in a bucket**, so a bar at 2× means the stretch really was played
+    twice.
   - `durationMs` not finite or `≤ 0` → there is no bucket to name, so every delta is
     discarded and heat stays all zeros while the observation point still advances. A
     session that only ever learns its duration mid-playback therefore accumulates from
     that moment on, and one that never learns it ships 50 zeros (§16.2).
 - `reanchor(state, currentMs)` sets the observation point to `currentMs` and touches
-  no bucket. It is what a discontinuity costs: the delta across it is dropped.
+  no bucket. It is what a discontinuity costs: the delta across it is dropped. It
+  **preserves `seeking`** — a viewer can hit `play` with the scrubber still held, and
+  only `seeked` ends a seek.
+- `beginSeek(state)` sets `seeking` and is **idempotent**; `endSeek(state, currentMs)`
+  clears it and re-anchors to `currentMs`. A drag is not one seek: the element aborts
+  the seek in progress and starts another on every pointer move, so `seeking` fires
+  many times and only the last one is ever `seeked`. Between the two, every position
+  the element reports is a place the viewer is scanning past, and a hop small enough
+  to pass for playback — a few hundred milliseconds of a slow drag — is
+  indistinguishable from it at the only place that decision is made. Suppressing the
+  whole interval is therefore the rule, not re-anchoring at each end of it: that left
+  a scanned span painted with heat nobody watched, which on the reported session
+  showed as the last buckets reading ~2× and one bucket at ~3.9× though nothing was
+  rewatched. `endSeek` clears the flag **even when `currentMs` is not finite** (keeping
+  the old anchor): suppression that could stick would cost a session all of its heat,
+  a worse failure than the leak it closes.
+- `syncSeek(state, elementSeeking, currentMs)` is the other half of that same rule, and
+  the only thing besides `endSeek` that ends a seek: with `state.seeking` set and
+  `elementSeeking` false it is `endSeek(state, currentMs)`, and otherwise it returns
+  `state` untouched. `elementSeeking` is the media element's own `seeking` attribute,
+  passed in because this module takes no DOM. It exists because `seeked` is the only
+  *event* that ends a seek, so a `seeked` that never arrives would suppress the rest of
+  the session — every later delta discarded, while `watched`, coverage and `completed`
+  come off `video.played` and look untouched, making the undercount **invisible** rather
+  than merely wrong. Two ways to get there: a `load()` or an `src` swap mid-session (the
+  media load algorithm clears `seeking` and fires no `seeked`), and a browser abandoning
+  a seek across a fullscreen or backgrounding transition. Neither is reachable through
+  today's app code — `player.ts` sets `src` once, before playback — which is what makes
+  this a guard rather than a bug fix.
+
+  It is not a second opinion about whether a seek is in flight, and not a way back into
+  the leak above: it reads the very state whose clearing is what queues `seeked`. A
+  completed seek clears `seeking`, queues `timeupdate`, *then* queues `seeked`, so in a
+  conforming browser this ends the seek one task early at the position `seeked` is about
+  to report — no bucket changes hands. And a drag holds `elementSeeking` true for as
+  long as it is aborting one seek and starting the next, so the first moment it reads
+  false is a moment a seek has landed.
 - `heatMs(state)` rounds each bucket to an integer. Accumulation itself is in floating
   milliseconds — rounding 4 times a second would drift by minutes over a long video.
 - Heat is **media time, not wall-clock time**: the deltas come from `currentTime`, so a
@@ -967,14 +1036,32 @@ export function viewerId(): string;              // `videoshare.viewer`; in-memo
   already refuses to re-send a body identical to the last one the browser accepted, so
   the pair costs one write, not two.
 - Heat (§16.2) is accumulated with `watch.ts`'s reducer over one `HeatState` held for
-  the session: every `timeupdate` calls `advance(state, video.currentTime * 1000,
-  durationMs)` — the browser fires it only while playback is progressing, a few times
-  a second — and `seeking`, `seeked` and `play` call `reanchor(state,
-  video.currentTime * 1000)` instead. That is the whole reset rule: a scrub loses the
-  delta across itself and adds ~nothing, a pause of any length adds nothing because
-  the `play` on the other side re-anchors, and a section watched twice accumulates
-  about twice its own length. `heatMs(state)` is read at flush time, beside
-  `playedRanges`.
+  the session: every `timeupdate` calls `syncSeek(state, video.seeking, currentMs)` and
+  then `advance(state, currentMs, durationMs)` for `currentMs = video.currentTime *
+  1000` — the browser fires it only while playback is progressing, a few times
+  a second — `play` calls `reanchor(state, video.currentTime * 1000)`, `seeking` calls
+  `beginSeek(state)` and `seeked` calls `endSeek(state, video.currentTime * 1000)`.
+  That is the whole reset rule: a scrub adds **nothing**, because the entire interval
+  between `seeking` and `seeked` is suppressed rather than merely re-anchored at each
+  end; a pause of any length adds nothing because the `play` on the other side
+  re-anchors; and a section watched twice accumulates about twice its own length.
+  `heatMs(state)` is read at flush time, beside `playedRanges`.
+- **No other event ends a seek**, and the three that look like they should are each a
+  reason not to. `play` re-anchors and leaves the flag set — a viewer can hit play with
+  the scrubber still held. `ratechange` changes the size of the next delta, not its
+  meaning (and past ~6× at a foreground cadence the deltas simply exceed
+  `MAX_PLAYBACK_DELTA_MS`, as above). A stall's `waiting`/`playing` pair does not move
+  `currentTime` at all, so it needs no handling — and a seek that rebuffers fires that
+  same pair mid-flight, where treating `playing` as a resume would reopen exactly this
+  leak. None of the three is wired.
+- The failsafe is **not** an event and not a timer: it is the `syncSeek` call above,
+  reading the element's own `seeking` on the `timeupdate` that already fires. `seeked`
+  being the sole event that ends a seek is what makes a dropped one so expensive — the
+  session keeps flushing, `watched` and `completed` stay right, and only the heatmap
+  quietly goes to zero — so the flag is reconciled against the element rather than
+  trusted to an event. Nothing else is added for it: no `loadstart`/`emptied` listener
+  (a `load()` clears `seeking`, so the next `timeupdate` already recovers) and no
+  timeout (there is no honest duration for one; a slow drag is unbounded).
 - **No beacon at all** when: `config.js` sets no `gatewayUrl`; `/config` did not
   answer `analytics: true`; nothing has been played yet (`watched` is empty); or the
   page is the recorder. Beacons come from `view.html` only — `record.ts` never calls
@@ -1156,12 +1243,38 @@ analytics.**
     buckets; a forwards seek (delta > `MAX_PLAYBACK_DELTA_MS`) and a backwards seek
     (delta ≤ 0) both discarded **while the observation point still moves**, proven by
     the next in-range step counting from the new position; `reanchor` dropping the
-    delta across a pause and across a scrub; the boundary cases — a position exactly on
-    a bucket edge landing in the higher bucket, `currentMs === durationMs` landing in
-    bucket 49 rather than 50, a position past the duration clamped to 49, a negative
-    position clamped to 0; `durationMs` of `0`, `NaN` and `Infinity` accumulating
-    nothing while leaving the state advanced; and immutability (the input state
-    unchanged after both calls).
+    delta across a pause and across a scrub; the boundary cases — a step *ending* on a
+    bucket edge credited to the bucket below and one *starting* there to the bucket
+    above, `currentMs === durationMs` landing in bucket 49 rather than 50, a position
+    past the duration clamped to 49, a negative position clamped to 0; `durationMs` of
+    `0`, `NaN` and `Infinity` accumulating nothing while leaving the state advanced;
+    and immutability (the input state unchanged after both calls).
+  - Pro-rating, against the jitter it was added to fix: a delta straddling one boundary
+    split in proportion to either side; a delta spanning several whole buckets giving
+    each of them its own span; conservation (what a step spreads sums back to the step,
+    across geometries including a span shorter than a boundary gap and one clamped at
+    either end); and the property that matters to the picture — a straight-through 1×
+    watch of a **27 s** video (540 ms buckets, the length the jitter was reported
+    against) leaving every bucket within a millisecond of its own span, at cadences
+    from 100 ms to 1 400 ms, and on a duration whose buckets divide the cadence
+    unevenly. The pre-fix rule failed all of these by ±39%.
+  - The seek in flight: a slow drag's small forward hops accumulating **nothing** over
+    the span they scanned; suppression holding across the repeated `seeking` a single
+    drag fires; `endSeek` resuming from where the seek landed; the observation point
+    still moving while suppressed; `endSeek` clearing the flag even on a non-finite
+    landing (suppression must never stick); `reanchor` preserving the flag, so a `play`
+    mid-drag is not an opening; and the reported session end to end — watch 5 s, drag
+    to the end and back, watch the last 5 s out — leaving every bucket at ≤ 1.02× with
+    the scanned middle at exactly zero, where it used to show ~2× at the end and a
+    3.9× spike.
+  - `syncSeek`, the guard against suppression sticking: a dropped `seeked` costing the
+    session nothing beyond the seek itself, where without it every later delta is
+    discarded; the same for a mid-session `load()`, whose reset to 0 arrives as a
+    backwards step; a no-op while the element is still seeking, so a drag is not
+    reopened; a no-op when no seek is in flight, in particular **not** re-anchoring and
+    swallowing the delta of an ordinary step; and the ordering a real browser produces
+    (`seeking` cleared → `timeupdate` → `seeked`) leaving exactly the state the `seeked`
+    alone would have.
   - v1 compatibility: `heatFromRanges` overlap arithmetic including a range that
     covers a bucket exactly, one that straddles a boundary, one ending on `durationMs`,
     and `durationMs ≤ 0` → zeros; `sessionHeat` returning the array as sent for v2 and
@@ -1190,7 +1303,15 @@ analytics.**
   there is no media element in Node, and inventing one would test the stub. That is
   precisely why the heat reducer is pure — the arithmetic that a `pause`, a seek or a
   resume changes is `watch.ts`'s and is tested there, and what `beacon.ts` adds on top
-  is which event name calls which function.
+  is which event name calls which function. The seek pair is the one place that is
+  worth stating plainly rather than leaving implied: `seeking` and `seeked` no longer
+  call the same function, so the four listeners are `timeupdate`→`syncSeek` then
+  `advance`, `play`→`reanchor`, `seeking`→`beginSeek`, `seeked`→`endSeek`, and a mapping
+  that swapped the last two would suppress everything **except** the drag. The
+  `video.seeking` argument to `syncSeek` is the other untested joint — passing a
+  constant `false` there would defeat the drag suppression entirely, and passing
+  `state.seeking` would defeat the guard. §16.10's first-deploy check is where both get
+  eyes on them.
 - `tests/crypto.test.ts` gains: `analyticsAad` round-trip, and a block that decrypts
   under `{id}:analytics:{sessionA}` failing under `{id}:analytics:{sessionB}` and
   under `{id}:meta`.

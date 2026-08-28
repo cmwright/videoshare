@@ -16,8 +16,11 @@
  *   says "seen at least once", never "time spent". Coverage and completion come
  *   from it, and re-watching cannot push coverage past 100%.
  * - `heat` is **time spent**: 50 buckets of actual playback milliseconds, one per
- *   2% of the video, accumulated from `timeupdate` deltas. A section watched
- *   twice holds about twice its own length, and scrubbing adds ~nothing.
+ *   2% of the video, accumulated from `timeupdate` deltas — each one pro-rated
+ *   across the buckets it actually spans. A section watched twice holds about
+ *   twice its own length, a section watched once holds about its own length
+ *   whatever the browser's sampling cadence happens to be, and scrubbing adds
+ *   nothing.
  */
 
 import type { TimeRangesLike } from "./gap";
@@ -200,7 +203,7 @@ export function isCompleted(ranges: readonly Range[], durationMs: number): boole
 /**
  * One session's heat, mid-accumulation.
  *
- * Immutable: `advance` and `reanchor` return a new state and mutate nothing, so
+ * Immutable: every function here returns a new state and mutates nothing, so
  * `beacon.ts` can hold one of these across an event stream and a test can hold
  * both sides of a step. `lastMs` is the observation point — where the video was
  * the last time we looked — and `null` means there is nothing to measure from
@@ -209,25 +212,53 @@ export function isCompleted(ranges: readonly Range[], durationMs: number): boole
 export interface HeatState {
   readonly heat: readonly number[];
   readonly lastMs: number | null;
+  /**
+   * A seek is in flight: `seeking` has fired and its `seeked` has not.
+   *
+   * While this is set no delta is credited, however small and however plausible
+   * it looks. A drag across the scrubber is not one seek — the element starts a
+   * new one on every pointer move and only fires `seeked` once the drag settles
+   * — so between those two events the positions it reports are places the
+   * viewer is scanning past, not playback (SPEC §16.5).
+   *
+   * `endSeek` clears it, and `syncSeek` clears it when the element says it is
+   * no longer seeking at all — because suppression that could stick would cost
+   * a whole session's heat invisibly.
+   */
+  readonly seeking: boolean;
 }
 
-/** All-zero heat with no observation point yet (SPEC §16.5). */
+/** All-zero heat, no observation point, no seek in flight (SPEC §16.5). */
 export function createHeatState(buckets: number = HEAT_BUCKETS): HeatState {
-  return { heat: new Array<number>(bucketCount(buckets)).fill(0), lastMs: null };
+  return {
+    heat: new Array<number>(bucketCount(buckets)).fill(0),
+    lastMs: null,
+    seeking: false,
+  };
 }
 
 /**
  * One `timeupdate`: the video is now at `currentMs`.
  *
  * With `deltaMs = currentMs - state.lastMs`, a delta in `(0,
- * MAX_PLAYBACK_DELTA_MS]` is playback and lands whole in the bucket of the
- * **arriving** position. Anything else — no observation point yet, a backwards
+ * MAX_PLAYBACK_DELTA_MS]` with no seek in flight is playback, and is
+ * **pro-rated** across the buckets its own media-time span `[state.lastMs,
+ * currentMs]` covers, each bucket taking the milliseconds actually spent inside
+ * it. Anything else — no observation point yet, a seek in flight, a backwards
  * step (a seek back), a step over the cap (a seek forward, or a stall nobody
  * watched through) — is discarded, but the observation point still moves, so the
  * next step is measured from where the video actually is.
  *
- * A delta straddling a bucket boundary is not split. The error is under 1.5 s
- * per crossing, and splitting would buy precision nothing downstream can use.
+ * Pro-rating is what keeps the heatmap flat where attention was flat. Crediting
+ * a delta whole to the arriving bucket is only harmless while a bucket is much
+ * wider than a step, and it is not: a 27 s recording has 540 ms buckets against
+ * a ~250 ms foreground cadence, so buckets took 2 or 3 whole steps at random and
+ * a picture of an even watch came out as a ±39% sawtooth. A single accepted step
+ * can also be nearly three times a bucket wide (1.5 s against 540 ms), and
+ * landing it whole spiked that bucket to 2.8× a full pass out of nothing.
+ *
+ * The invariant that buys: one pass at any cadence puts at most one bucket-span
+ * in a bucket, so 2× on the dashboard means the stretch really was played twice.
  *
  * With no usable `durationMs` there is no bucket to name, so every delta is
  * discarded and the heat stays all zeros while the observation point advances —
@@ -237,28 +268,85 @@ export function advance(state: HeatState, currentMs: number, durationMs: number)
   // An element with no media loaded reports NaN; anchoring to it would poison
   // every delta after it.
   if (!Number.isFinite(currentMs)) return state;
-  if (state.lastMs === null) return { heat: state.heat, lastMs: currentMs };
+  if (state.lastMs === null) return { ...state, lastMs: currentMs };
 
   const deltaMs = currentMs - state.lastMs;
-  const playback = deltaMs > 0 && deltaMs <= MAX_PLAYBACK_DELTA_MS;
-  const bucket = playback ? bucketOf(currentMs, durationMs, state.heat.length) : null;
-  if (bucket === null) return { heat: state.heat, lastMs: currentMs };
+  const playback = !state.seeking && deltaMs > 0 && deltaMs <= MAX_PLAYBACK_DELTA_MS;
+  if (!playback) return { ...state, lastMs: currentMs };
 
-  // Sliced, never written in place: callers hold the old state.
-  const heat = state.heat.slice();
-  heat[bucket] += deltaMs;
-  return { heat, lastMs: currentMs };
+  const heat = creditSpan(state.heat, state.lastMs, currentMs, durationMs);
+  if (heat === null) return { ...state, lastMs: currentMs };
+  return { ...state, heat, lastMs: currentMs };
 }
 
 /**
  * Moves the observation point without touching a bucket — what a discontinuity
- * costs. A `seeking`/`seeked` pair and the `play` after a pause all land here,
- * so a scrub loses the delta across itself and a pause of any length adds
+ * costs. The `play` after a pause lands here, so a pause of any length adds
  * nothing (SPEC §16.5).
+ *
+ * A seek in flight **survives** this: a viewer can hit play with the scrubber
+ * still held, and only `seeked` ends a seek.
  */
 export function reanchor(state: HeatState, currentMs: number): HeatState {
   if (!Number.isFinite(currentMs)) return state;
-  return { heat: state.heat, lastMs: currentMs };
+  return { ...state, lastMs: currentMs };
+}
+
+/**
+ * `seeking`: suppress accumulation until the seek lands (SPEC §16.5).
+ *
+ * Idempotent, because one drag fires this many times — the element aborts the
+ * seek in progress and starts another on every pointer move, and only the last
+ * one gets a `seeked`. Re-anchoring on each `seeking` is what used to leak: a
+ * `timeupdate` landing between two of them reports a position a few hundred
+ * milliseconds along the drag, which is indistinguishable from playback at the
+ * only place that decision was made.
+ */
+export function beginSeek(state: HeatState): HeatState {
+  return state.seeking ? state : { ...state, seeking: true };
+}
+
+/**
+ * `seeked`: the seek landed at `currentMs`. Re-anchors there and resumes.
+ *
+ * Clears the flag even when the landing is unusable, keeping the old anchor
+ * instead. Suppression that could stick would cost a session all of its heat,
+ * which is a worse failure than the leak it exists to close.
+ */
+export function endSeek(state: HeatState, currentMs: number): HeatState {
+  const landed = Number.isFinite(currentMs) ? currentMs : state.lastMs;
+  return { heat: state.heat, lastMs: landed, seeking: false };
+}
+
+/**
+ * Reconciles the flag with the element's own `seeking` attribute, which the
+ * caller passes as `elementSeeking` (SPEC §16.5). Ends a seek the element is no
+ * longer in.
+ *
+ * This is the other half of the rule `endSeek` already holds: suppression must
+ * never stick. `seeked` is the only *event* that ends a seek, so one that is
+ * never delivered would suppress the rest of the session — every later delta
+ * discarded, while `watched`, coverage and `completed` (all read from
+ * `video.played`) look perfectly normal, which makes the undercount invisible
+ * rather than merely wrong.
+ *
+ * In a conforming browser this changes nothing, because it is not a second
+ * opinion — it reads the very state whose clearing is what queues `seeked`. A
+ * completed seek clears `seeking` and queues `timeupdate` before `seeked`, so
+ * this ends the seek one task early, at the position `seeked` is about to
+ * report anyway. It differs only where a `seeked` never comes: a `load()` or an
+ * `src` swap mid-session (the load algorithm clears `seeking` and fires no
+ * `seeked`), or a browser abandoning a seek across a fullscreen or backgrounding
+ * transition.
+ *
+ * It is not a way back into the leak §16.5 closed. A drag holds the element's
+ * `seeking` true for as long as it is aborting one seek and starting the next,
+ * so the first moment this reads false is a moment a seek has landed — which is
+ * exactly when `seeked` fires.
+ */
+export function syncSeek(state: HeatState, elementSeeking: boolean, currentMs: number): HeatState {
+  if (!state.seeking || elementSeeking) return state;
+  return endSeek(state, currentMs);
 }
 
 /**
@@ -550,6 +638,52 @@ function bucketOf(currentMs: number, durationMs: number, buckets: number): numbe
   if (!Number.isFinite(durationMs) || durationMs <= 0) return null;
   const raw = Math.floor((currentMs / durationMs) * buckets);
   return Math.min(buckets - 1, Math.max(0, raw));
+}
+
+/**
+ * `heat` with the media-time span `[fromMs, toMs)` added to it, each bucket
+ * taking the milliseconds of the span that fall inside that bucket. Null when
+ * there is no duration to divide the video by.
+ *
+ * A copy, never written in place: callers hold the old state.
+ *
+ * The span is walked as a contiguous chain — `fromMs` → the first boundary above
+ * it → … → the last boundary below `toMs` → `toMs` — so the pieces add back up
+ * to `toMs - fromMs` exactly, and no rounding happens here at all (`heatMs` does
+ * that once, at the end).
+ *
+ * Clamping is inherited from `bucketOf` and is the same rule the whole module
+ * uses: an element that reports a position a frame past its own duration, or a
+ * negative one, contributes to the last or first bucket rather than off the end.
+ * The clamped end bucket simply swallows whatever part of the span lies outside
+ * `[0, durationMs]`.
+ *
+ * Expects `toMs > fromMs`.
+ */
+function creditSpan(
+  heat: readonly number[],
+  fromMs: number,
+  toMs: number,
+  durationMs: number,
+): number[] | null {
+  const buckets = heat.length;
+  const first = bucketOf(fromMs, durationMs, buckets);
+  const last = bucketOf(toMs, durationMs, buckets);
+  if (first === null || last === null) return null;
+
+  const out = heat.slice();
+  if (first === last) {
+    out[first] += toMs - fromMs;
+    return out;
+  }
+
+  const width = durationMs / buckets;
+  for (let b = first; b <= last; b++) {
+    const start = b === first ? fromMs : b * width;
+    const end = b === last ? toMs : (b + 1) * width;
+    if (end > start) out[b] += end - start;
+  }
+  return out;
 }
 
 /**

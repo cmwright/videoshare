@@ -7,16 +7,61 @@
     <title>VideoShare</title>
     <!-- Deploy config, copied verbatim to dist/. Classic script: runs before the module. -->
     <script src="/config.js"></script>
+    <!-- JS off: nothing will ever fill the stage or the skeleton, so hide both and
+         let the <noscript> panel below be the page's single designed state. -->
+    <noscript>
+      <style>
+        #stage,
+        #status,
+        .title-skeleton {
+          display: none !important;
+        }
+      </style>
+    </noscript>
   </head>
   <body>
+    <header class="topbar">
+      <div class="topbar-inner">
+        <a class="brand" href="/">
+          <svg class="brand-mark" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+            <rect class="brand-mark-frame" x="0.75" y="4.5" width="18.5" height="11" rx="2.5" />
+            <path class="brand-mark-play" d="M8.6 7.4 L13.2 10 L8.6 12.6 Z" />
+          </svg>
+          <span class="brand-name">VideoShare</span>
+        </a>
+
+        <!-- Honest, not a boast: the key lives in the URL fragment and never leaves this tab. -->
+        <span class="badge-secure" title="Encrypted in this browser">
+          <svg class="badge-lock" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+            <path class="badge-lock-shackle" d="M5.25 7.25V5.25a2.75 2.75 0 0 1 5.5 0v2" />
+            <rect class="badge-lock-body" x="3" y="7.25" width="10" height="6.5" rx="1.6" />
+          </svg>
+          <span class="badge-label">Encrypted in this browser</span>
+        </span>
+      </div>
+    </header>
+
     <main class="page">
-      <header id="video-header" class="video-header hidden">
+      <header id="video-header" class="title-block hidden">
         <h1 id="video-title"></h1>
         <p id="video-meta" class="video-meta"></p>
       </header>
 
+      <!-- Stands in for the title until meta.json decrypts; CSS removes it the
+           moment #video-header loses .hidden, or an error takes the stage. -->
+      <div class="title-skeleton" aria-hidden="true">
+        <span class="skeleton-bar skeleton-bar-title"></span>
+        <span class="skeleton-bar skeleton-bar-meta"></span>
+      </div>
+
       <div id="stage" class="stage">
         <video id="video" controls playsinline preload="metadata"></video>
+
+        <p id="status" class="status" role="status">
+          <span class="spinner" aria-hidden="true"></span>
+          <span id="status-text">Loading&hellip;</span>
+        </p>
+
         <div id="play-overlay" class="play-overlay hidden">
           <button id="play-button" class="play-button" type="button" aria-label="Play video">
             <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
@@ -27,18 +72,27 @@
         </div>
       </div>
 
-      <p id="status" class="status">
-        <span class="spinner" aria-hidden="true"></span>
-        <span id="status-text">Loading&hellip;</span>
-      </p>
-
-      <section id="error-card" class="card error-card hidden" role="alert">
+      <section id="error-card" class="state-panel hidden" role="alert">
+        <span class="state-icon" aria-hidden="true">
+          <svg class="state-glyph" viewBox="0 0 24 24" focusable="false">
+            <circle class="state-glyph-ring" cx="12" cy="12" r="9" />
+            <path class="state-glyph-bar" d="M12 7.5v5" />
+            <circle class="state-glyph-dot" cx="12" cy="16.3" r="1" />
+          </svg>
+        </span>
         <h2 id="error-title"></h2>
         <p id="error-detail"></p>
       </section>
 
       <noscript>
-        <section class="card error-card">
+        <section class="state-panel">
+          <span class="state-icon" aria-hidden="true">
+            <svg class="state-glyph" viewBox="0 0 24 24" focusable="false">
+              <circle class="state-glyph-ring" cx="12" cy="12" r="9" />
+              <path class="state-glyph-bar" d="M12 7.5v5" />
+              <circle class="state-glyph-dot" cx="12" cy="16.3" r="1" />
+            </svg>
+          </span>
           <h2>JavaScript required</h2>
           <p>
             This video is encrypted in your browser with the key from the link,
@@ -46,12 +100,14 @@
           </p>
         </section>
       </noscript>
-
-      <!-- Deploying a fork? Point this at your own repository. -->
-      <footer class="footer muted">
-        Powered by <a href="https://github.com/cmwright/videoshare">VideoShare</a>
-      </footer>
     </main>
+
+    <footer class="site-footer">
+      <div class="footer-inner">
+        <!-- Deploying a fork? Point this at your own repository. -->
+        Powered by <a href="https://github.com/cmwright/videoshare">VideoShare</a>
+      </div>
+    </footer>
 
     <script type="module" src="/src/player.ts"></script>
   </body>

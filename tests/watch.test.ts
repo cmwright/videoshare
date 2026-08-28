@@ -36,10 +36,12 @@ import type { TimeRangesLike } from "../src/gap";
 import {
   advance,
   BEACON_INTERVAL_MS,
+  beginSeek,
   capRanges,
   COMPLETION_THRESHOLD,
   coverage,
   createHeatState,
+  endSeek,
   groupByViewer,
   HEAT_BUCKETS,
   type HeatState,
@@ -57,6 +59,7 @@ import {
   relativeHeat,
   sessionHeat,
   sumHeat,
+  syncSeek,
   type WatchPayload,
   type WatchPayloadV1,
   type WatchPayloadV2,
@@ -106,6 +109,21 @@ const MINUTE = 60_000;
 /** A 100 s video: 50 buckets of exactly 2 000 ms each. */
 const DURATION = 100_000;
 const BUCKET_MS = DURATION / HEAT_BUCKETS;
+
+/**
+ * A 27 s recording — the length the heat jitter was reported against.
+ *
+ * Its buckets are 540 ms, which is the interesting part: **shorter than
+ * `MAX_PLAYBACK_DELTA_MS` and only about twice a foreground `timeupdate`**, so a
+ * delta credited whole to one bucket cannot help but be lumpy. Most VideoShare
+ * recordings are this length; the 100 s video above, whose 2 000 ms buckets
+ * swallow eight steps each, is the case that hid the bug.
+ */
+const SHORT_DURATION = 27_000;
+const SHORT_BUCKET_MS = SHORT_DURATION / HEAT_BUCKETS;
+
+/** What a foreground tab fires `timeupdate` at, near enough (SPEC §16.5). */
+const CADENCE_MS = 250;
 
 describe("analytics constants", () => {
   it("matches the SPEC values", () => {
@@ -351,6 +369,31 @@ function play(state: HeatState, durationMs: number, ...positions: readonly numbe
   return positions.reduce((current, ms) => advance(current, ms, durationMs), state);
 }
 
+/**
+ * A stretch played straight through at 1×: `timeupdate` every `stepMs` from
+ * `fromMs` to `toMs`, the first call only anchoring. This is the event stream a
+ * real viewer produces, and the one the jitter showed up in.
+ */
+function watch(
+  state: HeatState,
+  durationMs: number,
+  fromMs: number,
+  toMs: number,
+  stepMs: number = CADENCE_MS,
+): HeatState {
+  let current = advance(state, fromMs, durationMs);
+  for (let at = fromMs + stepMs; at <= toMs; at += stepMs) {
+    current = advance(current, at, durationMs);
+  }
+  return current;
+}
+
+/** Each bucket as a multiple of one pass through it — what §16.6's tooltip shows. */
+function timesOnePass(heat: readonly number[], durationMs: number): number[] {
+  const span = durationMs / HEAT_BUCKETS;
+  return heat.map((ms) => ms / span);
+}
+
 describe("heat accumulation — advance", () => {
   it("starts at all zeros with no observation point", () => {
     const state = createHeatState();
@@ -366,22 +409,51 @@ describe("heat accumulation — advance", () => {
     expect(heatMs(state)).toEqual(flat(0));
   });
 
-  it("adds each delta to the bucket of the arriving position", () => {
+  it("credits each delta to the buckets its own span covers", () => {
     // 100 s / 50 = one bucket per 2 000 ms.
     const state = play(createHeatState(), DURATION, 0, 500, 1500, 2500);
     const heat = heatMs(state);
 
-    expect(heat[0]).toBe(1500); // 0→500 and 500→1500
-    expect(heat[1]).toBe(1000); // 1500→2500 lands in bucket 1, whole
+    expect(heat[0]).toBe(2000); // 0→500, 500→1500, and 1500→2000 of the last step
+    expect(heat[1]).toBe(500); // only the 2 000→2 500 tail of it is in bucket 1
     expect(heat.reduce((sum, ms) => sum + ms, 0)).toBe(2500);
   });
 
-  it("does not split a delta that straddles a boundary", () => {
-    // The error is under 1.5 s per crossing, and splitting would buy precision
-    // nothing downstream can use (SPEC §16.5).
+  it("splits a delta that straddles a boundary in proportion to either side", () => {
+    // 1 500 → 2 400 is 500 ms of bucket 0 and 400 ms of bucket 1. Crediting the
+    // whole 900 to the arriving bucket is what made the heatmap jitter
+    // (SPEC §16.5).
     const heat = heatMs(play(createHeatState(), DURATION, 1500, 2400));
-    expect(heat[0]).toBe(0);
-    expect(heat[1]).toBe(900);
+    expect(heat[0]).toBe(500);
+    expect(heat[1]).toBe(400);
+  });
+
+  it("spreads a delta that runs clean over whole buckets across all of them", () => {
+    // A 1.4 s step on a 27 s video crosses four of its 540 ms buckets. Landed
+    // whole it would read 2.6x in one bucket — the tall spike the owner saw.
+    const heat = heatMs(play(createHeatState(), SHORT_DURATION, 10_000, 11_400));
+
+    expect(heat[18]).toBe(260); // 10 000 → 10 260, the rest of bucket 18
+    expect(heat[19]).toBe(540); // whole
+    expect(heat[20]).toBe(540); // whole
+    expect(heat[21]).toBe(60); // 11 340 → 11 400
+    expect(heat.reduce((sum, ms) => sum + ms, 0)).toBe(1400);
+    expect(Math.max(...heat)).toBeLessThanOrEqual(SHORT_BUCKET_MS);
+  });
+
+  it("conserves the delta: what a step spreads adds up to what it was", () => {
+    // Splitting must not invent or lose playback time, whatever the geometry.
+    for (const [from, to] of [
+      [0, 1400],
+      [10_000, 11_400],
+      [26_800, 27_000],
+      [-400, 300],
+      [13_490, 13_510],
+    ] as const) {
+      const heat = heatMs(play(createHeatState(), SHORT_DURATION, from, to));
+      const total = heat.reduce((sum, ms) => sum + ms, 0);
+      expect(Math.abs(total - (to - from)), `${from}→${to}`).toBeLessThanOrEqual(1);
+    }
   });
 
   it("counts a delta of exactly MAX_PLAYBACK_DELTA_MS and refuses one past it", () => {
@@ -421,17 +493,27 @@ describe("heat accumulation — advance", () => {
 
   it("accumulates about twice a section's length when it is watched twice", () => {
     // The whole point of heat, and precisely what `watched` refuses to say.
+    // Bucket 0 is [0, 2 000) and the viewer played exactly that stretch twice,
+    // so it holds twice its own span and bucket 1 — never reached — holds none.
     let state = play(createHeatState(), DURATION, 0, 1000, 2000);
     state = reanchor(state, 0); // the viewer scrubs back to the start
     state = play(state, DURATION, 1000, 2000);
 
     const heat = heatMs(state);
-    expect(heat[0]).toBe(2000);
-    expect(heat[1]).toBe(2000);
+    expect(heat[0]).toBe(2 * BUCKET_MS);
+    expect(heat[1]).toBe(0);
   });
 
-  it("puts a position exactly on a bucket edge in the higher bucket", () => {
+  it("credits a step ending exactly on a bucket edge to the bucket below it", () => {
+    // The time was spent in [1 500, 2 000), which is bucket 0's; the arriving
+    // position sits on bucket 1's floor but no part of the step was inside it.
     const heat = heatMs(play(createHeatState(), DURATION, 1500, BUCKET_MS));
+    expect(heat[0]).toBe(500);
+    expect(heat[1]).toBe(0);
+  });
+
+  it("credits a step starting exactly on a bucket edge to the bucket above it", () => {
+    const heat = heatMs(play(createHeatState(), DURATION, BUCKET_MS, BUCKET_MS + 500));
     expect(heat[0]).toBe(0);
     expect(heat[1]).toBe(500);
   });
@@ -537,6 +619,221 @@ describe("heat accumulation — reanchor", () => {
     expect(heat[0]).toBe(1000);
     expect(heat[45]).toBe(300);
     expect(heat.reduce((sum, ms) => sum + ms, 0)).toBe(1300);
+  });
+
+  it("keeps a seek in flight across a re-anchor, so a `play` mid-drag is not an opening", () => {
+    // `beacon.ts` re-anchors on `play`, and a viewer can hit play with the
+    // scrubber still held. Only `seeked` ends a seek.
+    const state = reanchor(beginSeek(createHeatState()), 5000);
+    expect(state.seeking).toBe(true);
+    expect(heatMs(advance(state, 5300, DURATION))).toEqual(flat(0));
+  });
+});
+
+// --- The two defects behind the reported heatmap jitter ----------------------
+
+describe("heat accumulation — a steady 1x watch is flat, not sawtoothed", () => {
+  it("gives every bucket its own span for a straight-through 1x play", () => {
+    // The reported bug. A 27 s video has 540 ms buckets and a foreground tab
+    // steps 250 ms, so crediting each step whole to its arriving bucket handed
+    // buckets 2 or 3 steps at random — 500 ms next to 750 ms, a ±39% sawtooth
+    // in a picture that should have been flat.
+    const state = watch(createHeatState(), SHORT_DURATION, 0, SHORT_DURATION);
+    const heat = heatMs(state);
+
+    expect(heat.reduce((sum, ms) => sum + ms, 0)).toBe(SHORT_DURATION);
+    for (const [bucket, ms] of heat.entries()) {
+      expect(Math.abs(ms - SHORT_BUCKET_MS), `bucket ${bucket}`).toBeLessThanOrEqual(1);
+    }
+  });
+
+  it("reads 1.0x everywhere after one pass, whatever the cadence", () => {
+    // A throttled tab, a 2x listen and a foreground tab all step differently;
+    // none of them should change the *shape* of one pass through the video.
+    for (const step of [100, 250, 400, 500, 1000, 1400]) {
+      const heat = heatMs(watch(createHeatState(), SHORT_DURATION, 0, SHORT_DURATION, step));
+      const peak = Math.max(...timesOnePass(heat, SHORT_DURATION));
+      expect(peak, `${step} ms cadence`).toBeLessThanOrEqual(1.02);
+    }
+  });
+
+  it("stays flat on a duration whose buckets do not divide the cadence evenly", () => {
+    // 41 s / 50 = 820 ms against a 250 ms step: 3.28 steps a bucket, so the old
+    // rule alternated 3 and 4 steps forever.
+    const heat = heatMs(watch(createHeatState(), 41_000, 0, 41_000));
+    const span = 41_000 / HEAT_BUCKETS;
+    for (const [bucket, ms] of heat.entries()) {
+      expect(Math.abs(ms - span), `bucket ${bucket}`).toBeLessThanOrEqual(1);
+    }
+  });
+});
+
+describe("heat accumulation — a seek in flight", () => {
+  /** The drag the owner's screenshot came from: 0→5 s watched, then scrubbed to the end. */
+  function scrubbedToTheEnd(state: HeatState): HeatState {
+    let current = beginSeek(state);
+    // While the pointer is down the element reports the positions it is being
+    // dragged over. Hops small enough to pass for playback are the leak.
+    for (let at = 5800; at <= 22_000; at += 800) current = advance(current, at, SHORT_DURATION);
+    return endSeek(current, 22_000);
+  }
+
+  it("accumulates nothing over a span the viewer only scanned", () => {
+    const watched = watch(createHeatState(), SHORT_DURATION, 0, 5000);
+    const before = heatMs(watched);
+    const after = heatMs(scrubbedToTheEnd(watched));
+
+    // Not "a bit less than a watch" — nothing at all. The viewer saw thumbnails.
+    expect(after).toEqual(before);
+    expect(after.slice(10)).toEqual(new Array<number>(HEAT_BUCKETS - 10).fill(0));
+  });
+
+  it("stays suppressed through the repeated seeking events one drag fires", () => {
+    // A drag is not one seek: the element starts a new one on every pointer
+    // move and only fires `seeked` when the drag settles.
+    let state = watch(createHeatState(), SHORT_DURATION, 0, 5000);
+    const before = heatMs(state);
+
+    for (let at = 5800; at <= 22_000; at += 800) {
+      state = beginSeek(state); // another `seeking`, mid-drag
+      state = advance(state, at, SHORT_DURATION);
+    }
+    state = endSeek(state, 22_000);
+
+    expect(heatMs(state)).toEqual(before);
+    expect(state.seeking).toBe(false);
+  });
+
+  it("resumes measuring from where the seek landed", () => {
+    const state = scrubbedToTheEnd(watch(createHeatState(), SHORT_DURATION, 0, 5000));
+    expect(state.seeking).toBe(false);
+    expect(state.lastMs).toBe(22_000);
+
+    const heat = heatMs(advance(state, 22_400, SHORT_DURATION));
+    expect(heat[40]).toBe(140); // bucket 40 is [21 600, 22 140): 22 000 → 22 140
+    expect(heat[41]).toBe(260); // bucket 41 takes the rest, 22 140 → 22 400
+    // The step counted for 400 ms and the scanned span still holds nothing.
+    expect(heat.slice(10, 40)).toEqual(new Array<number>(30).fill(0));
+  });
+
+  it("keeps the observation point moving while it suppresses", () => {
+    // Suppression must not leave the anchor stale: a `seeked` the element never
+    // delivers would otherwise make the next real step a 17-second fiction.
+    const state = advance(beginSeek(reanchor(createHeatState(), 5000)), 5300, SHORT_DURATION);
+    expect(state.lastMs).toBe(5300);
+    expect(heatMs(state)).toEqual(flat(0));
+  });
+
+  it("ends the seek even when the element reports a landing it cannot use", () => {
+    // Never leave suppression stuck on: a NaN landing keeps the old anchor but
+    // still clears the flag, or the session would silently record no heat.
+    const state = endSeek(beginSeek(reanchor(createHeatState(), 5000)), Number.NaN);
+    expect(state.seeking).toBe(false);
+    expect(state.lastMs).toBe(5000);
+  });
+
+  it("leaves the whole reported session reading 1x, with no spike", () => {
+    // End to end: watch 5 s, drag over the rest of the video to the end and
+    // back, then watch the last 5 s out. The heatmap this produced had the end
+    // at ~2x and one bucket at 3.9x, though nothing was rewatched.
+    let state = watch(createHeatState(), SHORT_DURATION, 0, 5000);
+
+    state = beginSeek(state);
+    for (let at = 6400; at <= 26_000; at += 1400) state = advance(state, at, SHORT_DURATION);
+    for (const at of [26_200, 26_500, 26_900, 22_000, 22_200, 22_400]) {
+      state = advance(state, at, SHORT_DURATION);
+    }
+    state = endSeek(state, 22_400);
+
+    state = watch(state, SHORT_DURATION, 22_400, SHORT_DURATION);
+
+    const times = timesOnePass(heatMs(state), SHORT_DURATION);
+    // Nothing was watched twice, so nothing may read as watched twice.
+    expect(Math.max(...times)).toBeLessThanOrEqual(1.02);
+    // The two stretches actually played read as one pass each...
+    for (const bucket of [0, 4, 8, 44, 48]) expect(times[bucket]).toBeCloseTo(1, 2);
+    // ...and the middle the viewer only scanned reads as nothing.
+    for (const bucket of [15, 25, 35]) expect(times[bucket]).toBe(0);
+  });
+});
+
+describe("heat accumulation — a seek that never ends", () => {
+  /** A drag left hanging: `seeking` fired, the positions scanned past, no `seeked`. */
+  function dragging(state: HeatState): HeatState {
+    let current = beginSeek(state);
+    for (let at = 5800; at <= 22_000; at += 800) current = advance(current, at, SHORT_DURATION);
+    return current;
+  }
+
+  it("recovers when the element never delivers the `seeked`", () => {
+    // `seeked` is the only event that ends a seek, so one that is dropped
+    // would suppress every remaining delta of the session — and invisibly,
+    // because `watched`, coverage and `completed` come off `video.played` and
+    // stay exactly right while the heatmap goes to zero.
+    const watched = watch(createHeatState(), SHORT_DURATION, 0, 5000);
+    const before = heatMs(watched);
+
+    // Without the guard, the same stream after the lost event counts nothing.
+    const stuck = watch(dragging(watched), SHORT_DURATION, 22_000, 26_000);
+    expect(heatMs(stuck)).toEqual(before);
+
+    // With it, the element's own `seeking` reading false ends the seek at the
+    // position it landed on, and playback carries on from there.
+    const resumed = syncSeek(dragging(watched), false, 22_000);
+    expect(resumed.seeking).toBe(false);
+    expect(resumed.lastMs).toBe(22_000);
+
+    const times = timesOnePass(heatMs(watch(resumed, SHORT_DURATION, 22_000, 26_000)), SHORT_DURATION);
+    // 22 s → 26 s reads as one pass, and the scanned middle still as nothing.
+    for (const bucket of [43, 46]) expect(times[bucket]).toBeCloseTo(1, 2);
+    for (const bucket of [15, 25, 35]) expect(times[bucket]).toBe(0);
+  });
+
+  it("recovers from a mid-session `load()`, which clears seeking and fires nothing", () => {
+    // The media load algorithm clears `seeking` without a `seeked` and resets
+    // `currentTime` to 0 — a backwards step `advance` discards on its own. The
+    // flag is the only thing that would have stayed stuck.
+    const state = syncSeek(dragging(watch(createHeatState(), SHORT_DURATION, 0, 5000)), false, 0);
+    expect(state.seeking).toBe(false);
+    expect(state.lastMs).toBe(0);
+
+    const times = timesOnePass(heatMs(watch(state, SHORT_DURATION, 0, 2000)), SHORT_DURATION);
+    expect(times[1]).toBeCloseTo(2, 2); // played once before the reload and once after
+  });
+
+  it("does nothing while the element says the seek is still in flight", () => {
+    // The guard runs on every `timeupdate`, including the ones a drag fires,
+    // and must not reopen the leak suppression exists to close.
+    const watched = watch(createHeatState(), SHORT_DURATION, 0, 5000);
+    let state = beginSeek(watched);
+    for (let at = 5800; at <= 22_000; at += 800) {
+      state = syncSeek(state, true, at);
+      state = advance(state, at, SHORT_DURATION);
+    }
+
+    expect(state.seeking).toBe(true);
+    expect(heatMs(state)).toEqual(heatMs(watched));
+  });
+
+  it("leaves an ordinary step alone, anchor included", () => {
+    // With no seek in flight it is the identity. Re-anchoring here would
+    // swallow the delta of every step it ran before — the whole session.
+    const state = watch(createHeatState(), SHORT_DURATION, 0, 5000);
+    expect(syncSeek(state, false, 99_000)).toBe(state);
+    expect(syncSeek(state, true, 99_000)).toBe(state);
+
+    const guarded = advance(syncSeek(state, false, 5250), 5250, SHORT_DURATION);
+    expect(heatMs(guarded)).toEqual(heatMs(advance(state, 5250, SHORT_DURATION)));
+  });
+
+  it("lands where the `seeked` would have, when the event does arrive", () => {
+    // A conforming browser clears `seeking`, queues `timeupdate`, then queues
+    // `seeked`, so the guard always ends a real seek one task early — at the
+    // position the event is about to report. Nothing may change hands.
+    const dragged = dragging(watch(createHeatState(), SHORT_DURATION, 0, 5000));
+    const early = advance(syncSeek(dragged, false, 22_000), 22_000, SHORT_DURATION);
+
+    expect(endSeek(early, 22_000)).toEqual(endSeek(dragged, 22_000));
   });
 });
 

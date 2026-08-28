@@ -643,6 +643,9 @@ playButton.addEventListener("click", () => {
   video.play().catch((err: unknown) => console.warn("[videoshare] play() rejected", err));
 });
 video.addEventListener("play", () => playOverlay.classList.add("hidden"));
+// Presentation only: lets CSS tell "nothing has painted yet" (a full-stage
+// loading state) from "playing and buffering ahead" (a small corner pill).
+video.addEventListener("loadeddata", () => stage.classList.add("has-frames"));
 video.addEventListener("error", () => {
   const code = video.error?.code;
   // Before a source is committed the whole-file fallback may still rescue this.
