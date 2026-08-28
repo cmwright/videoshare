@@ -22,6 +22,16 @@
  * export const OPUS_BITRATE: number;            // 48_000, WebCodecs engine (§6)
  * export const FALLBACK_AUDIO_BITRATE: number;  // 64_000, MediaRecorder engine (§6)
  * export const KEYFRAME_INTERVAL_US: number;    // 8_000_000 — a keyframe every 8 s (§6)
+ * export const MAX_ENCODE_QUEUE: number;        // backpressure bound, frames in flight (§6)
+ * export const HEARTBEAT_IDLE_MS: number;       // still timeline before a frame is repeated (§6)
+ * export const HEARTBEAT_INTERVAL_MS: number;   // how often that is checked
+ * export function heartbeatDue(input: HeartbeatInput): boolean;
+ * export function heartbeatTimestampUs(lastEncodeUs: number, lastEncodeAtMs: number,
+ *   nowMs: number): number;
+ * export const SILENCE_FRAME_US: number;        // 20_000 — one Opus frame of silence
+ * export const SILENCE_LEAD_US: number;         // how far the audio clock leads video
+ * export const MAX_SILENCE_CATCHUP_US: number;  // widest jump that clock may take
+ * export function silenceCatchUpUs(silenceUs: number, targetUs: number): number;
  * export const FALLBACK_MIME_TYPES: readonly string[];
  * export const QUANTIZERS: Record<VideoCodec, Record<Quality, number>>;
  * export function quantizerFor(codec: VideoCodec, quality: Quality): number;
@@ -42,13 +52,23 @@ import {
   containerMimeType,
   FALLBACK_AUDIO_BITRATE,
   FALLBACK_MIME_TYPES,
+  HEARTBEAT_IDLE_MS,
+  HEARTBEAT_INTERVAL_MS,
+  type HeartbeatInput,
+  heartbeatDue,
+  heartbeatTimestampUs,
   KEYFRAME_INTERVAL_US,
+  MAX_ENCODE_QUEUE,
+  MAX_SILENCE_CATCHUP_US,
   OPUS_BITRATE,
   QUANTIZERS,
   quantizerFor,
   selectEngineKind,
   selectFallbackMimeType,
   selectVideoCodec,
+  SILENCE_FRAME_US,
+  SILENCE_LEAD_US,
+  silenceCatchUpUs,
   videoCodecString,
 } from "../src/encoder";
 import { DEFAULT_VIDEO_BITS_PER_SECOND, QUALITIES } from "../src/settings";
@@ -472,6 +492,209 @@ describe("MediaRecorder fallback mime types", () => {
   });
 });
 
+/**
+ * The heartbeat (SPEC §6). Screen capture is VFR and the backpressure valve
+ * drops delta frames under load, so the video timeline can stand still while
+ * the audio track runs on. In a file that is invisible; through MSE it splits
+ * the buffered ranges and strands the player at the near edge (§8). The engine
+ * answers by re-encoding a retained clone of the last frame — near-free in
+ * quantizer mode — and this is the decision it makes on every tick.
+ */
+describe("heartbeat", () => {
+  /** A still timeline, an idle encoder, a frame in hand: the case that fires. */
+  const DUE: HeartbeatInput = {
+    nowMs: 60_000,
+    lastEncodeAtMs: 60_000 - HEARTBEAT_IDLE_MS - 1,
+    queueSize: 0,
+    hasFrame: true,
+    recording: true,
+  };
+
+  const after = (stillMs: number): HeartbeatInput => ({
+    ...DUE,
+    lastEncodeAtMs: DUE.nowMs - stillMs,
+  });
+
+  it("fires once the timeline has stood still for more than a second", () => {
+    expect(heartbeatDue(DUE)).toBe(true);
+    expect(heartbeatDue(after(HEARTBEAT_IDLE_MS + 1))).toBe(true);
+    expect(heartbeatDue(after(5_000))).toBe(true);
+  });
+
+  it("stays out of the way while frames are arriving", () => {
+    // 30 fps capture hits this branch every 33 ms for the whole recording, so
+    // the common case must be "no".
+    for (const still of [0, 33, 100, 500, 999, HEARTBEAT_IDLE_MS]) {
+      expect(heartbeatDue(after(still)), `${still} ms since the last frame`).toBe(false);
+    }
+  });
+
+  it("skips while the encoder is behind, at the same bound backpressure uses", () => {
+    // A heartbeat is only free when the encoder is idle. Pushing frames into a
+    // queue that is already over the bound is what makes it drop deltas in the
+    // first place — it would trade one hole for a bigger one.
+    expect(heartbeatDue({ ...DUE, queueSize: MAX_ENCODE_QUEUE })).toBe(true);
+    expect(heartbeatDue({ ...DUE, queueSize: MAX_ENCODE_QUEUE + 1 })).toBe(false);
+    expect(heartbeatDue({ ...DUE, queueSize: 100 })).toBe(false);
+  });
+
+  it("needs a retained frame to repeat", () => {
+    // Before the first capture frame, or after the clone was closed on the way
+    // out, there is no picture to encode.
+    expect(heartbeatDue({ ...DUE, hasFrame: false })).toBe(false);
+  });
+
+  it("stops the moment the recording does", () => {
+    // stop() flushes and finalizes; a heartbeat landing after that would encode
+    // into an encoder being drained.
+    expect(heartbeatDue({ ...DUE, recording: false })).toBe(false);
+  });
+
+  it("carries the media clock forward by the wall time that passed", () => {
+    // The real recording's hole, as the heartbeat would have covered it: the
+    // last frame encoded at 5.097 s, wall clock 541 ms later.
+    expect(heartbeatTimestampUs(5_097_000, 1_000, 1_541)).toBe(5_638_000);
+  });
+
+  it("always lands strictly ahead of the last encoded frame", () => {
+    // The muxer rejects a video timestamp below the one before it outright,
+    // which would end the recording rather than dent it.
+    expect(heartbeatTimestampUs(1_000_000, 500, 500)).toBeGreaterThan(1_000_000);
+    expect(heartbeatTimestampUs(1_000_000, 500, 400)).toBeGreaterThan(1_000_000);
+  });
+
+  it("produces whole microseconds from a fractional wall clock", () => {
+    // performance.now() has sub-millisecond resolution; VideoFrame timestamps
+    // are integers.
+    const ts = heartbeatTimestampUs(0, 0.4, 1_234.6789);
+    expect(Number.isInteger(ts)).toBe(true);
+    expect(ts).toBe(1_234_279);
+  });
+
+  it("keeps a hole in a still recording under 1.5 s, and the clock honest", () => {
+    // Ten seconds of a completely static screen, ticked at the interval the
+    // engine uses. The gap between consecutive encoded frames is what MSE sees
+    // as a hole, and it is what has to stay bounded.
+    let lastEncodeAtMs = 0;
+    let lastEncodeUs = 0;
+    const encodedAt = [0];
+
+    for (let nowMs = 0; nowMs <= 10_000; nowMs += HEARTBEAT_INTERVAL_MS) {
+      if (!heartbeatDue({ nowMs, lastEncodeAtMs, queueSize: 0, hasFrame: true, recording: true })) {
+        continue;
+      }
+      const timestamp = heartbeatTimestampUs(lastEncodeUs, lastEncodeAtMs, nowMs);
+      expect(timestamp, "monotonic").toBeGreaterThan(lastEncodeUs);
+      lastEncodeUs = timestamp;
+      lastEncodeAtMs = nowMs;
+      encodedAt.push(nowMs);
+    }
+
+    const holes = encodedAt.slice(1).map((at, i) => at - (encodedAt[i] as number));
+    expect(holes.length, "the still screen was kept alive").toBeGreaterThan(5);
+    expect(Math.max(...holes)).toBeLessThanOrEqual(HEARTBEAT_IDLE_MS + HEARTBEAT_INTERVAL_MS);
+    // Media time tracks wall time: a still stretch is not compressed away.
+    expect(lastEncodeUs).toBe(lastEncodeAtMs * 1000);
+  });
+
+  it("checks often enough that the threshold is the bound", () => {
+    // The worst case is one full interval of bad luck on top of the threshold,
+    // so the interval has to be a fraction of it.
+    expect(HEARTBEAT_INTERVAL_MS).toBeLessThanOrEqual(HEARTBEAT_IDLE_MS / 2);
+    expect(HEARTBEAT_IDLE_MS + HEARTBEAT_INTERVAL_MS).toBeLessThan(2_000);
+  });
+
+  it("repeats frames far more often than it forces keyframes", () => {
+    // A heartbeat that crosses the 8 s deadline is a keyframe like any other
+    // frame; the rest are deltas against an identical picture, which is what
+    // makes them nearly free.
+    expect(HEARTBEAT_IDLE_MS * 1000).toBeLessThan(KEYFRAME_INTERVAL_US);
+  });
+});
+
+/**
+ * The silence the engine synthesises after the audio track ends mid-recording
+ * (`fillAudioGap`), and the one decision inside it: fill the gap to the video
+ * clock frame by frame, or give up and jump the clock forward.
+ *
+ * A jump leaves a hole in the *audio* track, and MSE intersects the two tracks'
+ * buffered ranges — so an audio hole strands the player at its near edge just
+ * as a video hole does (§8). The heartbeat makes this sharp: it moves the video
+ * clock in strides of up to 1.5 s, which the catch-up ceiling has to be able to
+ * absorb, or every heartbeat on a still screen would punch a fresh hole.
+ */
+describe("silence catch-up after the audio track ends", () => {
+  it("fills a heartbeat-wide gap frame by frame instead of jumping it", () => {
+    const silenceUs = 2_000_000;
+    const widestStride = (HEARTBEAT_IDLE_MS + HEARTBEAT_INTERVAL_MS) * 1000;
+    expect(silenceCatchUpUs(silenceUs, silenceUs + widestStride)).toBe(silenceUs);
+  });
+
+  it("keeps the ceiling clear of the heartbeat's stride, with room for jitter", () => {
+    // The bound the case above rests on, stated where a change to either
+    // constant will trip over it. The factor of two is for a heartbeat that
+    // runs late on a loaded main thread, which is when frames get dropped and
+    // the heartbeat matters most.
+    const stride = (HEARTBEAT_IDLE_MS + HEARTBEAT_INTERVAL_MS) * 1000;
+    expect(MAX_SILENCE_CATCHUP_US).toBeGreaterThanOrEqual(2 * stride);
+    // And still small enough that filling it is a bounded burst of encodes.
+    expect(MAX_SILENCE_CATCHUP_US / SILENCE_FRAME_US).toBeLessThanOrEqual(200);
+  });
+
+  it("still jumps a hole no heartbeat could have covered", () => {
+    // A tab throttled to one timer callback a minute: that audio really is
+    // missing, and encoding it 20 ms at a time would mean 3000 encodes inside
+    // the video pump.
+    const silenceUs = 2_000_000;
+    const target = silenceUs + 60_000_000;
+    expect(silenceCatchUpUs(silenceUs, target)).toBe(target - MAX_SILENCE_CATCHUP_US);
+  });
+
+  it("never moves the clock backwards", () => {
+    // Video frames arrive slightly out of step with the silence already
+    // written; the clock must simply stay where it is.
+    expect(silenceCatchUpUs(5_000_000, 4_000_000)).toBe(5_000_000);
+    expect(silenceCatchUpUs(5_000_000, 5_000_000)).toBe(5_000_000);
+  });
+
+  it("leaves no audio hole across a still screen driven only by heartbeats", () => {
+    // The failure this exists to catch: audio track ended at 2 s, screen static
+    // for the next 30 s, so the only thing moving the video clock is the
+    // heartbeat. Both clocks are walked exactly as the engine walks them —
+    // `heartbeat()` calls `fillAudioGap()` before every frame it submits.
+    const endedAtUs = 2_000_000;
+    let lastEncodeAtMs = 2_000;
+    let lastEncodeUs = endedAtUs;
+    let silenceUs = endedAtUs;
+    const frames: number[] = [];
+
+    for (let nowMs = lastEncodeAtMs; nowMs <= 32_000; nowMs += HEARTBEAT_INTERVAL_MS) {
+      const due = heartbeatDue({ nowMs, lastEncodeAtMs, queueSize: 0, hasFrame: true, recording: true });
+      if (!due) continue;
+      const videoUs = heartbeatTimestampUs(lastEncodeUs, lastEncodeAtMs, nowMs);
+      lastEncodeUs = videoUs;
+      lastEncodeAtMs = nowMs;
+
+      const target = videoUs + SILENCE_LEAD_US;
+      silenceUs = silenceCatchUpUs(silenceUs, target);
+      while (silenceUs < target) {
+        frames.push(silenceUs);
+        silenceUs += SILENCE_FRAME_US;
+      }
+    }
+
+    expect(frames.length, "the audio clock followed the video clock").toBeGreaterThan(1_000);
+    expect(frames[0], "silence picks up where the real audio stopped").toBe(endedAtUs);
+    // Every Opus frame butts against the one before it: no hole for MSE to
+    // split the buffered ranges on, anywhere in the still stretch.
+    const gaps = frames.slice(1).map((at, i) => at - (frames[i] as number));
+    expect(Math.max(...gaps)).toBe(SILENCE_FRAME_US);
+    // And the audio clock still leads the video clock, which is what keeps the
+    // muxer releasing video blocks (§7 streaming upload).
+    expect(silenceUs).toBeGreaterThan(lastEncodeUs);
+  });
+});
+
 describe("encoder constants", () => {
   it("matches the SPEC §6 audio bitrates", () => {
     expect(OPUS_BITRATE).toBe(48_000);
@@ -485,9 +708,9 @@ describe("encoder constants", () => {
     expect(KEYFRAME_INTERVAL_US / 1_000_000).toBe(8);
   });
 
-  it("defaults the fallback engine to 1.2 Mbps", () => {
+  it("defaults the fallback engine to 2.5 Mbps", () => {
     // videoBitsPerSecond only reaches the MediaRecorder engine now; the
     // WebCodecs engine is constant-quality and ignores it (SPEC §6, §9).
-    expect(DEFAULT_VIDEO_BITS_PER_SECOND).toBe(1_200_000);
+    expect(DEFAULT_VIDEO_BITS_PER_SECOND).toBe(2_500_000);
   });
 });

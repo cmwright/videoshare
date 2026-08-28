@@ -83,7 +83,7 @@ Two objects per video, under the id as prefix:
 ## 6. Recording
 
 - Capture: `getDisplayMedia({ video: { frameRate: { ideal: 30, max: 30 },
-  width: { max: 1920 }, height: { max: 1080 } }, audio: true })` (system/tab
+  width: { max: 2560 }, height: { max: 1440 } }, audio: true })` (system/tab
   audio only arrives if the user opts in via the picker) plus
   `getUserMedia({ audio: true })` for the default microphone (same device the OS
   gives Meet/Zoom). Mic defaults ON with a visible toggle before capture starts.
@@ -120,13 +120,19 @@ Two objects per video, under the id as prefix:
      picks sane values ~"visually clean text" for `standard`; document them in
      code). Backpressure: if `encodeQueueSize` exceeds a small bound, drop
      incoming **delta** frames. Force a keyframe at least every **8 s** of media
-     time so clusters stay bounded and MSE seeking works. Audio: `AudioEncoder`
+     time so clusters stay bounded and MSE seeking works. **Heartbeat**: screen
+     capture is VFR (static screens deliver no frames) and backpressure drops
+     frames under load, but holes in the video timeline split MSE buffered
+     ranges and stall playback (§8) — so if ~1 s of wall clock passes with no
+     frame encoded, re-encode a retained clone of the last frame at the current
+     timestamp (near-free in quantizer mode; skip while the encoder queue is
+     over the backpressure bound). Audio: `AudioEncoder`
      Opus, mono, **48 kbps**. Muxing: the `webm-muxer` npm package (MIT) in
      streaming mode — its output callback feeds `ondata`. No in-container
      duration (the duration bullet below is unchanged).
   2. **Fallback — MediaRecorder engine** (Firefox etc.): first supported of
      `video/webm;codecs=vp9,opus`, `vp8,opus`, `video/webm`;
-     `videoBitsPerSecond` from settings (default **1_200_000**),
+     `videoBitsPerSecond` from settings (default **2_500_000**),
      `audioBitsPerSecond` **64_000**, `start(1000)`, blob bytes → `ondata`.
 
   `meta.mimeType` MUST be the engine's actual string, never the requested one.
@@ -218,6 +224,19 @@ player and storage format are unaffected. `meta.json` remains a single PUT.
   wait for the buffer to reach that point (v1 accepts this).
 - Fallback path (e.g. Safari): fetch entire `video.bin`, decrypt all chunks,
   `URL.createObjectURL(new Blob(chunks, { type: meta.mimeType }))` → `<video src>`.
+- **Buffered-gap jumping (MSE path)**: recordings may still contain small
+  video-timeline holes (frames dropped under encoder load). On a playback stall
+  (`waiting`, plus a watchdog for stalls Chrome does not event), if
+  `currentTime` has nothing playable ahead of it — at the end of a buffered
+  range, or inside a hole — and a later range exists, seek forward to that
+  range's start plus a small epsilon. A pending seek is not a reason to stand
+  down: an MSE seek into a hole never completes, since in-order appends can
+  never supply frames that were not encoded, so scrubbing into one would
+  otherwise stall forever. Jump any gap size (a stalled player loses everything
+  after the hole; the §6 heartbeat keeps real holes sub-second), never seek
+  backwards, never move a paused playhead, tear the watchdog down at `error`,
+  and stop it in the `ended` state — the next `play` re-arms it, so a replay is
+  rescued too.
 - Errors: decrypt failure → "wrong key or corrupted video"; 404 → "video not
   found"; network/CORS → actionable message.
 
@@ -231,7 +250,7 @@ player and storage format are unaffected. `meta.json` remains a single PUT.
   `preferAv1` (boolean, default `false` — AV1 shrinks files ~30-50% but viewers
   on Safari without AV1 hardware decode can't play; the settings UI must say
   this), `videoBitsPerSecond` (fallback MediaRecorder engine only, default
-  1_200_000). Loading settings stored by older versions (no quality/preferAv1,
+  2_500_000). Loading settings stored by older versions (no quality/preferAv1,
   old bitrate default) must not error — fill defaults.
 - `videoshare.library` (JSON array of): `{ id, title, createdAt, durationMs,
   link, sizeBytes? }` — newest first; list in UI with copy-link and

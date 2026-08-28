@@ -6,6 +6,7 @@ import "./app.css";
 import "./player.css";
 
 import { chunkAad, decryptBlock, decryptChunkRange, importKeyB64, metaAad } from "./crypto";
+import { bufferedRanges, findGapSeek, isStalling } from "./gap";
 import { publicBaseUrl } from "./settings";
 import type { VideoMeta } from "./types";
 import { formatDuration } from "./util";
@@ -21,6 +22,15 @@ const QUOTA_RETRY_MS = 400;
 
 /** Cap on waiting for the media element during the duration probe, so playback never hangs on it. */
 const ELEMENT_TIMEOUT_MS = 5000;
+
+/** How often the stall watchdog samples `currentTime` (SPEC §8). */
+const STALL_POLL_MS = 250;
+
+/** Consecutive samples with no progress before a playing element counts as stalled. */
+const STALL_TICKS = 3;
+
+/** Floor on repeating the same rescue seek, so a seek that does not take cannot spin. */
+const GAP_SEEK_COOLDOWN_MS = 1500;
 
 const CORRUPT_TITLE = "Wrong key or corrupted video";
 const CORRUPT_DETAIL =
@@ -330,6 +340,114 @@ async function append(sb: SourceBuffer, data: Uint8Array): Promise<void> {
   }
 }
 
+/**
+ * Watches for a stall the element cannot get itself out of, and steps over the
+ * hole in the video timeline that caused it (SPEC §8).
+ *
+ * Two triggers, because one is not enough. `waiting` is the event for "I ran
+ * out of media", but Chrome frequently does not fire it when the playhead
+ * reaches the end of a buffered range with another range beyond — the element
+ * simply stops advancing, still `readyState >= HAVE_CURRENT_DATA`, no event at
+ * all. So `currentTime` is also polled a few times a second and a playing
+ * element that has not moved for ~{@link STALL_TICKS} samples is treated as
+ * stalled.
+ *
+ * Whether either trigger actually seeks is left entirely to `findGapSeek`,
+ * which only answers with a time when there is a later buffered range to reach:
+ * a stall waiting on the network at the head of the buffer looks identical from
+ * here and must not turn into a skip.
+ *
+ * A seek in flight is not a reason to stand down — it is the worst case. An
+ * MSE seek into a hole never completes: the element drops to HAVE_METADATA and
+ * waits for an append covering the seek point, which an in-order append stream
+ * of a recording whose frames were never encoded can never deliver. So a
+ * viewer who scrubs into the hole sits at `seeking = true` forever, with no
+ * event to follow. The watchdog therefore keeps counting while a seek is
+ * pending and leaves the verdict to `findGapSeek`, which is safe precisely
+ * because it answers `null` for the two waits that are legitimate: the
+ * still-downloading head of the buffer, and a forward seek past it.
+ *
+ * MSE path only. The whole-file fallback hands the element a complete WebM,
+ * where a hole is just a long-held frame and the element plays straight
+ * through — nothing to rescue, and a stray seek would only make it worse.
+ *
+ * Returns the teardown. It also tears itself down on a media error, and pauses
+ * at `ended` — the element's next `play` re-arms it, so a viewer who replays
+ * the recording meets the same hole and gets the same rescue.
+ */
+function armGapJumper(): () => void {
+  let lastTime = -1;
+  let stuck = 0;
+  let lastTarget = Number.NEGATIVE_INFINITY;
+  let lastJumpAt = 0;
+  let timer: number | null = null;
+
+  const jump = (): void => {
+    // A paused playhead is parked, not stalled. The watchdog already treats it
+    // that way; this is for the `waiting` listener, which Chrome fires on a
+    // paused element around a readyState drop.
+    if (video.paused) return;
+    const from = video.currentTime;
+    const target = findGapSeek(bufferedRanges(video.buffered), from);
+    if (target === null) return;
+
+    // A seek that does not take (the element lands back where it was) would
+    // otherwise re-fire every poll for the rest of the recording.
+    const now = Date.now();
+    if (target <= lastTarget && now - lastJumpAt < GAP_SEEK_COOLDOWN_MS) return;
+    lastTarget = target;
+    lastJumpAt = now;
+
+    console.info(
+      `[videoshare] stepping over a ${(target - from).toFixed(3)}s hole in the video timeline (${from.toFixed(3)} → ${target.toFixed(3)})`,
+    );
+    // Count the jump as progress so the watchdog gives the seek time to land.
+    lastTime = target;
+    stuck = 0;
+    video.currentTime = target;
+  };
+
+  const tick = (): void => {
+    // A pending seek is not an excuse — see `isStalling`.
+    if (!isStalling(lastTime, video)) {
+      lastTime = video.currentTime;
+      stuck = 0;
+      return;
+    }
+    if (++stuck >= STALL_TICKS) jump();
+  };
+
+  const watch = (): void => {
+    lastTime = video.currentTime;
+    stuck = 0;
+    timer ??= window.setInterval(tick, STALL_POLL_MS);
+  };
+
+  /** Stops polling but stays subscribed, so `play` can bring the watchdog back. */
+  const rest = (): void => {
+    if (timer === null) return;
+    window.clearInterval(timer);
+    timer = null;
+  };
+
+  const disarm = (): void => {
+    rest();
+    video.removeEventListener("waiting", jump);
+    video.removeEventListener("play", watch);
+    video.removeEventListener("ended", rest);
+    video.removeEventListener("error", disarm);
+  };
+
+  video.addEventListener("waiting", jump);
+  video.addEventListener("play", watch);
+  // Nothing to rescue in the ended state, and the poll would run for as long as
+  // the page stays open; a replay fires `play` and arms it again.
+  video.addEventListener("ended", rest);
+  video.addEventListener("error", disarm);
+  watch();
+  return disarm;
+}
+
 async function streamToMediaSource(
   meta: VideoMeta,
   id: string,
@@ -484,10 +602,15 @@ async function main(): Promise<void> {
 
   const url = `${base}/${fragment.id}/video.bin`;
   if (canStream(meta.mimeType)) {
+    // Armed for the whole MSE lifetime, and deliberately left running when the
+    // append loop returns: the last chunk landing and endOfStream() is exactly
+    // when a hole near the end of the recording strands the playhead (§8).
+    const disarm = armGapJumper();
     try {
       await streamToMediaSource(meta, fragment.id, key, makeBlockReader(url, meta));
       return;
     } catch (err) {
+      disarm();
       if (err instanceof PlaybackError || appendedAny) throw err;
       console.warn("[videoshare] progressive playback failed, downloading the whole file", err);
     }

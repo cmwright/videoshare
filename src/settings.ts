@@ -8,7 +8,7 @@ export const DEFAULT_REGION = "us-east-1";
 export const DEFAULT_QUALITY: Quality = "standard";
 export const DEFAULT_PREFER_AV1 = false;
 /** Fallback MediaRecorder engine only (SPEC §6/§9). */
-export const DEFAULT_VIDEO_BITS_PER_SECOND = 1_200_000;
+export const DEFAULT_VIDEO_BITS_PER_SECOND = 2_500_000;
 
 /** Every accepted `quality` value, in UI order. */
 export const QUALITIES: readonly Quality[] = ["smaller", "standard", "sharper"];

@@ -85,7 +85,76 @@ export const KEYFRAME_INTERVAL_US = 8_000_000;
  * frames instead of dropping them would grow latency and memory without bound,
  * and holding VideoFrames open stalls the capture pipeline outright.
  */
-const MAX_ENCODE_QUEUE = 4;
+export const MAX_ENCODE_QUEUE = 4;
+
+/**
+ * Heartbeat (§6): how long the video timeline may stand still before the last
+ * frame is re-encoded at the current media time.
+ *
+ * Screen capture is variable frame rate — a still screen delivers nothing at
+ * all — and the backpressure valve above drops delta frames whenever the
+ * encoder falls behind. Both leave a hole in the video timeline. Played as a
+ * file that is invisible (the decoder holds the last picture for longer), but
+ * MSE splits its buffered ranges at a hole and the player stops dead at the
+ * edge of the first one (§8). One repeated frame costs almost nothing in
+ * quantizer mode — it is a delta against a picture it is identical to — so the
+ * timeline is kept continuous instead.
+ */
+export const HEARTBEAT_IDLE_MS = 1000;
+
+/**
+ * How often that idle check runs. Half the idle threshold, so the hole a
+ * heartbeat can leave behind is bounded by roughly 1.5 × the threshold rather
+ * than 2 × it, and the check itself is a comparison against a timestamp.
+ */
+export const HEARTBEAT_INTERVAL_MS = 500;
+
+/** Everything the heartbeat decision looks at, as plain numbers (SPEC §13). */
+export interface HeartbeatInput {
+  /** Wall clock now, in milliseconds. */
+  nowMs: number;
+  /** Wall clock when a frame was last handed to the video encoder. */
+  lastEncodeAtMs: number;
+  /** `VideoEncoder.encodeQueueSize` at this instant. */
+  queueSize: number;
+  /** A clone of the last delivered frame is being held, on a started clock. */
+  hasFrame: boolean;
+  /** The engine is still recording: encoder configured, not stopped, not failed. */
+  recording: boolean;
+}
+
+/**
+ * Whether to emit a heartbeat frame right now (§6).
+ *
+ * The queue test is the important one: a heartbeat is only free when the
+ * encoder is idle. Adding frames to an encoder that is already behind is how
+ * the backpressure valve gets tripped in the first place, and it would trade
+ * one hole for a bigger one.
+ */
+export function heartbeatDue(input: HeartbeatInput): boolean {
+  return (
+    input.recording &&
+    input.hasFrame &&
+    input.queueSize <= MAX_ENCODE_QUEUE &&
+    input.nowMs - input.lastEncodeAtMs > HEARTBEAT_IDLE_MS
+  );
+}
+
+/**
+ * The media timestamp a heartbeat frame carries: the last encoded timestamp
+ * plus the wall time since, so the video clock tracks real time across a still
+ * stretch instead of compressing it. Capture timestamps and `performance.now()`
+ * are the same clock in the browsers this engine runs on, and the result is
+ * always strictly ahead of `lastEncodeUs` — the muxer rejects a video timestamp
+ * that is not.
+ */
+export function heartbeatTimestampUs(
+  lastEncodeUs: number,
+  lastEncodeAtMs: number,
+  nowMs: number,
+): number {
+  return lastEncodeUs + Math.max(1, Math.round((nowMs - lastEncodeAtMs) * 1000));
+}
 
 /** Opus for the mixed mono voice track (§6). */
 export const OPUS_BITRATE = 48_000;
@@ -95,7 +164,7 @@ export const OPUS_BITRATE = 48_000;
  * frames — Opus's own frame size, so the encoder packetizes them one for one.
  * See `fillAudioGap()` for why the audio clock may not be allowed to stop.
  */
-const SILENCE_FRAME_US = 20_000;
+export const SILENCE_FRAME_US = 20_000;
 
 /**
  * How far that synthetic audio clock is kept ahead of the video clock. The
@@ -103,14 +172,43 @@ const SILENCE_FRAME_US = 20_000;
  * audio has to lead; a fifth of a second covers encoder latency without putting
  * a noticeable tail of silence on the end of the file.
  */
-const SILENCE_LEAD_US = 200_000;
+export const SILENCE_LEAD_US = 200_000;
 
 /**
- * Ceiling on catching that clock up in one go. A backgrounded tab can leave a
- * minutes-wide hole, and filling it 20 ms at a time would block the video pump;
- * the audio really is missing for that stretch, so the clock jumps instead.
+ * Ceiling on catching that clock up in one go, and so also the widest jump the
+ * silence clock may take — a jump leaves a hole in the audio track exactly as
+ * wide as the stretch it skipped.
+ *
+ * It exists for a tab throttled so hard that nothing in this engine runs for
+ * minutes: the audio really is missing for that stretch, and filling it 20 ms
+ * at a time would block the video pump for tens of thousands of encodes.
+ *
+ * Which is why it has to stay clear of the heartbeat's cadence. A heartbeat on
+ * a still screen advances the video clock by up to `HEARTBEAT_IDLE_MS +
+ * HEARTBEAT_INTERVAL_MS` at a time (1.5 s), and clamping anywhere below that
+ * would punch a hole in the *audio* track on every single heartbeat. MSE
+ * intersects the two tracks' buffered ranges, so an audio hole splits playback
+ * exactly as a video hole does (§8) — the heartbeat would be trading the stall
+ * it exists to prevent for a periodic version of the same thing.
+ *
+ * Set to twice that stride: a heartbeat delayed by a busy main thread — the
+ * exact condition that drops frames in the first place — still gets its gap
+ * filled, and the loop stays bounded at 150 encodes of 20 ms each. Everything
+ * after the track ended is silence anyway, so filling more of it costs nothing
+ * but those encodes.
  */
-const MAX_SILENCE_CATCHUP_US = 1_000_000;
+export const MAX_SILENCE_CATCHUP_US = 3_000_000;
+
+/**
+ * Where the silence clock resumes when it is behind `targetUs`: where it
+ * already is (so the gap gets filled frame by frame), or the far end of the
+ * catch-up ceiling when the gap is wider than this engine can be responsible
+ * for. See `MAX_SILENCE_CATCHUP_US` for which is which and why the boundary
+ * sits where it does.
+ */
+export function silenceCatchUpUs(silenceUs: number, targetUs: number): number {
+  return targetUs - silenceUs > MAX_SILENCE_CATCHUP_US ? targetUs - MAX_SILENCE_CATCHUP_US : silenceUs;
+}
 
 /** MediaRecorder fallback: audio bitrate and timeslice (§6). */
 export const FALLBACK_AUDIO_BITRATE = 64_000;
@@ -143,8 +241,8 @@ const NOMINAL_FRAME_RATE = 30;
  *   fonts), at roughly double the bytes of `standard`.
  */
 export const QUANTIZERS: Record<VideoCodec, Record<Quality, number>> = {
-  vp9: { smaller: 42, standard: 32, sharper: 24 },
-  av1: { smaller: 168, standard: 128, sharper: 96 },
+  vp9: { smaller: 38, standard: 28, sharper: 20 },
+  av1: { smaller: 152, standard: 112, sharper: 80 },
 };
 
 export function quantizerFor(codec: VideoCodec, quality: Quality): number {
@@ -372,6 +470,15 @@ function even(n: number): number {
   return Math.max(2, n - (n % 2));
 }
 
+/**
+ * Monotonic wall clock. The same one capture timestamps are measured against,
+ * which is what lets the heartbeat carry the media clock forward by elapsed
+ * real time (see `heartbeatTimestampUs`).
+ */
+function nowMs(): number {
+  return typeof performance !== "undefined" ? performance.now() : Date.now();
+}
+
 // --- WebCodecs engine --------------------------------------------------------
 
 type PendingChunk =
@@ -407,6 +514,19 @@ class WebCodecsEngine implements RecorderEngine {
   /** Shared A/V zero point in microseconds; frozen once the muxer exists. */
   private base: number | null = null;
   private lastKeyframeUs = Number.NEGATIVE_INFINITY;
+
+  /**
+   * A clone of the last frame off the capture track, held open so the §6
+   * heartbeat has something to re-encode when the screen goes still. Sharing
+   * the original's pixels, it costs one buffer out of the capture pool — which
+   * is why exactly one is ever held and every exit path closes it.
+   */
+  private retained: VideoFrame | null = null;
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  /** Media timestamp of the last frame handed to the video encoder, in µs. */
+  private lastEncodeUs = Number.NEGATIVE_INFINITY;
+  /** Wall clock when that happened — what "the timeline has stood still" means. */
+  private lastEncodeAtMs = 0;
 
   private videoReader: ReadableStreamDefaultReader<VideoFrame> | null = null;
   private audioReader: ReadableStreamDefaultReader<AudioData> | null = null;
@@ -608,6 +728,10 @@ class WebCodecsEngine implements RecorderEngine {
         try {
           if (this.stopped || this.failure) return;
           if (!this.videoEncoder) this.configureVideo(value);
+          // Taken before the encoder sees the frame, and kept after the
+          // `finally` below closes it: the heartbeat may need this picture
+          // seconds from now, when nothing else has arrived (§6).
+          this.retain(value);
           // Before the frame, not after: the muxer will not release a video
           // block until audio has passed its timestamp.
           this.fillAudioGap(value.timestamp);
@@ -618,6 +742,10 @@ class WebCodecsEngine implements RecorderEngine {
         }
       }
     } finally {
+      // The track is done delivering, so there is nothing left to repeat: a
+      // heartbeat past this point would only extend the recording with a frozen
+      // picture the capture never produced.
+      this.releaseHeartbeat();
       await cancelReader(reader);
     }
   }
@@ -641,17 +769,45 @@ class WebCodecsEngine implements RecorderEngine {
     this.videoEncoder = encoder;
     this.videoSize = { width, height };
     this.openMuxer();
+    // There is a picture to repeat from here on, so start watching for
+    // stillness. Nothing catches a throw out of a timer callback the way the
+    // pumps' `allSettled` does, so a broken encoder has to be routed by hand.
+    this.heartbeatTimer ??= setInterval(() => {
+      try {
+        this.heartbeat();
+      } catch (err) {
+        this.fail(err);
+      }
+    }, HEARTBEAT_INTERVAL_MS);
   }
 
+  /** A frame straight off the capture track: droppable under backpressure. */
   private encodeFrame(frame: VideoFrame): void {
+    this.noteBase(frame.timestamp);
+    // A heartbeat can carry the media clock a frame or two past a frame that
+    // was captured just before it, because capture timestamps trail delivery.
+    // The muxer refuses a video timestamp below the one before it — that would
+    // end the recording — and the heartbeat has already put this instant on the
+    // timeline, so the straggler is dropped instead.
+    if (frame.timestamp <= this.lastEncodeUs) return;
+    this.submit(frame, true);
+  }
+
+  /**
+   * Hands one frame to the video encoder at its own timestamp.
+   *
+   * `droppable` is the §6 backpressure valve: an incoming delta frame is
+   * expendable when the encoder is already behind, because another one is 33 ms
+   * away. Keyframes never are — dropping one breaks every frame that
+   * references it — and neither is a heartbeat, which only ever runs when the
+   * queue is short in the first place.
+   */
+  private submit(frame: VideoFrame, droppable: boolean): void {
     const encoder = this.videoEncoder;
     if (!encoder || encoder.state !== "configured") return;
-    this.noteBase(frame.timestamp);
 
     const keyFrame = frame.timestamp - this.lastKeyframeUs >= KEYFRAME_INTERVAL_US;
-    // Backpressure: deltas are droppable, keyframes are not — dropping one
-    // would break every frame that references it.
-    if (!keyFrame && encoder.encodeQueueSize > MAX_ENCODE_QUEUE) return;
+    if (!keyFrame && droppable && encoder.encodeQueueSize > MAX_ENCODE_QUEUE) return;
 
     const options: QuantizerEncodeOptions = { keyFrame };
     const quantizer = quantizerFor(this.videoCodec, this.opts.quality);
@@ -661,10 +817,90 @@ class WebCodecsEngine implements RecorderEngine {
     const source = this.fit(frame);
     try {
       encoder.encode(source, options);
+      this.lastEncodeUs = frame.timestamp;
+      this.lastEncodeAtMs = nowMs();
       if (keyFrame) this.lastKeyframeUs = frame.timestamp;
     } finally {
       if (source !== frame) source.close();
     }
+  }
+
+  // --- Heartbeat (§6) --------------------------------------------------------
+
+  /** Replaces the retained clone, closing the one it supersedes. */
+  private retain(frame: VideoFrame): void {
+    let clone: VideoFrame;
+    try {
+      clone = new VideoFrame(frame);
+    } catch (err) {
+      // Out of capture buffers, most likely. The clone already held is an
+      // older picture but still a valid one, so keep it rather than going blind.
+      console.warn("[videoshare] could not retain a frame for the heartbeat", err);
+      return;
+    }
+    this.retained?.close();
+    this.retained = clone;
+  }
+
+  /**
+   * Re-encodes the retained frame at the current media time when nothing has
+   * reached the encoder for {@link HEARTBEAT_IDLE_MS} (§6). The picture is
+   * unchanged, so in quantizer mode the delta frame costs a few dozen bytes;
+   * what it buys is a video timeline with no hole for MSE to split on (§8).
+   */
+  private heartbeat(): void {
+    if (this.stopped || this.failure) {
+      this.releaseHeartbeat();
+      return;
+    }
+
+    const frame = this.retained;
+    const encoder = this.videoEncoder;
+    const now = nowMs();
+    const due = heartbeatDue({
+      nowMs: now,
+      lastEncodeAtMs: this.lastEncodeAtMs,
+      queueSize: encoder?.encodeQueueSize ?? 0,
+      // A picture to repeat, and a clock that has actually started.
+      hasFrame: frame !== null && Number.isFinite(this.lastEncodeUs),
+      recording: encoder?.state === "configured",
+    });
+    if (!due || !frame) return;
+
+    const timestamp = heartbeatTimestampUs(this.lastEncodeUs, this.lastEncodeAtMs, now);
+    let source: VideoFrame;
+    try {
+      // The retained clone still carries its original timestamp; re-stamping it
+      // shares the same pixels rather than copying them.
+      source = new VideoFrame(frame, { timestamp });
+    } catch (err) {
+      console.warn("[videoshare] could not synthesize a heartbeat frame", err);
+      return;
+    }
+
+    try {
+      // Same order as the capture pump, and for the same reason: the muxer
+      // holds a video block until the audio clock has passed it, so a heartbeat
+      // that skipped this would stop the byte stream instead of feeding it.
+      this.fillAudioGap(timestamp);
+      // Never droppable: `heartbeatDue` already refused if the queue was long,
+      // and a heartbeat that crosses the 8 s deadline is a keyframe like any
+      // other frame would be.
+      this.submit(source, false);
+    } finally {
+      source.close();
+    }
+  }
+
+  /** Stops the heartbeat and gives the retained capture buffer back. */
+  private releaseHeartbeat(): void {
+    if (this.heartbeatTimer !== null) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+    // A VideoFrame left open holds a buffer the capture pipeline needs back.
+    this.retained?.close();
+    this.retained = null;
   }
 
   /**
@@ -878,9 +1114,9 @@ class WebCodecsEngine implements RecorderEngine {
     if (!silence || !input || !encoder || encoder.state !== "configured") return;
 
     const target = videoTimestamp + SILENCE_LEAD_US;
-    if (target - silence.timestamp > MAX_SILENCE_CATCHUP_US) {
-      silence.timestamp = target - MAX_SILENCE_CATCHUP_US;
-    }
+    // Normally a no-op: every video frame and every heartbeat comes through
+    // here, so the clock is at most a heartbeat behind and gets filled in full.
+    silence.timestamp = silenceCatchUpUs(silence.timestamp, target);
 
     while (silence.timestamp < target) {
       try {
@@ -1019,6 +1255,9 @@ class WebCodecsEngine implements RecorderEngine {
     console.error("[videoshare] recording engine failed", err);
     if (this.failure) return;
     this.failure = toError(err);
+    // Nothing more will be encoded, so the heartbeat has no reason to hold a
+    // capture buffer open until stop() eventually arrives.
+    this.releaseHeartbeat();
     // Both pumps check `failure` on every read and return, so from here the
     // engine is silent: no more ondata, no rejection until stop() is called.
     // The page has to be told now, while there is still a capture to end.
@@ -1030,6 +1269,9 @@ class WebCodecsEngine implements RecorderEngine {
 
   private async finish(): Promise<void> {
     this.stopped = true;
+    // First, before anything below awaits: a heartbeat landing between the
+    // flush and finalize() would encode into an encoder that is being drained.
+    this.releaseHeartbeat();
     await cancelReader(this.videoReader);
     await cancelReader(this.audioReader);
     await this.pumps;

@@ -43,8 +43,8 @@ import {
 import { formatBytes, formatDuration, randomId } from "./util";
 
 /** Capture ceiling (SPEC §6): a 4K display downscales, and 30fps is plenty for a screen. */
-const MAX_WIDTH = 1920;
-const MAX_HEIGHT = 1080;
+const MAX_WIDTH = 2560;
+const MAX_HEIGHT = 1440;
 const MAX_FRAME_RATE = 30;
 
 /** Cap on waiting for the preview element during the duration probe. */
@@ -546,8 +546,8 @@ function releaseCapture(): void {
 async function startCapture(useMic: boolean): Promise<Capture> {
   // getDisplayMedia must run within the click's transient user activation, so it
   // goes first: awaiting a microphone permission prompt before it can expire it.
-  // Capped at 1080p30 (SPEC §6): a Retina or 4K display would otherwise hand the
-  // encoder four times the pixels for no legibility gain, at four times the size.
+  // Capped at 1440p30 (SPEC §6): enough pixels for legible Retina text, while
+  // staying inside what software VP9 encodes in real time without heavy drops.
   const display = await navigator.mediaDevices.getDisplayMedia({
     video: {
       frameRate: { ideal: MAX_FRAME_RATE, max: MAX_FRAME_RATE },
