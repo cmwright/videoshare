@@ -681,7 +681,10 @@ class WebCodecsEngine implements RecorderEngine {
       // Constant quality: `bitrate` is ignored, every frame carries its own
       // quantizer instead (§6).
       bitrateMode: "quantizer",
-      latencyMode: "quality",
+      // "realtime" runs libvpx's fast motion search — 5-10x faster than
+      // "quality", which cannot keep up with native-resolution capture (§6).
+      // Same quantizer, so text stays as sharp; files run somewhat larger.
+      latencyMode: "realtime",
     };
     // Screen content: keep text edges crisp rather than smoothing for motion.
     if (contentHint) config.contentHint = "text";

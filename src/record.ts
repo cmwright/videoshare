@@ -49,6 +49,10 @@ import { formatBytes, formatDuration, randomId } from "./util";
 const MAX_WIDTH = 3840;
 const MAX_HEIGHT = 2160;
 const MAX_FRAME_RATE = 30;
+/** Captures above QHD drop to this frame rate (SPEC §6): native-resolution text
+ * detail beats 30fps for screencasts, and the encoder cannot deliver both. */
+const HIGH_RES_FRAME_RATE = 20;
+const HIGH_RES_PIXELS = 2560 * 1440;
 
 /** Cap on waiting for the preview element during the duration probe. */
 const ELEMENT_TIMEOUT_MS = 5000;
@@ -577,6 +581,17 @@ async function startCapture(useMic: boolean): Promise<Capture> {
   // Tells the encoder this is screen content: it should hold sharp edges and
   // small text rather than smooth motion (SPEC §6).
   video.contentHint = "text";
+
+  // Above QHD the software encoder cannot hold 30fps; trading frame rate for
+  // the full native text detail is the right deal for screencasts (SPEC §6).
+  const { width = 0, height = 0 } = video.getSettings();
+  if (width * height > HIGH_RES_PIXELS) {
+    try {
+      await video.applyConstraints({ frameRate: { ideal: HIGH_RES_FRAME_RATE, max: HIGH_RES_FRAME_RATE } });
+    } catch {
+      // A capture that rejects the tighter cap keeps the original one.
+    }
+  }
 
   const recorded = new MediaStream([video]);
   const sources = [...display.getAudioTracks(), ...(mic?.getAudioTracks() ?? [])];

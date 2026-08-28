@@ -117,7 +117,11 @@ Two objects per video, under the id as prefix:
 
   1. **Primary — WebCodecs engine** (when `VideoEncoder`, `AudioEncoder` and
      `MediaStreamTrackProcessor` all exist; Chrome/Edge): `VideoEncoder` in
-     **quantizer (constant-quality) mode**, `latencyMode: "quality"`. Codec:
+     **quantizer (constant-quality) mode**, `latencyMode: "realtime"` (the
+     "quality" tuning cannot encode native-resolution capture at speed; same
+     quantizer keeps text equally sharp at a modest file-size cost). Captures
+     above QHD (2560x1440 pixels) additionally apply a 20fps track constraint
+     after acquisition — native text detail beats 30fps for screencasts. Codec:
      AV1 when `preferAv1` and encode support, else VP9 (proper codec strings,
      e.g. `av01.0.08M.08` / `vp09.00.10.08`; the exact string used flows into
      `meta.mimeType`). `quality` maps to a per-codec quantizer table (implementer
