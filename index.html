@@ -8,13 +8,48 @@
     <title>VideoShare — Record</title>
     <!-- Deploy config, copied verbatim to dist/. Classic script: runs before the module. -->
     <script src="/config.js"></script>
+    <!-- JS off: capture, encryption and upload all live in this tab, so every card
+         is inert. Hide them and let the <noscript> panel be the page's one state. -->
+    <noscript>
+      <style>
+        .page .card {
+          display: none !important;
+        }
+      </style>
+    </noscript>
   </head>
 
   <body>
+    <!-- Same topbar as view.html, down to the mark and the badge: a viewer who
+         follows a link and a recorder who made it are looking at one product. -->
+    <header class="topbar">
+      <div class="topbar-inner">
+        <a class="brand" href="/">
+          <svg class="brand-mark" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+            <rect class="brand-mark-frame" x="0.75" y="4.5" width="18.5" height="11" rx="2.5" />
+            <path class="brand-mark-play" d="M8.6 7.4 L13.2 10 L8.6 12.6 Z" />
+          </svg>
+          <span class="brand-name">VideoShare</span>
+        </a>
+
+        <!-- Honest, not a boast: the key is minted here and never leaves this tab. -->
+        <span class="badge-secure" title="Encrypted in this browser">
+          <svg class="badge-lock" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+            <path class="badge-lock-shackle" d="M5.25 7.25V5.25a2.75 2.75 0 0 1 5.5 0v2" />
+            <rect class="badge-lock-body" x="3" y="7.25" width="10" height="6.5" rx="1.6" />
+          </svg>
+          <span class="badge-label">Encrypted in this browser</span>
+        </span>
+      </div>
+    </header>
+
     <main class="page">
-      <header class="site-header">
-        <h1 class="brand">VideoShare</h1>
-        <p class="muted">Record your screen, encrypt it here, share a link.</p>
+      <header class="page-head">
+        <h1>Record your screen</h1>
+        <p class="page-lede">
+          Capture a screen, window or tab. It is encrypted in this browser as it uploads, and the
+          link you get back carries the only key.
+        </p>
       </header>
 
       <!--
@@ -23,24 +58,32 @@
         breath — the two are mutually exclusive by design.
       -->
       <section id="auth-panel" class="card auth hidden" aria-label="Sign in">
-        <p id="auth-loading" class="muted hint">Loading Google sign-in…</p>
+        <p id="auth-loading" class="auth-loading">
+          <span class="spinner" aria-hidden="true"></span>
+          Loading Google sign-in&hellip;
+        </p>
 
         <div id="auth-signed-out" class="auth-row hidden">
-          <p class="muted hint">
-            Sign in with Google to record. Uploads are authorized by the gateway, so this browser
-            never holds bucket credentials.
+          <p class="auth-lead">
+            <strong>Sign in with Google to record.</strong> Uploads are authorized by the gateway, so
+            this browser never holds bucket credentials.
           </p>
           <div id="auth-button"></div>
         </div>
 
         <div id="auth-signed-in" class="auth-row hidden">
           <p class="auth-identity">
-            Signed in as <strong id="auth-email"></strong>
+            <span class="auth-check" aria-hidden="true">
+              <svg viewBox="0 0 16 16" focusable="false">
+                <path d="M3.6 8.5 6.5 11.3 12.4 5.2" />
+              </svg>
+            </span>
+            <span class="auth-identity-text">Signed in as <strong id="auth-email"></strong></span>
           </p>
           <button id="sign-out" type="button" class="ghost">Sign out</button>
         </div>
 
-        <p id="auth-status" class="muted hint" role="status" aria-live="polite"></p>
+        <p id="auth-status" class="hint muted" role="status" aria-live="polite"></p>
         <p id="auth-warning" class="hint error hidden"></p>
       </section>
 
@@ -52,112 +95,19 @@
         values and same copy as the matching fields in the settings form —
         distinct ids because both panels exist in this document.
       -->
-      <details id="recording-panel" class="card settings hidden">
-        <summary>Recording options</summary>
+      <details id="recording-panel" class="card panel hidden">
+        <summary class="panel-summary">
+          <span class="panel-summary-text">
+            <span class="panel-title">Recording options</span>
+            <span class="panel-sub">Quality, codec and fallback bitrate &mdash; saved as you change them</span>
+          </span>
+        </summary>
 
-        <div class="fields">
-          <div class="field">
-            <label for="rec-quality">Recording quality</label>
-            <select id="rec-quality">
-              <option value="smaller">Smaller — smallest files</option>
-              <option value="standard" selected>Standard — crisp text</option>
-              <option value="sharper">Sharper — largest files</option>
-            </select>
-            <p class="muted hint">Constant quality, so busy screens cost more bytes than still ones.</p>
-          </div>
-
-          <div class="field">
-            <label for="rec-videoBitsPerSecond">Fallback bitrate (bits/s)</label>
-            <input id="rec-videoBitsPerSecond" type="number" min="100000" step="100000" value="2500000" />
-            <p class="muted hint">
-              Only used where recording falls back to the browser's own MediaRecorder — Firefox,
-              and anything else without the WebCodecs pieces this app needs. Normally ignored in
-              Chrome and Edge, which encode through WebCodecs, but they use it too if no WebCodecs
-              configuration works.
-            </p>
-          </div>
-
-          <div class="field wide">
-            <label for="rec-codec">Video codec</label>
-            <select id="rec-codec">
-              <option value="auto" selected>Auto — hardware H.264 when available (recommended)</option>
-              <option value="h264">H.264 — hardware where available, larger files, widest playback</option>
-              <option value="vp9">VP9 — smallest files, software, may drop frames at high resolution</option>
-              <option value="av1">AV1 — smallest, some Safari viewers can't play</option>
-            </select>
-            <p class="muted hint">
-              Chrome and Edge only. Hardware H.264 encodes 4K without dropping frames; the software
-              codecs trade that for smaller uploads. If the codec you pick isn't available here, the
-              recorder falls back and says which one it used — H.264 itself falls back to a software
-              H.264 encoder, which is slower and no smaller. For Safari viewers, H.264 also needs a
-              recording machine with an AAC encoder: without one (desktop Linux) the MP4 carries
-              Opus audio, which Safari cannot play.
-            </p>
-          </div>
-        </div>
-
-        <p id="recording-status" class="muted hint" role="status" aria-live="polite"></p>
-      </details>
-
-      <details id="settings-panel" class="card settings">
-        <summary id="settings-summary">Storage settings</summary>
-
-        <form id="settings-form" autocomplete="off">
-          <p class="muted hint">
-            Credentials stay in this browser's localStorage and are used to sign uploads directly
-            to your bucket. A write-only key is enough — see
-            <code>docs/storage-setup.md</code>.
-          </p>
-
+        <div class="panel-body">
           <div class="fields">
-            <div class="field wide">
-              <label for="endpoint">S3 endpoint</label>
-              <input
-                id="endpoint"
-                name="endpoint"
-                type="url"
-                required
-                placeholder="http://localhost:9000"
-                spellcheck="false"
-              />
-            </div>
-
             <div class="field">
-              <label for="bucket">Bucket</label>
-              <input id="bucket" name="bucket" type="text" required placeholder="videoshare" spellcheck="false" />
-            </div>
-
-            <div class="field">
-              <label for="region">Region</label>
-              <input id="region" name="region" type="text" value="us-east-1" spellcheck="false" />
-            </div>
-
-            <div class="field">
-              <label for="accessKeyId">Access key ID</label>
-              <input id="accessKeyId" name="accessKeyId" type="text" required spellcheck="false" />
-            </div>
-
-            <div class="field">
-              <label for="secretAccessKey">Secret access key</label>
-              <input id="secretAccessKey" name="secretAccessKey" type="password" required />
-            </div>
-
-            <div class="field wide">
-              <label for="publicBaseUrl">Public base URL</label>
-              <input
-                id="publicBaseUrl"
-                name="publicBaseUrl"
-                type="url"
-                required
-                placeholder="http://localhost:9000/videoshare"
-                spellcheck="false"
-              />
-              <p class="muted hint">Where the bucket's objects are readable without credentials.</p>
-            </div>
-
-            <div class="field">
-              <label for="quality">Recording quality</label>
-              <select id="quality" name="quality">
+              <label for="rec-quality">Recording quality</label>
+              <select id="rec-quality">
                 <option value="smaller">Smaller — smallest files</option>
                 <option value="standard" selected>Standard — crisp text</option>
                 <option value="sharper">Sharper — largest files</option>
@@ -166,15 +116,8 @@
             </div>
 
             <div class="field">
-              <label for="videoBitsPerSecond">Fallback bitrate (bits/s)</label>
-              <input
-                id="videoBitsPerSecond"
-                name="videoBitsPerSecond"
-                type="number"
-                min="100000"
-                step="100000"
-                value="2500000"
-              />
+              <label for="rec-videoBitsPerSecond">Fallback bitrate (bits/s)</label>
+              <input id="rec-videoBitsPerSecond" type="number" min="100000" step="100000" value="2500000" />
               <p class="muted hint">
                 Only used where recording falls back to the browser's own MediaRecorder — Firefox,
                 and anything else without the WebCodecs pieces this app needs. Normally ignored in
@@ -184,8 +127,8 @@
             </div>
 
             <div class="field wide">
-              <label for="codec">Video codec</label>
-              <select id="codec" name="codec">
+              <label for="rec-codec">Video codec</label>
+              <select id="rec-codec">
                 <option value="auto" selected>Auto — hardware H.264 when available (recommended)</option>
                 <option value="h264">H.264 — hardware where available, larger files, widest playback</option>
                 <option value="vp9">VP9 — smallest files, software, may drop frames at high resolution</option>
@@ -202,82 +145,233 @@
             </div>
           </div>
 
+          <p id="recording-status" class="hint muted" role="status" aria-live="polite"></p>
+        </div>
+      </details>
+
+      <details id="settings-panel" class="card panel">
+        <summary id="settings-summary" class="panel-summary">
+          <span class="panel-summary-text">
+            <span class="panel-title">Storage settings</span>
+            <span class="panel-sub">Bucket endpoint and keys, kept in this browser</span>
+          </span>
+        </summary>
+
+        <form id="settings-form" class="panel-body" autocomplete="off">
+          <p class="panel-note">
+            Credentials stay in this browser's localStorage and are used to sign uploads directly
+            to your bucket. A write-only key is enough — see
+            <code>docs/storage-setup.md</code>.
+          </p>
+
+          <fieldset class="field-group">
+            <legend class="group-title">Bucket</legend>
+
+            <div class="fields">
+              <div class="field wide">
+                <label for="endpoint">S3 endpoint</label>
+                <input
+                  id="endpoint"
+                  name="endpoint"
+                  type="url"
+                  required
+                  placeholder="http://localhost:9000"
+                  spellcheck="false"
+                />
+              </div>
+
+              <div class="field">
+                <label for="bucket">Bucket</label>
+                <input id="bucket" name="bucket" type="text" required placeholder="videoshare" spellcheck="false" />
+              </div>
+
+              <div class="field">
+                <label for="region">Region</label>
+                <input id="region" name="region" type="text" value="us-east-1" spellcheck="false" />
+              </div>
+
+              <div class="field">
+                <label for="accessKeyId">Access key ID</label>
+                <input id="accessKeyId" name="accessKeyId" type="text" required spellcheck="false" />
+              </div>
+
+              <div class="field">
+                <label for="secretAccessKey">Secret access key</label>
+                <input id="secretAccessKey" name="secretAccessKey" type="password" required />
+              </div>
+
+              <div class="field wide">
+                <label for="publicBaseUrl">Public base URL</label>
+                <input
+                  id="publicBaseUrl"
+                  name="publicBaseUrl"
+                  type="url"
+                  required
+                  placeholder="http://localhost:9000/videoshare"
+                  spellcheck="false"
+                />
+                <p class="muted hint">Where the bucket's objects are readable without credentials.</p>
+              </div>
+            </div>
+          </fieldset>
+
+          <!-- The same three choices gateway mode keeps in its own panel (SPEC §15.5);
+               legacy mode leaves them here, grouped so they read as one subject. -->
+          <fieldset class="field-group">
+            <legend class="group-title">Recording options</legend>
+
+            <div class="fields">
+              <div class="field">
+                <label for="quality">Recording quality</label>
+                <select id="quality" name="quality">
+                  <option value="smaller">Smaller — smallest files</option>
+                  <option value="standard" selected>Standard — crisp text</option>
+                  <option value="sharper">Sharper — largest files</option>
+                </select>
+                <p class="muted hint">Constant quality, so busy screens cost more bytes than still ones.</p>
+              </div>
+
+              <div class="field">
+                <label for="videoBitsPerSecond">Fallback bitrate (bits/s)</label>
+                <input
+                  id="videoBitsPerSecond"
+                  name="videoBitsPerSecond"
+                  type="number"
+                  min="100000"
+                  step="100000"
+                  value="2500000"
+                />
+                <p class="muted hint">
+                  Only used where recording falls back to the browser's own MediaRecorder — Firefox,
+                  and anything else without the WebCodecs pieces this app needs. Normally ignored in
+                  Chrome and Edge, which encode through WebCodecs, but they use it too if no WebCodecs
+                  configuration works.
+                </p>
+              </div>
+
+              <div class="field wide">
+                <label for="codec">Video codec</label>
+                <select id="codec" name="codec">
+                  <option value="auto" selected>Auto — hardware H.264 when available (recommended)</option>
+                  <option value="h264">H.264 — hardware where available, larger files, widest playback</option>
+                  <option value="vp9">VP9 — smallest files, software, may drop frames at high resolution</option>
+                  <option value="av1">AV1 — smallest, some Safari viewers can't play</option>
+                </select>
+                <p class="muted hint">
+                  Chrome and Edge only. Hardware H.264 encodes 4K without dropping frames; the software
+                  codecs trade that for smaller uploads. If the codec you pick isn't available here, the
+                  recorder falls back and says which one it used — H.264 itself falls back to a software
+                  H.264 encoder, which is slower and no smaller. For Safari viewers, H.264 also needs a
+                  recording machine with an AAC encoder: without one (desktop Linux) the MP4 carries
+                  Opus audio, which Safari cannot play.
+                </p>
+              </div>
+            </div>
+          </fieldset>
+
           <div class="settings-actions">
             <button type="submit" class="primary">Save settings</button>
-            <span id="settings-status" class="muted" role="status" aria-live="polite"></span>
+            <span id="settings-status" class="hint muted" role="status" aria-live="polite"></span>
           </div>
         </form>
       </details>
 
       <section class="card recorder" aria-label="Recorder">
-        <div data-stage="idle" class="stage">
-          <button id="start" type="button" class="primary record-button">
-            <span class="record-glyph" aria-hidden="true"></span>
-            Record screen
-          </button>
-          <label class="toggle">
-            <input id="mic" type="checkbox" checked />
-            <span>Record microphone</span>
-          </label>
-        </div>
-
-        <div data-stage="picking" class="stage hidden">
-          <p class="muted">Waiting for you to choose a screen, window, or tab…</p>
-        </div>
-
-        <div data-stage="recording" class="stage hidden">
-          <div class="recording-row">
-            <span class="rec-dot" aria-hidden="true"></span>
-            <span id="timer" class="timer" role="timer" aria-live="off">00:00</span>
-            <button id="stop" type="button" class="danger">Stop recording</button>
-          </div>
-          <p id="uploaded" class="muted hint" role="status" aria-live="off">Uploading as you record…</p>
-          <p class="muted hint">The browser's own “Stop sharing” bar works too.</p>
-        </div>
-
-        <div data-stage="preview" class="stage hidden">
-          <video id="preview" class="preview-video" controls playsinline></video>
-          <p id="preview-info" class="muted hint"></p>
-          <div class="field">
-            <label for="title">Title</label>
-            <input id="title" type="text" placeholder="Untitled recording" maxlength="200" />
-          </div>
-          <div class="button-row">
-            <button id="finish" type="button" class="primary">Finish</button>
-            <button id="discard" type="button" class="danger">Discard</button>
-          </div>
-        </div>
-
-        <div data-stage="finishing" class="stage hidden">
-          <h2>Finishing…</h2>
-          <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="progress">
-            <div id="progress-fill" class="progress-fill"></div>
-          </div>
-          <p id="progress-text" class="muted hint">0%</p>
-
-          <div id="recovery" class="recovery hidden">
-            <p class="muted hint">
-              Nothing was lost — the recording is still in this tab. Download it, or try again.
+        <!-- Every stage stands in the same footprint, so the card never jumps
+             as the recorder moves between them — the share page's rule for its
+             player, applied to the thing that makes the recordings. -->
+        <div class="stages">
+          <div data-stage="idle" class="stage stage-idle">
+            <button id="start" type="button" class="primary record-button">
+              <span class="record-glyph" aria-hidden="true"></span>
+              Record screen
+            </button>
+            <label class="toggle">
+              <input id="mic" type="checkbox" checked />
+              <span>Record microphone</span>
+            </label>
+            <p class="stage-hint">
+              You'll pick a screen, window or tab next. The recording uploads as it goes, so nothing
+              waits on a big file at the end.
             </p>
+          </div>
+
+          <div data-stage="picking" class="stage stage-centered hidden">
+            <span class="spinner spinner-lg" aria-hidden="true"></span>
+            <p class="stage-title">Waiting for you to choose</p>
+            <p class="stage-hint">Pick a screen, window, or tab in the dialog your browser just opened.</p>
+          </div>
+
+          <div data-stage="recording" class="stage hidden">
+            <div class="recording-row">
+              <div class="rec-clock">
+                <span class="rec-status">
+                  <span class="rec-dot" aria-hidden="true"></span>
+                  Recording
+                </span>
+                <span id="timer" class="timer" role="timer" aria-live="off">00:00</span>
+              </div>
+              <button id="stop" type="button" class="danger stop-button">Stop recording</button>
+            </div>
+            <p id="uploaded" class="stage-meta" role="status" aria-live="off">Uploading as you record…</p>
+            <p class="stage-hint">The browser's own “Stop sharing” bar works too.</p>
+          </div>
+
+          <div data-stage="preview" class="stage hidden">
+            <!-- The frame carries the radius and the letterbox colour so the
+                 browser's own controls are clipped by the corners, the way the
+                 share page's stage clips its player. -->
+            <div class="preview-frame">
+              <video id="preview" class="preview-video" controls playsinline></video>
+            </div>
+            <p id="preview-info" class="stage-meta"></p>
+            <div class="field">
+              <label for="title">Title</label>
+              <input id="title" type="text" placeholder="Untitled recording" maxlength="200" />
+            </div>
             <div class="button-row">
-              <a id="download" class="button-link" download>Download recording</a>
-              <button id="retry" type="button" class="primary">Retry</button>
+              <button id="finish" type="button" class="primary">Finish</button>
+              <button id="discard" type="button" class="danger">Discard</button>
             </div>
           </div>
-        </div>
 
-        <div data-stage="done" class="stage hidden">
-          <h2>Ready to share</h2>
-          <div class="link-row">
-            <input id="link" type="text" readonly class="mono" aria-label="Share link" />
-            <button id="copy-link" type="button" class="primary">Copy</button>
+          <div data-stage="finishing" class="stage hidden">
+            <h2>Finishing&hellip;</h2>
+            <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="progress">
+              <div id="progress-fill" class="progress-fill"></div>
+            </div>
+            <p id="progress-text" class="stage-meta">0%</p>
+
+            <div id="recovery" class="recovery hidden">
+              <p class="recovery-note">
+                Nothing was lost — the recording is still in this tab. Download it, or try again.
+              </p>
+              <div class="button-row">
+                <a id="download" class="button-link" download>Download recording</a>
+                <button id="retry" type="button" class="primary">Retry</button>
+              </div>
+            </div>
           </div>
-          <p class="muted hint">
-            The decryption key lives in the link's <code>#</code> fragment — anyone with the link can
-            watch, and nobody else can.
-          </p>
-          <div class="button-row">
-            <button id="again" type="button">Record another</button>
+
+          <div data-stage="done" class="stage stage-done hidden">
+            <span class="state-icon state-icon-success" aria-hidden="true">
+              <svg class="state-glyph" viewBox="0 0 24 24" focusable="false">
+                <circle class="state-glyph-ring" cx="12" cy="12" r="9" />
+                <path class="state-glyph-check" d="M8.1 12.3 10.8 15 15.9 9.4" />
+              </svg>
+            </span>
+            <h2>Ready to share</h2>
+            <div class="link-row">
+              <input id="link" type="text" readonly class="mono" aria-label="Share link" />
+              <button id="copy-link" type="button" class="primary">Copy</button>
+            </div>
+            <p class="stage-hint">
+              The decryption key lives in the link's <code>#</code> fragment — anyone with the link can
+              watch, and nobody else can.
+            </p>
+            <div class="button-row">
+              <button id="again" type="button">Record another</button>
+            </div>
           </div>
         </div>
 
@@ -285,13 +379,52 @@
       </section>
 
       <section class="card library" aria-label="My videos">
-        <h2>My videos</h2>
-        <p id="library-empty" class="muted hint">
-          Nothing yet. Recordings you upload are listed here — this list is local to this browser.
+        <div class="card-head">
+          <h2>My videos</h2>
+          <p class="card-sub">
+            Kept in this browser. Removing a row here does not delete the video from the bucket.
+          </p>
+        </div>
+
+        <p id="library-empty" class="library-empty">
+          <span class="library-empty-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" focusable="false">
+              <rect class="library-empty-frame" x="1.5" y="5" width="21" height="14" rx="3" />
+              <path class="library-empty-play" d="M10.2 9.5 L15 12 L10.2 14.5 Z" />
+            </svg>
+          </span>
+          <span class="library-empty-text">
+            No recordings yet — the ones you upload from this browser will show up here.
+          </span>
         </p>
+
         <ul id="library-list" class="library-list"></ul>
       </section>
+
+      <noscript>
+        <section class="state-panel">
+          <span class="state-icon" aria-hidden="true">
+            <svg class="state-glyph" viewBox="0 0 24 24" focusable="false">
+              <circle class="state-glyph-ring" cx="12" cy="12" r="9" />
+              <path class="state-glyph-bar" d="M12 7.5v5" />
+              <circle class="state-glyph-dot" cx="12" cy="16.3" r="1" />
+            </svg>
+          </span>
+          <h2>JavaScript required</h2>
+          <p>
+            The recorder captures the screen, encrypts every chunk and uploads it entirely in this
+            tab, so it needs JavaScript enabled.
+          </p>
+        </section>
+      </noscript>
     </main>
+
+    <footer class="site-footer">
+      <div class="footer-inner">
+        <!-- Deploying a fork? Point this at your own repository. -->
+        Powered by <a href="https://github.com/cmwright/videoshare">VideoShare</a>
+      </div>
+    </footer>
 
     <script type="module" src="/src/record.ts"></script>
   </body>

@@ -1,27 +1,267 @@
-/* Recorder page layout. Tokens and base element styles come from app.css. */
+/* Recorder page (index.html). Shared tokens and base styles come from app.css,
+   loaded first; everything here is page-local.
 
-.page {
-  max-width: 760px;
-  margin: 0 auto;
-  padding: var(--space-6) var(--space-4) var(--space-7);
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-5);
+   Design thesis: the share page is the system, and this page joins it. Same
+   topbar, wordmark, encryption badge and footer; same neutral ramp, 12–20px
+   quiet chrome, hairline-plus-soft-shadow elevation in light and hairline alone
+   in dark; the accent appears in the mark, links, focus rings and the one thing
+   this page exists for — the record button. Red is reserved for two meanings and
+   no others: live capture, and destructive or failed.
+
+   The recorder's six stages share one footprint, the way every state on the
+   share page occupies the player's, so the card never jumps between them.
+
+   The topbar, brand mark and footer rules below are deliberate copies of
+   player.css's: both pages declare their chrome page-locally (SPEC §11), and
+   player.css is not this pass's to edit. view.html / player.css remain the
+   source of truth — change them there first, then here. */
+
+:root {
+  /* Page-local radii, matching the share page's. The shared --radius-* scale is
+     left alone; --radius-card is what makes a card here read like a panel there. */
+  --radius-card: 12px;
+  --radius-stage: 12px;
+  --radius-pill: 999px;
+
+  --topbar-height: 56px;
+  --column-width: 920px;
+  --gutter: var(--space-5);
+
+  /* One number for card padding, so a library row's full-bleed hover band and
+     the card it sits in cannot drift apart. */
+  --card-pad: var(--space-5);
+
+  /* Every recorder stage stands at least this tall. */
+  --stage-min-height: 220px;
+
+  /* The preview is its own environment and must not re-tint per theme — same
+     near-black and the same ring language as the share page's stage. */
+  --stage-bg: #08090b;
+  --stage-ring: 0 0 0 1px rgb(16 20 26 / 0.12), var(--shadow-sm);
+
+  /* Heatmap ramp: cool is a calmed accent so a lightly-watched bucket still
+     reads as data, hot is the same red the live dot uses. Both ends are tokens;
+     dashboard.ts interpolates between them with --heat-mix. */
+  --heat-cool: color-mix(in srgb, var(--accent) 70%, var(--surface));
+  --heat-hot: var(--recording);
 }
 
-.site-header {
+@media (prefers-color-scheme: dark) {
+  :root {
+    /* No drop shadow on near-black: an inset highlight separates it instead. */
+    --stage-ring: 0 0 0 1px #2a3039, inset 0 1px 0 rgb(255 255 255 / 0.04);
+    --heat-cool: color-mix(in srgb, var(--accent) 62%, var(--surface));
+  }
+}
+
+/* --- Page frame ----------------------------------------------------------- */
+
+body {
   display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: var(--space-2) var(--space-3);
+  flex-direction: column;
+  min-height: 100vh;
+  min-height: 100svh;
+}
+
+.page {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  width: 100%;
+  max-width: var(--column-width);
+  margin: 0 auto;
+  padding: var(--space-6) var(--gutter) var(--space-7);
+}
+
+/* --- Topbar (mirrors player.css) ------------------------------------------ */
+
+.topbar {
+  flex: none;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.topbar-inner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  height: var(--topbar-height);
+  max-width: var(--column-width);
+  margin: 0 auto;
+  padding: 0 var(--gutter);
 }
 
 .brand {
-  font-size: 1.6rem;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.2;
+  letter-spacing: -0.006em;
+  text-decoration: none;
+}
+
+.brand:hover {
+  color: var(--accent);
+}
+
+.brand:focus-visible {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.brand-mark {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  display: block;
+}
+
+.brand-mark-frame {
+  fill: var(--accent);
+}
+
+.brand-mark-play {
+  fill: var(--accent-contrast);
+  stroke-linejoin: round;
+}
+
+.badge-secure {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  background: var(--surface-sunken);
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.badge-lock {
+  flex: none;
+  width: 12px;
+  height: 12px;
+  display: block;
+}
+
+.badge-lock-body {
+  fill: var(--text-faint);
+}
+
+.badge-lock-shackle {
+  fill: none;
+  stroke: var(--text-faint);
+  stroke-width: 1.5;
+  stroke-linecap: round;
+}
+
+/* --- Page head ------------------------------------------------------------ */
+
+/* Deliberately the same weight as the share page's title block: 20px heading,
+   13px meta line. The hero on this page is the record button, not a banner. */
+.page-head {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin-bottom: var(--space-1);
+}
+
+.page-head h1 {
+  font-size: 20px;
+  font-weight: 600;
+  line-height: 1.3;
+  letter-spacing: -0.015em;
+}
+
+.page-lede {
+  max-width: 62ch;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.55;
+  text-wrap: pretty;
+}
+
+/* --- Footer (mirrors player.css) ------------------------------------------ */
+
+.site-footer {
+  flex: none;
+  border-top: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.footer-inner {
+  max-width: var(--column-width);
+  margin: 0 auto;
+  padding: var(--space-5) var(--gutter);
+  text-align: center;
+}
+
+.site-footer a {
+  color: var(--text-faint);
+  text-decoration: none;
+}
+
+.site-footer a:hover,
+.site-footer a:focus-visible {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+/* --- Cards ---------------------------------------------------------------- */
+
+/* app.css ships the primitive; these two lines are what make it read as a
+   sibling of the share page's state panel rather than a rounder, softer box. */
+.card {
+  padding: var(--card-pad);
+  border-radius: var(--radius-card);
+}
+
+@media (prefers-color-scheme: dark) {
+  .card {
+    box-shadow: none;
+  }
+}
+
+.card-head {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.card-head h2 {
+  font-size: 16px;
+}
+
+.card-sub {
+  color: var(--text-muted);
+  font-size: 12.5px;
+  line-height: 1.5;
 }
 
 .hint {
   font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+/* A file path or a URL fragment inside running copy. The horizontal padding is
+   deliberately small: these chips are followed by a comma or a full stop as
+   often as not, and a wide one leaves the punctuation stranded. */
+code {
+  padding: 1px 4px;
+  border-radius: 5px;
+  background: var(--surface-sunken);
+  color: var(--text-muted);
 }
 
 .button-row {
@@ -30,21 +270,30 @@
   gap: var(--space-2);
 }
 
-.message {
-  margin-top: var(--space-4);
-  font-size: 0.875rem;
-  color: var(--text-muted);
+/* --- Spinner -------------------------------------------------------------- */
+
+.spinner {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--border-strong);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
 }
 
-.message:empty {
-  display: none;
+.spinner-lg {
+  width: 22px;
+  height: 22px;
 }
 
-.message.error {
-  color: var(--danger);
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
-/* Sign-in (gateway mode) ---------------------------------------------------- */
+/* --- Sign-in (gateway mode, SPEC §15.5) ----------------------------------- */
 
 .auth {
   display: flex;
@@ -52,20 +301,40 @@
   gap: var(--space-3);
 }
 
+/* Both status lines start empty and stay out of the layout until they say
+   something. */
 .auth > :empty {
   display: none;
+}
+
+.auth-loading {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text-muted);
+  font-size: 0.8125rem;
 }
 
 .auth-row {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: var(--space-2) var(--space-4);
+  gap: var(--space-3) var(--space-4);
 }
 
 /* The explanation sits above Google's button; the signed-in line shares its row. */
-.auth-row > .hint {
+.auth-lead {
   flex-basis: 100%;
+  max-width: 64ch;
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+  line-height: 1.55;
+  text-wrap: pretty;
+}
+
+.auth-lead strong {
+  color: var(--text);
+  font-weight: 600;
 }
 
 /* Google renders its own button here; it must not be stretched by the row. */
@@ -74,48 +343,185 @@
 }
 
 .auth-identity {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
   flex: 1;
   min-width: 0;
+  font-size: 0.875rem;
+}
+
+.auth-identity-text {
+  min-width: 0;
   overflow: hidden;
+  color: var(--text-muted);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-/* Settings ------------------------------------------------------------------ */
+.auth-identity strong {
+  color: var(--text);
+  font-weight: 500;
+}
 
-.settings summary {
+.auth-check {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--success) 16%, transparent);
+}
+
+.auth-check svg {
+  width: 12px;
+  height: 12px;
+  fill: none;
+  stroke: var(--success);
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* Config mismatch: uploads would work and every link would point at nothing. */
+#auth-warning {
+  padding: var(--space-3);
+  border: 1px solid var(--danger-border);
+  border-radius: var(--radius-md);
+  background: var(--danger-soft);
+  text-wrap: pretty;
+}
+
+/* --- Disclosure panels ---------------------------------------------------- */
+
+.panel {
+  padding: 0;
+  /* Keeps the summary's hover band inside the card's rounded corners. */
+  overflow: hidden;
+}
+
+.panel-summary {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: var(--space-4);
+  padding: var(--space-4) var(--card-pad);
   cursor: pointer;
-  font-weight: 600;
   list-style: none;
+  transition: background-color 0.12s ease;
 }
 
 /* Safari still paints the default triangle without this. */
-.settings summary::-webkit-details-marker {
+.panel-summary::-webkit-details-marker {
   display: none;
 }
 
-.settings summary::after {
-  content: "▾";
-  color: var(--text-faint);
+.panel-summary:hover {
+  background: var(--surface-sunken);
+}
+
+/* The card clips its corners, so the ring goes inside rather than around. */
+.panel-summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.panel-summary-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.panel-title {
+  color: var(--text);
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.35;
+  letter-spacing: -0.01em;
+}
+
+.panel-sub {
+  color: var(--text-muted);
+  font-size: 12.5px;
+  line-height: 1.4;
+}
+
+/* A drawn chevron, not a "▾": the glyph's size and baseline differ per font,
+   and the analytics expander (built in JS, no room for an SVG) needs the same
+   mark as these two. */
+.panel-summary::after,
+.analytics > summary::after {
+  content: "";
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-right: 1.6px solid currentColor;
+  border-bottom: 1.6px solid currentColor;
+  opacity: 0.6;
+  transform: translateY(-2px) rotate(45deg);
   transition: transform 0.15s ease;
 }
 
-.settings[open] summary::after {
-  transform: rotate(180deg);
+.panel[open] > .panel-summary::after,
+.analytics[open] > summary::after {
+  transform: translateY(1px) rotate(225deg);
 }
 
-.settings[open] summary {
-  margin-bottom: var(--space-4);
+.panel[open] > .panel-summary {
+  border-bottom: 1px solid var(--border);
+}
+
+.panel-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding: var(--card-pad);
+}
+
+.panel-note {
+  max-width: 72ch;
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+  line-height: 1.55;
+  text-wrap: pretty;
+}
+
+/* --- Form fields ---------------------------------------------------------- */
+
+.field-group {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.field-group + .field-group {
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--border);
+}
+
+.group-title {
+  padding: 0;
+  margin-bottom: var(--space-3);
+  color: var(--text-faint);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  line-height: 1.2;
+  text-transform: uppercase;
 }
 
 .fields {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: var(--space-4);
-  margin: var(--space-4) 0;
+}
+
+.field {
+  min-width: 0;
 }
 
 .field.wide {
@@ -124,21 +530,40 @@
 
 .field .hint {
   margin-top: var(--space-1);
+  max-width: 72ch;
+  text-wrap: pretty;
 }
 
 .settings-actions {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: var(--space-3);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--border);
 }
 
 /* The recording panel saves on change, so its confirmation is a line of its own
    rather than a row beside a button — and nothing at all until there is one. */
-#recording-status:empty {
+#recording-status:empty,
+#settings-status:empty {
   display: none;
 }
 
-/* Recorder ------------------------------------------------------------------ */
+/* --- Recorder ------------------------------------------------------------- */
+
+.recorder {
+  padding-block: var(--space-6);
+}
+
+/* Idle, picking, recording, finishing and done all stand in one footprint. The
+   preview is the one stage allowed to grow: it carries a video. */
+.stages {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-height: var(--stage-min-height);
+}
 
 .stage {
   display: flex;
@@ -146,40 +571,147 @@
   gap: var(--space-4);
 }
 
+.stage-idle,
+.stage-centered,
+.stage-done {
+  align-items: center;
+  text-align: center;
+}
+
+.stage-idle {
+  gap: var(--space-3);
+}
+
+.stage-centered {
+  gap: var(--space-3);
+}
+
+.stage-title {
+  color: var(--text);
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.stage-hint {
+  max-width: 54ch;
+  color: var(--text-faint);
+  font-size: 0.8125rem;
+  line-height: 1.55;
+  text-wrap: pretty;
+}
+
+/* Live numbers: sizes, durations and percentages that tick. */
+.stage-meta {
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Idle ---------------------------------------------------------------------- */
+
 .record-button {
-  padding: var(--space-4) var(--space-5);
+  padding: var(--space-4) var(--space-6);
   border-radius: var(--radius-md);
-  font-size: 1.05rem;
+  font-size: 1.0625rem;
+  font-weight: 600;
+  transition: background-color 0.12s ease, border-color 0.12s ease, transform 0.12s ease;
+}
+
+.record-button:hover:not(:disabled) {
+  transform: translateY(-1px);
 }
 
 .record-glyph {
-  width: 0.7em;
-  height: 0.7em;
+  width: 0.66em;
+  height: 0.66em;
   border-radius: 50%;
   background: currentColor;
+  /* A ring around the dot, so it reads as a record indicator rather than a
+     bullet — the shape survives at the button's one size. */
+  box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 22%, transparent);
+  margin-right: 2px;
 }
 
 .toggle {
-  display: flex;
+  display: inline-flex;
   align-items: center;
   gap: var(--space-2);
   margin: 0;
-  color: var(--text);
-  font-size: 0.9375rem;
-  font-weight: 450;
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-pill);
+  color: var(--text-muted);
+  font-size: 0.875rem;
+  font-weight: 500;
   cursor: pointer;
 }
 
+.toggle:hover {
+  background: var(--surface-sunken);
+  color: var(--text);
+}
+
+/* Keyboard focus rings the whole pill, not the 15px box inside it. Both halves
+   are guarded together: where :has() is unsupported the rule below is dropped,
+   and suppressing the checkbox's own app.css ring would leave no ring at all. */
+@supports selector(:has(*)) {
+  .toggle:has(input:focus-visible) {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  .toggle input:focus-visible {
+    outline: none;
+  }
+}
+
+/* checkSupport() disables the microphone box on a browser that cannot capture
+   at all; the label has to say so too. */
+.toggle:has(input:disabled) {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.toggle input {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+}
+
+/* Recording ------------------------------------------------------------------ */
+
 .recording-row {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: var(--space-3);
+  gap: var(--space-3) var(--space-4);
+}
+
+.rec-clock {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.rec-status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--recording);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  line-height: 1.2;
+  text-transform: uppercase;
 }
 
 .rec-dot {
   flex: none;
-  width: 12px;
-  height: 12px;
+  width: 8px;
+  height: 8px;
   border-radius: 50%;
   background: var(--recording);
   animation: rec-pulse 1.4s ease-in-out infinite;
@@ -191,32 +723,46 @@
   }
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .rec-dot {
-    animation: none;
-  }
+.timer {
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 2rem;
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+  letter-spacing: -0.02em;
+  line-height: 1.15;
 }
 
-.timer {
-  flex: 1;
-  font-family: var(--font-mono);
-  font-size: 1.75rem;
-  font-variant-numeric: tabular-nums;
-  letter-spacing: -0.02em;
+.stop-button {
+  flex: none;
+}
+
+/* Preview -------------------------------------------------------------------- */
+
+.preview-frame {
+  overflow: hidden;
+  border-radius: var(--radius-stage);
+  background: var(--stage-bg);
+  box-shadow: var(--stage-ring);
+  line-height: 0;
 }
 
 .preview-video {
   display: block;
   width: 100%;
   max-height: 55vh;
-  border-radius: var(--radius-md);
-  background: #000;
+  /* The frame carries the letterbox colour, so an off-aspect recording
+     letterboxes into it rather than into a second, darker box. */
+  background: transparent;
 }
 
+/* Finishing ------------------------------------------------------------------ */
+
 .progress {
-  height: 10px;
-  border-radius: 999px;
+  height: 8px;
+  border-radius: var(--radius-pill);
   background: var(--surface-sunken);
+  box-shadow: inset 0 0 0 1px var(--border);
   overflow: hidden;
 }
 
@@ -229,11 +775,23 @@
 }
 
 /* Shown inside the finishing stage when finish() fails, so the local recording
-   can always be saved instead of lost (SPEC §7). */
+   can always be saved instead of lost (SPEC §7). Danger-tinted, because it only
+   ever appears after something went wrong. */
 .recovery {
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
+  padding: var(--space-4);
+  border: 1px solid var(--danger-border);
+  border-radius: var(--radius-md);
+  background: var(--danger-soft);
+}
+
+.recovery-note {
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+  line-height: 1.55;
+  text-wrap: pretty;
 }
 
 /* An <a download> that has to sit beside a button and match it. */
@@ -245,9 +803,10 @@
   border-radius: var(--radius-sm);
   background: var(--surface);
   color: var(--text);
-  font-weight: 550;
+  font-weight: 500;
   line-height: 1.4;
   text-decoration: none;
+  transition: background-color 0.12s ease, border-color 0.12s ease;
 }
 
 .button-link:hover {
@@ -256,12 +815,24 @@
   color: var(--text);
 }
 
+/* Done ----------------------------------------------------------------------- */
+
 .link-row {
   display: flex;
   gap: var(--space-2);
+  width: 100%;
+}
+
+/* A share link is long, but a full-width field in a centred stage reads as a
+   form rather than as the one thing to copy. */
+.stage-done .link-row {
+  width: min(100%, 34rem);
 }
 
 .link-row input {
+  flex: 1;
+  min-width: 0;
+  background: var(--surface-sunken);
   font-size: 0.8125rem;
 }
 
@@ -269,7 +840,178 @@
   flex: none;
 }
 
-/* Library ------------------------------------------------------------------- */
+/* --- Designed state marks (mirrors player.css) ---------------------------- */
+
+.state-icon {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: var(--radius-md);
+  background: var(--danger-soft);
+}
+
+.state-icon-success {
+  background: color-mix(in srgb, var(--success) 14%, transparent);
+}
+
+.state-glyph {
+  width: 20px;
+  height: 20px;
+  display: block;
+}
+
+.state-glyph-ring,
+.state-glyph-bar {
+  fill: none;
+  stroke: var(--danger);
+  stroke-width: 1.6;
+  stroke-linecap: round;
+}
+
+.state-glyph-dot {
+  fill: var(--danger);
+}
+
+.state-icon-success .state-glyph-ring {
+  stroke: var(--success);
+}
+
+.state-glyph-check {
+  fill: none;
+  stroke: var(--success);
+  stroke-width: 1.9;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* The <noscript> panel: this page's only full state panel, sized like the
+   share page's. */
+.state-panel {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 280px;
+  padding: var(--space-6);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+  text-align: center;
+}
+
+@media (prefers-color-scheme: dark) {
+  .state-panel {
+    box-shadow: none;
+  }
+}
+
+.state-panel .state-icon {
+  margin-bottom: var(--space-4);
+}
+
+.state-panel h2 {
+  font-size: 16px;
+}
+
+.state-panel p {
+  margin-top: var(--space-2);
+  max-width: 52ch;
+  color: var(--text-muted);
+  font-size: 14px;
+  line-height: 1.55;
+  text-wrap: pretty;
+}
+
+/* --- Page message --------------------------------------------------------- */
+
+/* One line for everything the recorder has to say about itself: a note in
+   neutral, an error in danger. The dot is drawn, never a character, so a
+   role="status" region announces the text and nothing else. */
+.message {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  margin-top: var(--space-5);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-sunken);
+  color: var(--text-muted);
+  font-size: 0.875rem;
+  line-height: 1.55;
+  text-wrap: pretty;
+}
+
+.message::before {
+  content: "";
+  flex: none;
+  width: 8px;
+  height: 8px;
+  margin-top: 0.45em;
+  border-radius: 50%;
+  background: var(--text-faint);
+}
+
+.message:empty {
+  display: none;
+}
+
+.message.error {
+  border-color: var(--danger-border);
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.message.error::before {
+  background: var(--danger);
+}
+
+/* --- Library -------------------------------------------------------------- */
+
+.library {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.library-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-6) var(--space-4);
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-md);
+  color: var(--text-muted);
+  font-size: 0.875rem;
+  line-height: 1.55;
+  text-align: center;
+}
+
+.library-empty-mark svg {
+  display: block;
+  width: 26px;
+  height: 26px;
+}
+
+.library-empty-frame {
+  fill: none;
+  stroke: var(--border-strong);
+  stroke-width: 1.5;
+}
+
+.library-empty-play {
+  fill: var(--border-strong);
+}
+
+.library-empty-text {
+  max-width: 44ch;
+  text-wrap: pretty;
+}
 
 .library-list {
   margin: 0;
@@ -277,17 +1019,20 @@
   list-style: none;
 }
 
+/* The row's hover band bleeds to the card's edge, which is why --card-pad is a
+   single number rather than two that have to be kept equal. */
 .library-item {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: var(--space-2);
-  padding: var(--space-3) 0;
+  gap: var(--space-2) var(--space-3);
+  margin-inline: calc(var(--card-pad) * -1);
+  padding: var(--space-3) var(--card-pad);
   border-top: 1px solid var(--border);
 }
 
-.library-item:first-child {
-  border-top: none;
-  padding-top: var(--space-4);
+.library-item:hover {
+  background: color-mix(in srgb, var(--surface-sunken) 55%, transparent);
 }
 
 .library-details {
@@ -299,22 +1044,40 @@
   display: block;
   overflow: hidden;
   color: var(--text);
-  font-weight: 550;
+  font-size: 0.9375rem;
+  font-weight: 500;
+  letter-spacing: -0.006em;
   text-decoration: none;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.library-title:hover {
+.library-title:hover,
+.library-title:focus-visible {
   color: var(--accent);
   text-decoration: underline;
+  text-underline-offset: 2px;
 }
 
+/* Date · duration · size · bitrate — four numbers that should line up between
+   rows. */
 .library-sub {
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.library-item > button {
+  flex: none;
   font-size: 0.8125rem;
 }
 
-/* Analytics expander (SPEC §16.6) -------------------------------------------
+/* record.ts appends copy then remove, both .ghost with nothing to tell them
+   apart; :nth-of-type is that difference, and it only colours a hover. */
+.library-item > button:nth-of-type(2):hover:not(:disabled) {
+  color: var(--danger);
+}
+
+/* --- Analytics expander (SPEC §16.6) --------------------------------------
 
    Watch data lives on the row of the video it is about, so this is a panel
    inside a library item rather than a page of its own. The heatmap is plain CSS
@@ -322,24 +1085,20 @@
    watch data, and nothing about drawing fifty rectangles is worth a third-party
    script. */
 
-.library-item {
-  flex-wrap: wrap;
-}
-
 .analytics,
 .analytics-hint {
   flex-basis: 100%;
-  margin-top: var(--space-2);
+  margin-top: var(--space-1);
 }
 
 .analytics > summary {
   display: inline-flex;
   align-items: center;
-  gap: var(--space-1);
+  gap: var(--space-2);
   color: var(--text-muted);
   cursor: pointer;
   font-size: 0.8125rem;
-  font-weight: 550;
+  font-weight: 600;
   list-style: none;
 }
 
@@ -347,32 +1106,36 @@
   display: none;
 }
 
-.analytics > summary::after {
-  content: "▾";
-  color: var(--text-faint);
-  transition: transform 0.15s ease;
-}
-
-.analytics[open] > summary::after {
-  transform: rotate(180deg);
-}
-
 .analytics > summary:hover {
   color: var(--accent);
+}
+
+.analytics > summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: 3px;
 }
 
 .analytics-body {
   display: flex;
   flex-direction: column;
-  gap: var(--space-2);
+  gap: var(--space-3);
   margin-top: var(--space-3);
-  padding: var(--space-3);
+  padding: var(--space-4);
+  border: 1px solid var(--border);
   border-radius: var(--radius-md);
   background: var(--surface-sunken);
 }
 
 .analytics-summary {
+  color: var(--text-muted);
   font-size: 0.875rem;
+}
+
+.analytics-summary strong {
+  color: var(--text);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
 }
 
 /* Errors and notes inside the expander are quiet by contract: none of them is
@@ -389,25 +1152,29 @@
   background: none;
   color: var(--text-faint);
   font-size: 0.75rem;
+  font-weight: 400;
   text-decoration: underline;
+  text-underline-offset: 2px;
   cursor: pointer;
 }
 
-.link-button:hover {
+.link-button:hover:not(:disabled) {
   color: var(--accent);
   background: none;
+  border-color: transparent;
 }
 
-/* Heatmap ------------------------------------------------------------------- */
+/* --- Heatmap -------------------------------------------------------------- */
 
 .heatmap {
   display: flex;
   align-items: flex-end;
   gap: 1px;
-  height: 72px;
-  padding: 2px;
+  height: 76px;
+  padding: 3px;
   border-radius: var(--radius-sm);
   background: var(--surface);
+  box-shadow: inset 0 0 0 1px var(--border);
 }
 
 .heat-bar {
@@ -416,33 +1183,39 @@
   /* A bucket nobody watched still shows a hairline, so fifty bars stay fifty
      bars and the axis reads as a timeline rather than as missing data. */
   min-height: 2px;
-  border-radius: 1px 1px 0 0;
+  border-radius: 2px 2px 0 0;
   /* Height is shape within this video; colour is intensity against a single
-     pass. Below 1x the bar warms with the ratio (the fallback is the flat
-     accent where color-mix is unavailable). */
+     pass. Below 1x the bar warms with the ratio. The fallback has to be a plain
+     colour: --heat-cool is itself a color-mix(), so where color-mix is
+     unavailable it would fail alongside the line below and leave the bar
+     transparent. Flat accent is the un-warmed end of the same ramp. */
   background: var(--accent);
-  background: color-mix(in srgb, var(--recording) var(--heat-mix, 0%), var(--accent));
+  background: color-mix(in srgb, var(--heat-hot) var(--heat-mix, 0%), var(--heat-cool));
 }
 
 /* At or above one full pass — the threshold the whole heat number exists for,
    and it has to be legible at a glance (SPEC §16.6). */
 .heat-bar.hot {
-  background: var(--recording);
+  background: var(--heat-hot);
 }
 
 .heat-axis {
   display: flex;
   justify-content: space-between;
-  font-size: 0.6875rem;
+  color: var(--text-faint);
+  font-size: 11px;
 }
 
-/* Per-viewer rows ----------------------------------------------------------- */
+/* The axis belongs to the heatmap above it, not to the gap between siblings. */
+.heatmap + .heat-axis {
+  margin-top: calc(var(--space-3) * -1 + 4px);
+}
+
+/* --- Per-viewer rows ------------------------------------------------------ */
 
 .viewers {
   display: flex;
   flex-direction: column;
-  gap: var(--space-2);
-  margin-top: var(--space-2);
 }
 
 .viewer-row {
@@ -450,7 +1223,14 @@
   grid-template-columns: 9ch 5.5rem minmax(0, 1fr) 3.5rem auto;
   align-items: center;
   gap: var(--space-3);
+  padding: var(--space-2) 0;
+  border-top: 1px solid var(--border);
   font-size: 0.8125rem;
+}
+
+.viewer-row:first-child {
+  border-top: none;
+  padding-top: 0;
 }
 
 .viewer-row .heatmap {
@@ -466,36 +1246,156 @@
   white-space: nowrap;
 }
 
+.viewer-plays {
+  white-space: nowrap;
+}
+
 .viewer-coverage {
+  color: var(--text);
   font-variant-numeric: tabular-nums;
   text-align: right;
 }
 
 .viewer-when {
   font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
 
-@media (max-width: 560px) {
+/* --- Responsive ----------------------------------------------------------- */
+
+/* The five-column viewer row needs about 380px for its labels before the
+   heatmap gets anything; below that the labels wrap around it instead. */
+@media (max-width: 700px) {
+  .viewer-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "who   seen"
+      "map   map"
+      "plays when";
+    gap: var(--space-2) var(--space-3);
+  }
+
+  .viewer-id {
+    grid-area: who;
+  }
+
+  .viewer-coverage {
+    grid-area: seen;
+  }
+
+  .viewer-row .heatmap {
+    grid-area: map;
+  }
+
+  .viewer-plays {
+    grid-area: plays;
+  }
+
+  .viewer-when {
+    grid-area: when;
+    text-align: right;
+  }
+}
+
+@media (max-width: 600px) {
+  :root {
+    --topbar-height: 52px;
+    --gutter: var(--space-4);
+    --card-pad: var(--space-4);
+    --radius-card: 10px;
+    --radius-stage: 10px;
+  }
+
+  .page {
+    padding: var(--space-5) var(--gutter) var(--space-6);
+  }
+
+  .page-head h1 {
+    font-size: 18px;
+  }
+
   .fields {
     grid-template-columns: 1fr;
+  }
+
+  .recorder {
+    padding-block: var(--space-5);
+  }
+
+  /* On a phone the record button is the page; give it the full width. */
+  .record-button {
+    width: 100%;
+  }
+
+  .timer {
+    font-size: 1.75rem;
+  }
+
+  .rec-clock {
+    flex-basis: 100%;
+  }
+
+  .stop-button {
+    width: 100%;
   }
 
   .library-details {
     flex-basis: 100%;
   }
 
-  /* The heatmap needs the full width, so the labels wrap above and below it. */
-  .viewer-row {
-    grid-template-columns: 9ch minmax(0, 1fr) 3.5rem;
+  .analytics-body {
+    padding: var(--space-3);
   }
 
-  .viewer-row .heatmap {
-    grid-column: 1 / -1;
+  .footer-inner {
+    padding: var(--space-4) var(--gutter);
   }
 
-  .viewer-when {
-    grid-column: 2 / -1;
-    text-align: right;
+  /* The badge collapses to the lock alone; the label stays in the accessibility
+     tree rather than being replaced by an aria-label on a non-focusable span. */
+  .badge-secure {
+    padding: 5px;
+  }
+
+  .badge-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+}
+
+/* --- Reduced motion ------------------------------------------------------- */
+
+@media (prefers-reduced-motion: reduce) {
+  .record-button,
+  .button-link,
+  .panel-summary,
+  .panel-summary::after,
+  .analytics > summary::after,
+  .progress-fill {
+    transition: none;
+  }
+
+  .record-button:hover:not(:disabled) {
+    transform: none;
+  }
+
+  /* A live-capture indicator is a status affordance, not decoration: stopping
+     it entirely would leave "recording" and "stopped" looking identical, so it
+     holds still and the colour carries the meaning. */
+  .rec-dot {
+    animation: none;
+  }
+
+  /* The spinner keeps turning, slower: a page that is waiting has to look
+     different from one that has hung. */
+  .spinner {
+    animation-duration: 1.6s;
   }
 }
