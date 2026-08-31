@@ -72,16 +72,50 @@ resource "google_storage_hmac_key" "gateway" {
 #     storage.multipartUploads.listParts
 #     (plus folders.create and resourcemanager.projects.get/list)
 #
-# No storage.objects.get, no .list, no .delete. So a leaked HMAC key writes and
-# abandons uploads and can do nothing else — the same worst case as the AWS
-# user's leaked access key, rather than "download and delete every recording".
+# No storage.objects.get and no .list, and that is the property worth keeping: a
+# leaked HMAC key cannot download or enumerate a single recording.
 #
-# The one thing objects.delete would buy is overwriting an existing object on
-# complete; video ids are 128 random bits and every key is written once, which is
-# the same reason the AWS policy has no s3:DeleteObject either.
+# What it also lacks is storage.objects.delete, and since docs/SPEC.md §18 that
+# is not a saving but a missing feature — the library's Delete video is three
+# presigned DELETEs signed with this credential, so without it every delete comes
+# back 403 on GCS. The custom role below adds exactly that one permission and
+# nothing else.
 resource "google_storage_bucket_iam_member" "gateway_videos" {
   bucket = google_storage_bucket.videos.name
   role   = "roles/storage.objectCreator"
+  member = google_service_account.gateway.member
+}
+
+# storage.objects.delete, on its own.
+#
+# Every predefined role that carries it (objectUser, objectAdmin) also carries
+# storage.objects.get and .list, which the grant above deliberately withholds —
+# and trading "cannot read or enumerate anything" for "can delete" would be a
+# bad bargain made silently. So this is a custom role of one permission, bound
+# per bucket below, and the argument above survives intact.
+#
+# What the credential can actually do afterwards, in full: create objects, run
+# and abandon multipart uploads, and delete objects — in the two buckets it is
+# bound to and nowhere else. It still cannot read one, list one, or touch bucket
+# configuration. The worst case for a leaked key moves from "write junk" to
+# "write junk and destroy recordings"; that is the same trade every provider
+# makes for deletion, and docs/storage-setup.md says so for the S3 side.
+#
+# The role id may hold only letters, digits, underscores and dots — no dashes —
+# so the suffix is normalized rather than interpolated raw. Note that a deleted
+# custom role is soft-deleted for 7 days: a destroy-then-apply inside that window
+# will fail on the id until it is undeleted or the window passes.
+resource "google_project_iam_custom_role" "object_deleter" {
+  project     = var.project
+  role_id     = "videoshare_${replace(var.name_suffix, "-", "_")}_object_deleter"
+  title       = "VideoShare object deleter (${var.name_suffix})"
+  description = "storage.objects.delete only — SPEC §18's Delete video, and nothing else."
+  permissions = ["storage.objects.delete"]
+}
+
+resource "google_storage_bucket_iam_member" "gateway_videos_delete" {
+  bucket = google_storage_bucket.videos.name
+  role   = google_project_iam_custom_role.object_deleter.name
   member = google_service_account.gateway.member
 }
 
@@ -89,7 +123,7 @@ resource "google_storage_bucket_iam_member" "gateway_videos" {
 # list them, and sign reads of them — PutObject + GetObject + ListBucket in
 # docs/gateway-setup.md §6. objectCreator is the write; objectViewer is
 # storage.objects.get + .list and nothing else, so the pair is that policy
-# exactly, still without .delete or .update.
+# exactly, still without .update.
 #
 # The read permission is the one people leave out. A presigned URL carries the
 # authority of the key that signed it, so without it the gateway signs URLs
@@ -107,6 +141,19 @@ resource "google_storage_bucket_iam_member" "gateway_analytics_read" {
 
   bucket = google_storage_bucket.analytics[0].name
   role   = "roles/storage.objectViewer"
+  member = google_service_account.gateway.member
+}
+
+# The fourth: DELETE /sessions/{videoId} (SPEC §18.4), which is the one delete
+# the gateway performs itself rather than signing a URL for — this bucket is
+# already its to list, and the objects under a prefix are not enumerable from a
+# presigned URL. Without it that route answers 502 and a video's watch data
+# outlives the video.
+resource "google_storage_bucket_iam_member" "gateway_analytics_delete" {
+  count = var.enable_analytics ? 1 : 0
+
+  bucket = google_storage_bucket.analytics[0].name
+  role   = google_project_iam_custom_role.object_deleter.name
   member = google_service_account.gateway.member
 }
 

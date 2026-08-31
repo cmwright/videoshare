@@ -70,6 +70,11 @@ image, typically 15–50 KB, so the object is typically 15–50 KB + 28 bytes. I
 decrypted by the same key as everything else: **a thumbnail is readable by
 exactly the holders of the share link**, like the video and the watch data.
 
+All three keys are removed together when a video is deleted (§18), and the
+optionality above survives that too: §18.1's delete names `thumb.bin` alongside
+the other two and treats a 404 on any of them as success, so a video that never
+had a thumbnail deletes exactly like one that did.
+
 Three rules make it optional rather than a fourth format version:
 
 - **Nothing in `meta.json` records whether it exists.** §5's JSON is unchanged,
@@ -354,9 +359,13 @@ player and storage format are unaffected. `meta.json` remains a single PUT.
 - Failures surface with the HTTP status and a hint (403 → check credentials,
   CORS/network error → check bucket CORS config; link to docs).
 - Bucket requirements this adds (must be reflected in §14 examples/docs):
-  CORS must allow POST (create/complete) and DELETE (abort) in addition to
+  CORS must allow POST (create/complete) and DELETE (abort — and, since §18,
+  object deletion, which is the same method from the same origin and therefore
+  needs no new rule) in addition to
   PUT/GET/HEAD and must expose the `ETag` response header; the uploader policy
-  needs `s3:AbortMultipartUpload` alongside `s3:PutObject`; docs recommend
+  needs `s3:AbortMultipartUpload` alongside `s3:PutObject` — plus the
+  **optional** `s3:DeleteObject` if that deployment wants §18's Delete video to
+  work; docs recommend
   cleaning up incomplete multipart uploads after ~1 day so crashed sessions
   don't strand storage (AWS/R2: an `AbortIncompleteMultipartUpload` lifecycle
   rule; MinIO: the server-wide `api stale_uploads_expiry` setting — `mc ilm`
@@ -429,8 +438,11 @@ and where the two could be read as disagreeing, §17 wins.
   link, sizeBytes? }` — newest first. `link` is the **full share link** including
   its `#{id}.{key}` fragment, and it is the only place this browser keeps a video's
   key; §17.3 builds the video page's URL out of it and never stores a second copy.
-  Removing an entry removes the local entry only — it does not delete from the
-  bucket. When `sizeBytes` is present the UI also shows size and effective bitrate
+  `removeFromLibrary(id)` removes the local entry only — it does not delete from
+  the bucket, which is why §17.3's menu calls it **Remove from list**. Deleting
+  the objects is §18, a separate action under a separate name, and it removes the
+  entry through this same function once the bucket has confirmed the objects are
+  gone. When `sizeBytes` is present the UI also shows size and effective bitrate
   (e.g. "14.2 MB · 1.9 Mbps") so compression is observable. Entries without
   `sizeBytes` (older) must render fine. The row itself is §17.3.
   **No thumbnail field, and no thumbnail bytes in localStorage.** §3's `thumb.bin`
@@ -518,7 +530,9 @@ export function publicBaseUrl(): string;                  // from window.VIDEOSH
 ```
 
 `upload.ts` — see §7 for the full streaming API (`createUploadSession`,
-`UploadSession`, `UploadResult`).
+`UploadSession`, `UploadResult`) and §18.3 for the deletion half
+(`VideoObjectName`, `DELETE_ORDER`, `deleteVideo`), which lives here because the
+`Signer` seam and its `send()` do.
 
 `thumbnail.ts` — §3's thumbnail, both ends of it, split on testability the way
 `gap.ts` and `watch.ts` are: the arithmetic and the frame test are pure and are
@@ -596,10 +610,13 @@ test.
 §8's arithmetic is: `watch.ts` is pure watch-range, heat and aggregation math (no DOM,
 so Node tests and both halves of §16 import it — including the engagement figures of
 §17.6, which are arithmetic and therefore live here), `beacon.ts` is the browser-side
-tracker and flush on `view.html`, and `dashboard.ts` is the reader half: fetch,
-decrypt, aggregate and render one video's engagement, used by `video.ts` for the full
-section and by `record.ts` for a library row's two-number summary (§16.6, §17.6).
-Full signatures in §16.5/§16.6.
+tracker and flush on `view.html`, and `dashboard.ts` is the owner-side client of the
+analytics endpoints: fetch, decrypt, aggregate and render one video's engagement,
+used by `video.ts` for the full section and by `record.ts` for a library row's
+two-number summary (§16.6, §17.6) — and, since §18, the one authenticated
+`DELETE /sessions/{id}` loop, which belongs here because this module already
+holds `AnalyticsDeps` and owns the per-id report cache a deletion invalidates.
+Full signatures in §16.5/§16.6 and §18.4.
 
 Styles: shared design tokens and base styles in `src/app.css`; the owner-side shell
 and the primitives both owner pages draw with — sidebar, account chip, responsive top
@@ -627,6 +644,9 @@ from `record.css` to `shell.css` because two pages now draw them; their tokens
   `src/thumbnail.ts` (§11) is one more module in the same graph, JPEG encoding is
   `canvas.toBlob`, and the fallback that stands in for a missing thumbnail is the
   CSS pattern that is already there (§17.3).
+- §18's deletion adds no dependency and no module in either package: a `DELETE` is
+  a method the signer seam and `aws4fetch` already have, and the analytics store's
+  bounded delete is the listing it already does with a second verb.
 
 ## 13. Tests
 
@@ -732,6 +752,13 @@ from `record.css` to `shell.css` because two pages now draw them; their tokens
   without creds fails 403, listing denied. Both the root creds and the
   write-only uploader creds must pass the full loop (multipart create/part/
   complete/abort must all work under the §14 uploader policy).
+- §18's deletion adds cases to `tests/gateway.test.ts`, `tests/util.test.ts`,
+  `tests/e2e.gateway.test.ts` and `tests/e2e.minio.test.ts`, and deletes none:
+  the whole existing suite must keep passing unchanged. §18.6 has the list. The
+  one existing expectation §18 *moves* is the uploader-policy claim — the MinIO
+  init job now grants `s3:DeleteObject` too (§14), so a test that asserted the
+  uploader cannot delete would be asserting the old policy and must be updated
+  to assert the new one rather than deleted.
 
 ## 14. Examples & docs (deliverables, not code)
 
@@ -744,9 +771,17 @@ from `record.css` to `shell.css` because two pages now draw them; their tokens
   plus an `nginx` (or `caddy`) service serving `../dist` on
   `http://localhost:8080`. One command → full local stack.
 - `examples/s3-cors.json` (GET/HEAD/PUT/POST/DELETE, expose `ETag`, `Content-Range`,
-  `Accept-Ranges`), `examples/s3-bucket-policy.json` (public GetObject, no
-  ListBucket), `examples/iam-uploader-policy.json` (`s3:PutObject` +
-  `s3:AbortMultipartUpload` only).
+  `Accept-Ranges`) — unchanged by §18, whose deletes are DELETEs from the same
+  origin the aborts already are; `examples/s3-bucket-policy.json` (public
+  GetObject, no ListBucket); `examples/iam-uploader-policy.json`, which since §18
+  holds **two** statements: `VideoShareUploadOnly` (`s3:PutObject` +
+  `s3:AbortMultipartUpload`) and `VideoShareOptionalDelete` (`s3:DeleteObject`).
+  The second is optional and the `Sid` is where that is said, because an IAM
+  policy document is strict JSON that neither `aws iam put-user-policy` nor
+  `mc admin policy create` will parse a comment out of — a deployment that does
+  not want deletion drops that one statement, and §18.3's per-row error names
+  exactly this. The prose lives in `docs/storage-setup.md`, where prose is
+  possible.
 - `docs/storage-setup.md`: walkthroughs for Cloudflare R2 (recommended default:
   scoped API tokens, free egress), AWS S3 (IAM user), MinIO self-hosted incl.
   the VPN + anonymous-write zero-credential variant.
@@ -826,12 +861,33 @@ answers CORS preflights itself and echoes only origins in `ALLOWED_ORIGINS`.
     `{ url, method: "PUT" }`
   - `{ op: "put-thumb", id }` → presigned PUT for `{id}/thumb.bin` (§3) →
     `{ url, method: "PUT" }`
+  - `{ op: "delete", id }` (§18.3) → presigned DELETEs for **all three** keys →
+    `{ urls: [{ key, url }], method: "DELETE" }`, where `key` is one of
+    `"meta.json"`, `"thumb.bin"`, `"video.bin"` — the suffix, not the full object
+    key, because the full key is the gateway's to build and the client's only use
+    for the name is to tell the three URLs apart. All three are returned in one
+    answer, in §18.1's deletion order; a client that only wanted one still gets
+    three, which costs three signatures and no request.
   Validation (400 on failure): `id` must match `^[A-Za-z0-9_-]{22}$`; object
   keys are constructed server-side as exactly `{id}/video.bin` /
   `{id}/meta.json` / `{id}/thumb.bin` — the client can never influence any other
-  key; `uploadId` and `partNumbers` are syntax-checked and passed through as
+  key, and `delete` in particular takes **no** key, suffix or object name from the
+  body; `uploadId` and `partNumbers` are syntax-checked and passed through as
   query params (URL-encoded). Auth failures: 401 (bad/expired token), 403 (valid
   token, email not allowed).
+
+  **`delete` is presign-or-bust**, and that is the whole of its relationship to
+  §15's invariant: the gateway signs three URLs and the browser sends the three
+  DELETEs. There is no route on which this service deletes a video-bucket object
+  itself, and none may be added — the analytics bucket's deletes (§18.4) are
+  server-side because that bucket is already the gateway's to list, and the video
+  bucket never is. R2, S3 and GCS all accept a SigV4 query-signed DELETE, so this
+  is the same signing path every other op takes with a different method.
+
+  **Anyone on `ALLOWED_EMAILS` can delete any video id they know.** This is the
+  uploader whitelist doing what it already does for the session listing (§16.3):
+  it is not per-video ownership and is not built to be. §18.2 says it once more,
+  and the README says it in the same plain register.
 
   **`put-thumb` mirrors `put-meta` exactly** and adds nothing else: same auth,
   same id validation, same 400s, same `{ url, method: "PUT" }` shape, same
@@ -893,14 +949,17 @@ token itself must never be logged.
   `/api/sign`; batches part URLs ahead of need, e.g. 8 at a time, so signing
   never stalls the upload queue). `UploadSession` logic is otherwise
   unchanged; presigned URLs are used exactly like signed requests today.
-  The seam carries **six** ops, not five: `SignOp` gains
+  The seam carries **seven** ops, not five: `SignOp` gains
   `{ kind: "put-thumb"; id }`, the method table maps it to `PUT`, and
   `LocalSigner`'s path-style URL builder maps it to `{endpoint}/{bucket}/{id}/thumb.bin`
   — the direct SigV4 PUT `meta.json` already gets, against a different key.
   `GatewaySigner` needs no new code at all beyond the union member: a `put-thumb`
   is a one-URL op and takes the same unbatched `askForUrl` path `put-meta`,
   `create`, `complete` and `abort` take. As with every other op, the key is the
-  signer's to derive from `id` and never crosses the seam.
+  signer's to derive from `id` and never crosses the seam. The seventh is §18.3's
+  `{ kind: "delete"; id; object }`, which is the one op whose gateway answer
+  carries several URLs for one request — the same shape `part` has, and it is
+  cached the same way.
 - On a 401 mid-session, the client re-acquires an ID token silently (GIS
   `prompt()` with auto-select) and retries once; if that fails, the part
   queue's existing retry/degraded path applies and the UI shows a re-sign-in
@@ -1117,6 +1176,16 @@ under prefix `{videoId}/` with `ListObjectsV2`, server-side, and answers:
   only reachable through a share link, but this is a real property and the README
   says so rather than implying per-video ownership that does not exist.
 
+`DELETE {gatewayUrl}/sessions/{videoId}` (alias `/beacon/{videoId}`, as above) —
+**authenticated exactly like the GET above**, and the one place this service
+deletes a stored object itself. It is the deletion half of §18, specified in
+§18.4; in this section's terms it is the same route, the same auth, the same
+`ID_PATTERN` validation and the same 404-when-analytics-is-off as the listing,
+answering `{ deleted: number, truncated: boolean }` after a bounded pass. It
+reads nothing back: §15's no-proxy invariant is about bytes flowing *out*, and
+a delete moves none. `DELETE /sessions/{videoId}/{sessionId}` is **405** — there
+is no single-session delete, because there is no surface that would ask for one.
+
 ### 16.4 Gateway configuration and storage layout
 
 - One new optional variable, `ANALYTICS_BUCKET` — a bucket **name**. Credentials,
@@ -1142,7 +1211,15 @@ under prefix `{videoId}/` with `ListObjectsV2`, server-side, and answers:
 - The analytics bucket MUST be **private**: no public domain attached, no anonymous
   read policy. It needs no CORS for writes (the gateway writes it) but DOES need
   `GET` CORS from the site origin, because the owner-side pages fetch presigned
-  URLs from it directly (§16.6, §16.10).
+  URLs from it directly (§16.6, §16.10). Its CORS stays **GET/HEAD only** after
+  §18: no browser ever deletes from this bucket, so adding DELETE there would
+  widen it for nothing.
+- The gateway's bucket credentials need `s3:DeleteObject` on the **analytics**
+  bucket once §18 exists, alongside the `PutObject`/`GetObject`/`ListBucket` this
+  section already needs. Without it every `DELETE /sessions/{id}` is a 502 —
+  which §18.7 makes the terraform modules and `docs/gateway-setup.md` say out
+  loud, because a missing grant on a delete path is invisible until someone
+  deletes something.
 - Logging: the beacon handler writes **no per-request log line** — not the session id,
   not a size, not an origin. A failed write logs the video id and the storage status
   and nothing else. No IP-bearing header (`CF-Connecting-IP`, `X-Forwarded-For`,
@@ -1154,11 +1231,16 @@ lives in core/auth/presign/analytics:
 ```ts
 export const MAX_BEACON_BYTES: number;      // 16384
 export const MAX_LISTED_SESSIONS: number;   // 1000
+export const MAX_DELETED_SESSIONS: number;  // 40 — deleted per call (§18.4)
+export const MAX_DELETE_LIST_PAGES: number; // 4 — listing pages walked per call (§18.4)
 export interface SessionSummary { sessionId: string; lastModified: string; size: number; url: string; }
 export interface SessionListing { sessions: SessionSummary[]; truncated: boolean; }
+export interface DeleteResult { deleted: number; truncated: boolean; }
 export interface AnalyticsStore {
   put(videoId: string, sessionId: string, body: Uint8Array): Promise<void>;
   list(videoId: string): Promise<SessionListing>;
+  /** One bounded pass of §18.4; `truncated` means "call me again". */
+  deleteAll(videoId: string): Promise<DeleteResult>;
 }
 export function analyticsKey(videoId: string, sessionId: string): string;  // `${videoId}/${sessionId}.bin`
 export function createAnalyticsStore(config: BucketConfig): AnalyticsStore;
@@ -1598,6 +1680,10 @@ export function summarize(report: VideoReport): VideoSummary;
 export function statCards(report: VideoReport): HTMLElement;
 export function replayHeatmap(report: VideoReport, durationMs: number): HTMLElement;
 export function viewerTable(report: VideoReport): HTMLElement;
+
+// The deletion half of this module — MAX_DELETE_ROUNDS, DeleteRound,
+// nextDeleteRound, deleteSessions — is §18.4. It shares `AnalyticsDeps` and
+// invalidates the cache above, which is why it lives here.
 ```
 
 `record.ts` and `video.ts` decide, from the gateway config and the auth state they
@@ -1774,8 +1860,10 @@ bucket's own disclosure is §1's, extended there.
   minted JWT, fetching each presigned url anonymously and decrypting; and a check that
   the analytics bucket is **not** anonymously readable.
 - §15.6's rule stands: no test bypasses. The write endpoint is genuinely
-  unauthenticated, so there is nothing to bypass; the read endpoint runs the same
-  minted-JWT path as `/api/sign`.
+  unauthenticated, so there is nothing to bypass; the read endpoint and §18.4's
+  delete endpoint both run the same minted-JWT path as `/api/sign`. What §18 adds
+  to these same two suites is listed in §18.6, with the subrequest bound asserted
+  rather than described.
 - The beacon is the first **binary** body the gateway carries, and the Worker and Node
   adapters hand it through as bytes (covered above). The Lambda function-URL adapter
   cannot be: a function URL decides text-vs-base64 delivery from the request's
@@ -2025,10 +2113,60 @@ One card per entry, newest first (§9's order):
 5. **Copy link** — copies `entry.link`, the **share link**, always. This is the button
    whose output goes to other people; it must never hand out a `video.html` URL.
 6. **Overflow menu** — a `⋯` button (`aria-haspopup="menu"`, `aria-expanded`) opening a
-   small menu whose one item is **Remove**, with today's meaning and today's warning (§9:
-   the local entry only; the video stays in the bucket). Escape or an outside click
-   closes it, focus returns to the trigger, and the whole thing works from the keyboard.
-   Remove re-renders the library.
+   small menu with **two** items, whose names are the contract because the difference
+   between them is the whole point (§18):
+   - **Remove from list** — today's item under an honest name, with today's meaning
+     and today's warning kept visible (§9: the local entry only; the video stays in
+     the bucket). `removeFromLibrary(entry.id)` then a re-render, exactly as now.
+   - **Delete video** — §18. The objects go, then the entry goes. It is the
+     destructive item and is styled as one, last in the menu.
+
+   Escape or an outside click closes the menu, focus returns to the trigger, and the
+   whole thing works from the keyboard.
+
+   **The confirm step is inline, in the page's own design language.** No
+   `window.confirm`: choosing **Delete video** replaces the menu's contents in
+   place with one sentence naming what is about to happen — the objects are
+   deleted from the bucket and every copy of the share link stops working — plus a
+   **Delete** button and a **Cancel** button. Focus moves to **Cancel**, which is
+   the safe half; Escape and an outside click are both Cancel and both close the
+   menu; Cancel returns the menu to its two items rather than closing it, so a
+   mis-click costs one keystroke. The sentence is a live-region announcement as
+   well as text, per §17.7. Nothing is deleted until **Delete** is pressed, and
+   there is no second confirmation after it.
+   Legacy mode's sentence says the same thing; gateway mode's adds the analytics
+   clause only when the gateway answered `analytics: true`, because a deployment
+   that stores no watch data must not be told its watch data is going.
+
+   **While a delete runs**, the menu closes and the row goes busy: `aria-busy` on
+   the row, a muted "Deleting…" line where the row's error line goes, and the row's
+   own controls — the title link, Copy link and the `⋯` trigger — disabled. The
+   thumbnail block goes with the title link: it is `aria-hidden` decoration and out
+   of the tab order, but it is an `<a>` aimed at the same video page, so a busy row
+   drops its `href` too and gets it back with the title's. Disabling three of the
+   four would leave the mouse a door the keyboard no longer has. Rows delete
+   independently; one row's delete never disables another's.
+
+   **On success** the library re-renders (§18.1 removes the entry, the thumbnail
+   object URL and the cached report). **On failure the entry stays** — never
+   silently downgraded to a Remove from list — the busy state lifts, the controls
+   come back, and the row shows **one muted error sentence** beneath its meta line,
+   in the register §16.6's failures use. This is the one place §16.6's "a failed
+   thing on a row renders as nothing at all" does not apply, and deliberately: a
+   summary is something the row went and got unasked, a delete is something the
+   reader pressed a button for.
+
+   **The delete state survives a re-render.** It is held per video id in a module
+   map beside `thumbUrls`, and `libraryRow` reads it while building — the same
+   pattern and for the same reason, since a sign-in change or a finished recording
+   can re-render the library while a delete is in flight and must not take the row's
+   busy state or its error with it. The error clears on the next attempt for that
+   id, and when the id leaves `loadLibrary()`.
+
+   **Gateway mode requires a signed-in session.** With no token, **Delete video**
+   does not fail and does not fetch: it closes the menu and calls
+   `demandSignIn(…)` (§17.2), the same way recording does. Legacy mode needs no
+   sign-in and never had one.
 
 **The row's link target** is `video.html#{id}.{key}`, built by running `entry.link`
 through `parseShareFragment` and re-serialising with `videoPageLink(id, keyB64)` (§11) —
@@ -2247,7 +2385,11 @@ What §17 must not lose, stated so it can be checked:
   link, Copy link, the overflow trigger and its items, Show all, Reload;
 - `aria-current="page"` on the active nav item; `hidden` on inactive views;
 - the overflow menu: `aria-haspopup`/`aria-expanded`, Escape closes it, focus returns to
-  the trigger;
+  the trigger — and its confirm step (§17.3, §18) is part of that: both its buttons are
+  in the tab order, focus lands on **Cancel**, Escape cancels, and the confirming
+  sentence is announced in a live region rather than only seen. A row mid-delete
+  carries `aria-busy` and disabled controls; a row whose delete failed carries the
+  error sentence as text in the row, not as a colour;
 - decoration marked `aria-hidden` (the thumbnail pattern, the glyphs), and each heatmap
   keeping the `role="img"` and real label it has today. A row's real thumbnail (§17.3) is
   decoration on the same terms: it lives inside the `aria-hidden` frame, carries `alt=""`,
@@ -2271,9 +2413,12 @@ What §17 must not lose, stated so it can be checked:
 (§11) rather than copied. `view.html` and `player.css` are untouched, and were untouched
 by §17 as written; the claim that `gateway/` and §§2–8, §15 and §16.1–16.5 are untouched
 was §17's own scope statement and is **superseded** by §3's thumbnail, which amends §3,
-§4, §6, §7, §15.3 and §15.5 and adds one op to `gateway/src/presign.ts`. What survives
-that amendment unchanged, and is the part worth stating: **`view.html` and `player.css`,
-still**. A recipient cannot tell that either §17 or §3's thumbnail happened.
+§4, §6, §7, §15.3 and §15.5 and adds one op to `gateway/src/presign.ts` — and again by
+§18's deletion, which amends §3, §7, §9, §11, §12, §13, §14, §15.3, §15.5, §16.3, §16.4,
+§16.9, §17.3 and §17.7 and adds a seventh op and one endpoint. What survives all of it
+unchanged, and is the part worth stating: **`view.html` and `player.css`, still**. A
+recipient cannot tell that §17, §3's thumbnail or §18 happened — §18.5 is a claim about
+the player's existing behaviour, checked rather than changed.
 
 ### 17.9 Docs
 
@@ -2285,3 +2430,385 @@ still**. A recipient cannot tell that either §17 or §3's thumbnail happened.
   the video page's Engagement section instead, with their diagnoses unchanged.
 - The one new thing a deployer has to know: `dist/` now contains `video.html`, and a
   deploy that drops it breaks every library row's link (§12).
+
+## 18. Deletion
+
+Everything about making a video actually go away. v1 shipped a library **Remove**
+that forgot the local entry and left the objects in the bucket forever, and the
+README said so under "What this does not protect against". This section is the
+other half, and once it exists that README bullet and the "Real deletion" entry
+in Future work are both **wrong as written** and must be rewritten (§18.7) —
+deletion is not future work any more.
+
+Two actions, two names, and the names are the contract (§17.3):
+
+- **Remove from list** — unchanged: `removeFromLibrary(id)` and a re-render. The
+  objects stay in the bucket. This is still the right action for a video someone
+  else owns, a link kept elsewhere, or a library that has grown noisy.
+- **Delete video** — the objects go, then the entry goes.
+
+The video page (§17.4) gets **no** delete control in this pass. The library is
+the management surface; §17.4's reasoning for not building the mockup's `⋯` there
+stands, and a video page opened from a link in another browser still has no
+library entry to remove.
+
+`view.html` and `player.css` are untouched by this section, as they were by §17
+and by §3's thumbnail. §18.5 is a claim about the player's *existing* behaviour,
+not a change to it.
+
+### 18.1 What gets deleted, and in what order
+
+For video `{id}`:
+
+1. every analytics session object under `{id}/` in the **analytics bucket** —
+   only in gateway mode with `ANALYTICS_BUCKET` set and `analytics: true`
+   (§18.4). Legacy mode has no analytics and skips this entirely;
+2. `{id}/meta.json`, then `{id}/thumb.bin`, then `{id}/video.bin`, in the
+   **video bucket** (§18.3);
+3. the `videoshare.library` entry, via `removeFromLibrary(id)` — which also
+   revokes the row's cached thumbnail object URL, since §17.3 already revokes the
+   URL of any id that has left `loadLibrary()` — and the video's cached
+   `VideoReport` (§16.6), which must be dropped rather than left to answer for an
+   id that no longer exists.
+
+Both orderings are load-bearing.
+
+**Analytics first**, because it is the step most likely to fail for a reason that
+costs nothing. Its authorization is a Google ID token that may have expired since
+the page loaded; failing there leaves the video, the entry and the watch data all
+intact — a state the reader can retry from with one click and nothing lost. The
+other order was considered and rejected: a video deleted first with its sessions
+left behind strands ciphertext in a private bucket that no surface can reach
+again, because the row that could have retried is the one thing that names the
+id. The cost of this choice, stated rather than hidden: a delete that fails on
+the video objects has already destroyed that video's watch data. That is the
+correct trade — the reader asked for the video to be gone, and watch data is an
+artifact of a video, not the other way round — but it is a real loss and §18.3's
+error sentence must not pretend nothing happened.
+
+**`meta.json` first** inside the video bucket, which is §7's write order exactly
+reversed. Meta is the completion marker: a player fetches it before anything else
+(§8), so from the instant it is gone every copy of the share link is already the
+clean "video not found" of §18.5. A delete that fails halfway therefore leaves a
+video that reads as **absent**, never as a torso that still looks complete and
+then fails deeper in.
+
+**404 is success on every one of the three.** S3's `DeleteObject` is idempotent
+and most implementations answer `204` whether or not the object was there; the
+ones that answer `404` mean the same thing. `thumb.bin` is optional (§3), so its
+absence is the ordinary case rather than an error, and a delete retried after a
+partial failure must not fail on the objects that already went. Any other
+non-2xx status is a failure and surfaces (§18.3).
+
+Nothing here touches an in-flight recording. A library entry exists only once
+`finish()` has returned (§6), and an abandoned multipart upload has its own path
+(§7's `abort()`), so there is no interaction between the two and no case where
+deleting a video races its own upload.
+
+### 18.2 Authorization, said plainly
+
+**Gateway mode.** `POST /api/sign { op: "delete" }` and
+`DELETE /sessions/{videoId}` are authenticated exactly like every other
+authenticated route: a Google ID token verified per §15.4, then `ALLOWED_EMAILS`.
+So: **anyone on `ALLOWED_EMAILS` can delete any video id they know.** That is the
+uploader whitelist, not per-video ownership, and it is not built to be one — the
+same property the session listing has had since §16.3, restated here rather than
+left to be discovered. Ids are 128 random bits and reachable only through a share
+link, which is a mitigation and not an access control.
+
+**Legacy mode.** Whoever holds the bucket credentials in that browser can delete
+whatever those credentials allow — the same sentence §1's threat model already
+writes about writing, with one more verb in it.
+
+**Neither mode authenticates a viewer**, and none could: a share link is a key,
+not an identity. A recipient can never delete; a recipient can also never be
+stopped from having already downloaded (§18.5).
+
+### 18.3 The video bucket: three presigned DELETEs
+
+The bytes never move through the gateway and neither does the authority to remove
+them in one place: the gateway signs three URLs, the browser sends three DELETEs.
+This is §15's invariant applied to a method that carries no payload, and it is
+why there is no server-side video-bucket delete anywhere in `gateway/`.
+
+`upload.ts` owns it, because `upload.ts` owns the `Signer` seam and the `send()`
+that turns a signed request into a `fetch` with the right method, retries and
+error messages:
+
+```ts
+/** §3's three objects, by the suffix the seam and the gateway's answer both use. */
+export type VideoObjectName = "video.bin" | "meta.json" | "thumb.bin";
+/** §18.1's order: meta first, video last. */
+export const DELETE_ORDER: readonly VideoObjectName[];
+/**
+ * Deletes the three objects in `DELETE_ORDER`, sequentially. Resolves when all
+ * three are gone (a 404 counting as gone); rejects with the first failure's
+ * message, leaving whatever came after it untouched.
+ */
+export function deleteVideo(signer: Signer, id: string): Promise<void>;
+```
+
+- `SignOp` gains a **seventh** member: `{ kind: "delete"; id: string; object:
+  VideoObjectName }`. `METHODS` maps `delete` to `"DELETE"`. The `object` field is
+  a closed union of three suffixes, not a key: the signer still builds
+  `{id}/{object}` itself, so §15.5's rule that a key never crosses the seam holds
+  exactly as it does for `put-meta` and `put-thumb`.
+- **`LocalSigner`** signs `{endpoint}/{bucket}/{id}/{object}` with `DELETE` —
+  the same aws4fetch path `put-meta` takes, a different method. Nothing else about
+  it changes.
+- **`GatewaySigner`** asks once and caches three. A `delete` op whose URL is not
+  held triggers one `POST /api/sign { op: "delete", id }`; the three entries of
+  the answer are stored by `{id}\n{object}` with the same `usableUntil` arithmetic
+  the part cache uses, and the two remaining DELETEs are then free. `forget(op)`
+  drops the cached URL for that one object, so a retry re-signs rather than
+  re-sending a signature the bucket has already refused — the rule parts already
+  follow.
+- **Sequential, in `DELETE_ORDER`.** The order is the point (§18.1); three
+  parallel DELETEs would save a few hundred milliseconds and give up the
+  guarantee.
+- `deleteVideo` gets **no retry ladder**. The part queue's ladder exists because a
+  recording is unrepeatable and a lost part loses it; a failed delete loses
+  nothing, the entry stays, and the reader can press the button again with a
+  better error in front of them. One attempt per object.
+
+**The optional-IAM contract.** A deployment whose credentials lack
+`s3:DeleteObject` (§14's second policy statement, or its equivalent) gets a `403`
+on the first DELETE. That is a supported configuration and it must read like one:
+
+- `LocalSigner.statusHint(403, "DELETE")` returns a **delete-specific** message,
+  not the existing PutObject/AbortMultipartUpload one — it says the bucket refused
+  the delete, that the upload credentials may not be allowed to delete, that
+  `s3:DeleteObject` is optional, and it points at `docs/storage-setup.md`;
+- `GatewaySigner.statusHint(403, "DELETE")` says the same about the gateway's
+  bucket credentials and points at `docs/gateway-setup.md`;
+- the row shows that sentence and **the entry stays** (§17.3). It is never
+  silently downgraded to a Remove from list, and the menu does not quietly hide
+  **Delete video** on such a deployment either: there is no way to know in advance
+  which grants a bucket carries, and a disabled button that cannot explain itself
+  is worse than a button with an honest failure behind it.
+- R2 needs nothing: its `Object Read & Write` token is a whole-object grant that
+  already includes deletion, which `docs/storage-setup.md` should say where it
+  says the same about `AbortMultipartUpload`.
+
+### 18.4 The analytics bucket: `DELETE {gatewayUrl}/sessions/{videoId}`
+
+Server-side, and consistently so: the analytics bucket is already the gateway's
+to list (§16.3), the browser has never held a credential for it, and the objects
+under a prefix are not enumerable from a presigned URL. So the same split as
+everywhere else — object bytes move only on presigned URLs, and the analytics
+bucket's own bookkeeping is the gateway's.
+
+**Request.** `DELETE {gatewayUrl}/sessions/{videoId}`, alias
+`/beacon/{videoId}`, both mount points (`/api/…` and bare) as §16.3 defines them.
+Authenticated exactly like the GET listing.
+
+**Response, 200:** `{ "deleted": 12, "truncated": false }`.
+
+**Statuses**, mirroring the listing case for case:
+
+| condition | status |
+| --- | --- |
+| no/expired/invalid token | 401 |
+| valid token, email not in `ALLOWED_EMAILS` | 403 |
+| identity provider unreachable | 503 |
+| `Origin` outside `ALLOWED_ORIGINS` | 403 |
+| `videoId` not `^[A-Za-z0-9_-]{22}$` | 400 |
+| `ANALYTICS_BUCKET` unset | 404 |
+| `DELETE /sessions/{videoId}/{sessionId}` | 405 |
+| the bucket refused the listing or a delete | 502 |
+| success | 200 |
+
+Preflight for the route now answers
+`Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS`.
+
+**Bounded per call, and the bound is a real constraint rather than a taste.** One
+call walks at most `MAX_DELETE_LIST_PAGES` (4) `ListObjectsV2` pages collecting
+at most `MAX_DELETED_SESSIONS` (40) keys that match `{videoId}/{22 base64url}.bin`
+— §16.3's skip rule unchanged, since nothing else belongs under that prefix — and
+issues one `DELETE` per key. That is at most 45 outbound requests, and the number
+is chosen for the **Cloudflare Workers free plan's 50 subrequests per request**;
+a call bounded at `MAX_LISTED_SESSIONS` (1000) instead would fail on the free plan
+immediately and sit exactly at the paid plan's ceiling. Lambda and the Node
+adapter have no such limit, and the bound applies to all three anyway so every
+adapter behaves identically.
+
+`truncated` is `true` when the pass stopped early — the 40-key cap was reached, or
+the page cap was, with more listing left. Otherwise `false`, meaning the prefix is
+empty of sessions.
+
+**The client repeats while `truncated`**, and the loop is `dashboard.ts`'s
+(§11):
+
+```ts
+export const MAX_DELETE_ROUNDS: number;      // 25 — 25 × 40 = MAX_LISTED_SESSIONS
+export type DeleteRound = "done" | "again" | "stalled";
+/** Pure, so the loop's stopping rule is testable without a gateway. */
+export function nextDeleteRound(result: { deleted: number; truncated: boolean },
+  round: number): DeleteRound;
+/** Repeats §18.4 until done; resolves with the total deleted, rejects on failure. */
+export function deleteSessions(video: { id: string }, deps: AnalyticsDeps): Promise<number>;
+```
+
+`nextDeleteRound` is `"done"` when `truncated` is false; `"again"` when
+`truncated` is true, `deleted > 0` and `round < MAX_DELETE_ROUNDS`; and
+`"stalled"` otherwise — which covers both ways a loop could fail to terminate. A
+round that reports `truncated: true` with `deleted: 0` is a gateway that cannot
+make progress (a prefix holding objects the skip rule refuses to touch is the way
+to get there), and running out of rounds is a prefix larger than anything §16.3
+was ever willing to *read*. Both surface as a failure on the row, and neither
+spins.
+
+`deleteSessions` is called only when the gateway answered `analytics: true`;
+otherwise §18.1's step 1 does not exist and nothing is requested.
+
+**Logging.** One line per call, in the shape §16.3's listing already logs:
+video id, the verified email, and the count deleted. No session id — the count is
+what an operator needs and a session id is a viewer-minted label — and, as
+everywhere on this path, no IP-bearing header is read (§16.4's rule is unchanged
+and applies here).
+
+**The overwrite-collapse model is untouched.** Deletion removes objects; it never
+reads one, never merges and never rewrites. A beacon that arrives after a delete
+simply writes a new session object under an id whose video is gone, which is junk
+the reader would count and skip (§16.6) if any reader ever asked again — and none
+will, because the entry is gone. That is a leak of storage, not of data, and it is
+bounded by the video's own life: a share link whose objects are deleted plays
+nothing, so nothing accumulates watch time to report.
+
+### 18.5 What a deleted video looks like from a share link
+
+**Every copy of the link dies, cleanly**, and this is the honest answer to the
+README's "Anyone with the link can watch, forever": forever ends when the objects
+do. `player.ts` fetches `{id}/meta.json` first (§8), and `playback.ts`'s reader
+already answers a 404 or 403 with `PlaybackError("Video not found", …)`, whose
+detail sentence already names deletion as one of the two causes. **That path is
+correct as it stands and is not changed by this section** — it was checked
+against this case rather than assumed to fit, which is the only reason §18 can
+say `view.html` is untouched.
+
+What deletion does not do, and the README must keep saying so in the same
+paragraph: it does not reach a copy already downloaded, a screen already
+recorded, or a cache already warm. It removes the objects; it does not un-share.
+
+### 18.6 Tests
+
+Every existing test keeps passing; §18 adds cases and deletes none (§13).
+
+- `tests/gateway.test.ts` gains a **`delete` sign-op suite**, written in the style
+  of the `put-thumb` one: no token → 401; a valid token that is not whitelisted →
+  403; an `id` that is not 22 base64url characters → 400, in each of the ways it
+  can fail (absent, wrong length, a `/`, a `.`); the happy path returning three
+  entries whose `key`s are exactly `meta.json`, `thumb.bin` and `video.bin` in
+  §18.1's order, each a presigned URL with the `X-Amz-*` shape and the same
+  `X-Amz-Expires` every other op carries, each path exactly
+  `/{bucket}/{id}/{key}`, and `method: "DELETE"` at the top level; and the
+  key-construction check the suite already makes elsewhere — an `objectKey`, a
+  `key`, or any other stray field in the body changes nothing about what comes
+  back.
+- `tests/gateway.test.ts` gains a **`DELETE /sessions/{videoId}` suite**: no token
+  → 401; non-whitelisted → 403; malformed id → 400; `ANALYTICS_BUCKET` unset →
+  404; a `sessionId` in the path → 405; the happy path against a stub bucket
+  issuing exactly one DELETE per matching key and answering
+  `{ deleted, truncated: false }`; a prefix of more than `MAX_DELETED_SESSIONS`
+  keys answering `truncated: true` with exactly `MAX_DELETED_SESSIONS` deleted and
+  **no more than `MAX_DELETE_LIST_PAGES` listings issued** — the subrequest bound
+  is the reason the constant exists, so it is asserted rather than described;
+  non-matching keys under the prefix skipped and not deleted; a bucket that
+  refuses the listing → 502 and a bucket that refuses a delete → 502; the preflight
+  advertising `GET, POST, DELETE, OPTIONS`; and the log line carrying the id, the
+  email and the count and **no session id**.
+- Client pure logic, in the suites that already own the module:
+  `nextDeleteRound` over its whole matrix — `truncated: false` → `"done"`;
+  `truncated: true` with `deleted > 0` under the round cap → `"again"`;
+  `truncated: true` with `deleted: 0` → `"stalled"`; the last permitted round →
+  `"again"`, the one after → `"stalled"` — so the two ways a loop could fail to
+  terminate are pinned by a test and not by a comment. `DELETE_ORDER` asserted to
+  be `meta.json`, `thumb.bin`, `video.bin`, because §18.1's guarantee is that
+  order and nothing else enforces it.
+- `tests/e2e.gateway.test.ts` gains a **full delete round trip** against MinIO:
+  upload a small video through the existing harness, confirm all three objects
+  read anonymously, ask the running Node adapter for the `delete` URLs with a real
+  minted JWT, send the three DELETEs straight to MinIO, then assert an anonymous
+  GET of each of the three is 404 — the same browser↔bucket path a real delete
+  takes, with the gateway having carried no byte of it. Then, with
+  `ANALYTICS_BUCKET` set: POST two beacons, `DELETE /sessions/{id}`, assert
+  `{ deleted: 2, truncated: false }` and that a following `GET /sessions/{id}`
+  lists nothing.
+- `tests/e2e.minio.test.ts` gains the **legacy** half of the same round trip:
+  upload via `createUploadSession`, delete via `deleteVideo` with a `LocalSigner`
+  built from the write-only uploader credentials, assert all three objects are
+  404 and that a second `deleteVideo` of the same id **succeeds** (idempotence —
+  §18.1's 404-is-success rule is what makes a retry safe, so it is a test).
+  A delete attempted with credentials that lack `s3:DeleteObject` must produce a
+  403 that carries the delete-specific hint, which is the optional-IAM contract
+  §18.3 states; the fixture for it is a policy without the second statement.
+- Not tested in Node, for the reasons §13 already gives: the menu, its confirm
+  step, the busy row and the error sentence. What is worth testing there is the
+  stopping rule and the order, both of which are pure and both of which are above.
+
+### 18.7 Docs, examples and terraform
+
+- **`README.md`**, two edits, both in the plain register the file was rewritten
+  to and neither a feature announcement:
+  - the **"Anyone with the link can watch, forever"** bullet keeps its first
+    sentences and loses the claim that "deleting a video from the recorder's
+    library removes the local entry only". It says instead that the library has
+    two actions — Remove from list, which forgets the entry, and Delete video,
+    which removes the objects so every copy of the link stops working — and that
+    neither reaches a copy someone already downloaded;
+  - the **Future work "Real deletion"** entry is removed, because it exists now.
+    In its place, in the security model, the sentence §18.2 owes a reader:
+    anyone in `ALLOWED_EMAILS` can delete any video id they know, the same way
+    anyone in it can list any video's sessions — not per-video ownership, and not
+    built to be.
+- **`docs/storage-setup.md`**: where the uploader policy is explained (the R2
+  token, the AWS IAM user, the MinIO policy), `s3:DeleteObject` and what it buys.
+  Optional, stated as optional, with the consequence named: without it the app
+  works exactly as it does today and **Delete video** answers with the 403 message
+  §18.3 pins. The AWS walkthrough's sentence that the uploader can do "no deleting
+  a stored object" is now wrong for the shipped policy and must be corrected
+  rather than left standing. R2's note that its whole-object grant already covers
+  the multipart calls gains deletion to the same list.
+- **`docs/gateway-setup.md`**: the env table's `BUCKET_ACCESS_KEY_ID` row no
+  longer says "and nothing more" — it needs `s3:DeleteObject` on the video bucket
+  for §18.3's presigned DELETEs and on the analytics bucket for §18.4's
+  server-side ones. A `DELETE /sessions/{videoId}` row in the endpoint reference,
+  with its statuses. A troubleshooting row for a 403 on a delete (the grant) and
+  one for a 502 from `DELETE /sessions/…` (the analytics grant, which is the one
+  people leave out — a presigned-URL grant and a delete grant are both invisible
+  until exercised).
+- **`examples/iam-uploader-policy.json`**: the second statement (§14), Sid
+  `VideoShareOptionalDelete`.
+- **`examples/docker-compose.yml`**: the `mc` init job applies the same file, so
+  the local uploader can delete and the e2e suite has something to run against.
+  The comment there says which statement to drop to get the old behaviour back.
+- **Terraform.** `examples/s3-cors.json` and all three modules already allow
+  `DELETE` on the video bucket for the multipart abort, so **no CORS change is
+  needed anywhere** — verified rather than assumed, and the comments that explain
+  the rule as "DELETE to abort" should now say what else it carries. What does
+  change:
+  - **aws/**: the gateway IAM user's policy gains `s3:DeleteObject` on
+    `${videos.arn}/*` **and**, when analytics is enabled, on
+    `${analytics.arn}/*`. Both are needed and only the first is obvious: the
+    video-bucket grant is what the presigned DELETEs are signed under, the
+    analytics-bucket grant is what §18.4 spends itself. The comment above the
+    policy document is a list of exactly what is granted and why, and it gains two
+    lines rather than losing its shape;
+  - **gcp/**: the module as it stands grants `roles/storage.objectCreator` on the
+    videos bucket and `objectCreator` + `objectViewer` on the analytics bucket —
+    **neither carries `storage.objects.delete`**, so gateway-mode deletion would
+    403 on GCS as written. It needs `storage.objects.delete` on both buckets and
+    nothing else. Every predefined role that carries it (`objectUser`,
+    `objectAdmin`) also carries `storage.objects.get` and `.list`, which the
+    videos-bucket grant deliberately withholds — the comment there argues at
+    length that a leaked key can write and abandon uploads "and do nothing else",
+    and that argument is worth keeping. So the honest minimum on the videos bucket
+    is a **custom role** of `storage.objects.create`, `storage.objects.delete` and
+    the three `storage.multipartUploads.*` permissions; whatever the module does
+    instead, the comment must describe what the credential can actually do
+    afterwards;
+  - **cloudflare/**: nothing. R2's `Object Read & Write` is a whole-object grant
+    that already includes deletion, and the module's CORS already lists `DELETE`.
+- The one thing a deployer of an **existing** installation has to know: nothing
+  breaks if they change none of it. Delete video appears, and on a deployment
+  whose credentials cannot delete it fails with a sentence that says so.

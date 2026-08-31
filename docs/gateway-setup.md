@@ -42,6 +42,10 @@ outbound call: a small encrypted beacon it never reads a reply to.
   trustworthy.
 - **Not an audit trail of who recorded what.** The verified email is written to
   the gateway's log at sign time, and nothing signs the objects themselves.
+- **Not per-video ownership.** `ALLOWED_EMAILS` is one list, and everyone on it
+  gets the same authority: anyone in it can delete any video id they know, and
+  list any video's sessions. It controls who may *use* the bucket; it does not
+  divide the bucket up between them, and it is not built to.
 
 ---
 
@@ -88,7 +92,7 @@ anywhere: this list *is* the deployment.
 | `BUCKET_ENDPOINT` | yes | S3 API endpoint, e.g. `https://<account>.r2.cloudflarestorage.com`. Path-style URLs are built from it. |
 | `BUCKET_NAME` | yes | Bucket the two objects per video live in. |
 | `BUCKET_REGION` | no (`auto`) | `auto` for R2; the real region for AWS; anything for MinIO. |
-| `BUCKET_ACCESS_KEY_ID` | yes | **Secret.** Needs `s3:PutObject` + `s3:AbortMultipartUpload` and nothing more. |
+| `BUCKET_ACCESS_KEY_ID` | yes | **Secret.** Needs `s3:PutObject` + `s3:AbortMultipartUpload` + `s3:DeleteObject` on the video bucket, and — with analytics on — `s3:DeleteObject` on the analytics bucket as well (§6). See below. |
 | `BUCKET_SECRET_ACCESS_KEY` | yes | **Secret.** |
 | `PUBLIC_BASE_URL` | yes | Where the bucket is publicly readable. Handed to the recorder by `GET /api/config`; the player uses it. |
 | `GOOGLE_CLIENT_ID` | yes | From step 1. The token's `aud` must equal this exactly. |
@@ -124,14 +128,24 @@ entry was rejected, that is in the service's own log.
 ### Bucket credentials
 
 Scope them exactly as the credential-in-the-browser mode does —
-`examples/iam-uploader-policy.json`, `s3:PutObject` and
-`s3:AbortMultipartUpload` on `{bucket}/*`. The gateway needs no more authority
-than the recorder had (turning on `ANALYTICS_BUCKET` adds three permissions on
-that *other* bucket, and nothing on this one — §6); what changes is who holds
-it. Everything in
-`docs/storage-setup.md` still applies, including the CORS rules: the *browser*
-still talks to the bucket directly, so the bucket must still allow
-`PUT`/`POST`/`DELETE` from the site's origin and still expose `ETag`.
+`examples/iam-uploader-policy.json`, both statements: `s3:PutObject` and
+`s3:AbortMultipartUpload` on `{bucket}/*` for recording, `s3:DeleteObject` on
+the same for the library's **Delete video**. The gateway needs no more authority
+than a recorder that can delete had (turning on `ANALYTICS_BUCKET` adds
+permissions on that *other* bucket, and nothing on this one — §6); what changes
+is who holds it. Everything in `docs/storage-setup.md` still applies, including
+the CORS rules: the *browser* still talks to the bucket directly, so the bucket
+must still allow `PUT`/`POST`/`DELETE` from the site's origin and still expose
+`ETag`.
+
+`s3:DeleteObject` here is not the optional grant it is in the other mode. The
+gateway **signs** the three DELETEs and the browser sends them — object bytes,
+and the authority to remove them, never pass through this service — so a
+presigned DELETE is only as authorized as the key that signed it, exactly like
+the analytics reads below. Leave it out and every **Delete video** comes back
+`403` from the bucket with a message saying so. You can still choose to run
+without deletion; it is the same choice, made in one place instead of every
+browser.
 
 Because the gateway is the only holder now, these can and should be narrower than
 before — and rotating them is a redeploy of one service rather than an
@@ -425,13 +439,14 @@ credentials. Two rules:
 
 ### Widen the credentials
 
-Three permissions, all of them on the analytics bucket only:
+Four permissions, all of them on the analytics bucket only:
 
 ```jsonc
 {
   "Sid": "VideoShareAnalytics",
   "Effect": "Allow",
-  "Action": ["s3:PutObject", "s3:GetObject"],   // write beacons; sign reads of them
+  // write beacons; sign reads of them; remove them when a video is deleted
+  "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"],
   "Resource": ["arn:aws:s3:::videoshare-analytics/*"]
 },
 {
@@ -448,10 +463,36 @@ signed it: without `GetObject` the gateway signs URLs happily and every one of
 them comes back `403`. On R2, the equivalent is an API token scoped to both
 buckets with **Object Read & Write**.
 
+`s3:DeleteObject` is the one **the gateway spends itself**. Deleting a video
+removes its watch data first, and this bucket is the one place the service does
+touch stored objects — it already lists this prefix (nothing else can: the
+objects under it are not enumerable from a presigned URL), so it deletes them
+the same way, server-side. Without it, `DELETE /sessions/{id}` answers `502` and
+the row says the delete failed before anything was removed. A missing grant on a
+delete path is invisible until someone deletes something, which is why it is
+worth setting now rather than discovering later.
+
 Because these are wider than the uploader's, keep them on a key of their own
 rather than reusing the one a legacy-mode browser might hold. The compose stack
-does exactly that: `videoshare-uploader` stays upload-only, and
-`videoshare-gateway` is the key with analytics on it.
+does exactly that: `videoshare-uploader` reaches the video bucket and nothing
+else, and `videoshare-gateway` is the key with the analytics bucket on it.
+
+### The session routes
+
+| Route | Auth | Answers |
+| --- | --- | --- |
+| `POST /sessions/{videoId}/{sessionId}` | none — viewers have no identity | `204`; `400` malformed id, `413` over 16 KiB, `404` analytics off, `502` the bucket refused the write |
+| `GET /sessions/{videoId}` | Google ID token + `ALLOWED_EMAILS` | `{ sessions: [...], truncated }`; `401`/`403`/`503` auth, `400` malformed id, `404` analytics off, `502` the bucket refused the listing |
+| `DELETE /sessions/{videoId}` | the same as the `GET` | `{ deleted, truncated }`; `401`/`403`/`503` auth, `400` malformed id, `404` analytics off, `405` on `/{sessionId}`, `502` the bucket refused the listing or a delete |
+
+`/beacon/…` is the same route under its original name, and both mount points
+(`/api/sessions/…` and `/sessions/…`) work.
+
+The `DELETE` is **bounded**: one call walks at most four listing pages and
+removes at most 40 session objects, then says `truncated: true` and the browser
+asks again. That bound is not a taste — it keeps the whole call inside the
+Cloudflare Workers free plan's 50 subrequests, and every adapter behaves the
+same way so a deployment cannot depend on which one it is running.
 
 ### Turn it on
 
@@ -530,9 +571,11 @@ Two consequences worth saying out loud:
 - **Watch data is readable by exactly the holders of the share link.** Sharing
   the link shares the analytics. There is no separate key.
 - **The listing endpoint uses the uploader whitelist.** Anyone in
-  `ALLOWED_EMAILS` can list sessions for any video id they know. Ids are 128-bit
-  random and only reachable through a share link, but this is not per-video
-  ownership, and it is not built to be.
+  `ALLOWED_EMAILS` can list sessions for any video id they know — and, since the
+  delete routes are authenticated exactly the same way, can delete any video id
+  they know along with its watch data. Ids are 128-bit random and only reachable
+  through a share link, but this is not per-video ownership, and it is not built
+  to be.
 
 ## Troubleshooting
 
@@ -545,6 +588,8 @@ Two consequences worth saying out loud:
 | `403` from the gateway on every sign call | Either the email is not in `ALLOWED_EMAILS`, or the site's origin is not in `ALLOWED_ORIGINS` — the body says which. |
 | `401` that a fresh sign-in does not fix | `GOOGLE_CLIENT_ID` differs between the gateway and the client id the page signed in with. |
 | `403` from the **bucket** on a part upload | The presigned URL expired (raise `PRESIGN_EXPIRY_SECONDS`, or check the gateway's clock), or the bucket credentials cannot `PutObject`. |
+| `403` from the **bucket** on a row's **Delete video** | The gateway's bucket credentials have no `s3:DeleteObject` on the video bucket. The gateway signs those three DELETEs and the browser sends them, so a presigned DELETE is only as authorized as the key behind it. The entry stays and the row says so; add the grant and press it again. |
+| `502` from `DELETE /sessions/…` | The gateway's credentials have no `s3:DeleteObject` on the **analytics** bucket — the one grant people leave out, because a presigned-URL grant and a delete grant are both invisible until exercised. The video's own objects are untouched: the sessions go first, precisely so a failure here costs nothing. |
 | Upload fails with no HTTP status at all | The **bucket's** CORS, not the gateway's — the gateway answered, so its own CORS is fine. See `examples/s3-cors.json`. |
 | `503` with "could not reach the identity provider" | The gateway cannot fetch Google's JWKS. Check egress from wherever it runs. |
 | `/api/config` says `"analytics":false` | `ANALYTICS_BUCKET` is unset, or set to whitespace. Nothing else turns analytics on. |

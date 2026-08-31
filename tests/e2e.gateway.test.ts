@@ -41,7 +41,13 @@ import {
   metaAad,
   thumbAad,
 } from "../src/crypto";
-import { createGatewaySigner, createUploadSession } from "../src/upload";
+import { deleteSessions } from "../src/dashboard";
+import {
+  createGatewaySigner,
+  createUploadSession,
+  DELETE_ORDER,
+  deleteVideo,
+} from "../src/upload";
 import type { Signer } from "../src/upload";
 import { randomId } from "../src/util";
 import { HEAT_BUCKETS, parsePayload } from "../src/watch";
@@ -845,6 +851,291 @@ describe.skipIf(!E2E)("gateway end-to-end", () => {
         expect(query.get("X-Amz-Signature")).toMatch(/^[0-9a-f]{64}$/);
         expect(Number(query.get("X-Amz-Expires"))).toBeLessThanOrEqual(3600);
       }
+    });
+  });
+
+  // --- Deletion (SPEC §18) ---------------------------------------------------
+
+  /**
+   * The whole of §18's gateway half against real storage: a real recording goes
+   * up through the real harness, its watch data goes into the private bucket,
+   * and then both are removed the way the library row removes them — analytics
+   * server-side through `DELETE /sessions/{id}`, the three video objects through
+   * presigned DELETEs the *browser* sends.
+   *
+   * The split is the point, and this suite is where it is provable rather than
+   * argued: every byte of the video bucket's deletion travels browser↔bucket on
+   * a signature, with the gateway having carried none of it (§18.3), while the
+   * analytics bucket — which no browser has ever held a credential for, and whose
+   * keys are not enumerable from a presigned URL — is emptied by the gateway
+   * itself (§18.4).
+   *
+   * The cases run in order and depend on it: the objects have to exist before
+   * they can be shown to stop existing.
+   */
+  describe("deleting a video, for real", () => {
+    const id = randomId();
+    /** SPEC §18.1's order: meta first, video last. */
+    const ORDER = ["meta.json", "thumb.bin", "video.bin"] as const;
+    const sessionIds = [randomId(), randomId()];
+
+    interface DeleteAnswer {
+      urls: { key: string; url: string }[];
+      method: string;
+    }
+
+    const authorized = async (): Promise<Record<string, string>> => ({
+      authorization: `Bearer ${await mintToken(UPLOADER_EMAIL)}`,
+    });
+
+    beforeAll(async () => {
+      track(id);
+      const key = await generateKey();
+
+      // One short chunk: this suite is about deletion, and a 20 MiB recording
+      // would prove nothing more than a 64 KiB one about whether an object goes.
+      const plain = randomBytes(64 * 1024);
+      const meta: VideoMeta = {
+        v: 1,
+        title: "gateway e2e deletion",
+        mimeType: "video/webm;codecs=vp9,opus",
+        durationMs: 4_000,
+        totalBytes: plain.length,
+        chunkSize: CHUNK_SIZE,
+        chunkCount: 1,
+        createdAt: new Date().toISOString(),
+      };
+      // §3's optional third object, so all three really exist to be deleted.
+      const thumb = await encryptBlock(
+        key,
+        thumbAad(id),
+        Uint8Array.from([0xff, 0xd8, 0xff, 0xe0, ...randomBytes(1024), 0xff, 0xd9]),
+      );
+
+      const session = await createUploadSession(signerFor(await mintToken(UPLOADER_EMAIL)), id, key);
+      await session.finish(plain, meta, thumb);
+
+      // Two watch sessions in the private bucket (§16.3), so the analytics half
+      // has something real to remove.
+      for (const sessionId of sessionIds) {
+        const block = await encryptBlock(
+          key,
+          analyticsAad(id, sessionId),
+          new TextEncoder().encode(JSON.stringify({ v: 2, sessionId })),
+        );
+        analyticsLitter.push(`${id}/${sessionId}.bin`);
+        const posted = await fetch(`${gatewayUrl}/sessions/${id}/${sessionId}`, {
+          method: "POST",
+          headers: { "content-type": "text/plain;charset=UTF-8" },
+          body: block as Uint8Array<ArrayBuffer>,
+        });
+        expect(posted.status, await posted.text()).toBe(204);
+      }
+    });
+
+    it("starts with all three objects readable by anyone holding the link", async () => {
+      for (const name of ORDER) {
+        const res = await fetch(objectUrl(`${id}/${name}`));
+        expect(res.status, `anonymous GET ${name} before the delete`).toBe(200);
+      }
+      const res = await fetch(`${gatewayUrl}/sessions/${id}`, { headers: await authorized() });
+      expect(((await res.json()) as { sessions: unknown[] }).sessions).toHaveLength(2);
+    });
+
+    it("refuses both halves to a verified address that is not whitelisted", async () => {
+      // SPEC §18.2: deletion is authenticated exactly like every other route,
+      // which means a real identity that may not upload may not delete either.
+      const headers = { authorization: `Bearer ${await mintToken(OUTSIDER_EMAIL)}` };
+
+      const signed = await fetch(`${gatewayUrl}/sign`, {
+        method: "POST",
+        headers: { ...headers, "content-type": "application/json" },
+        body: JSON.stringify({ op: "delete", id }),
+      });
+      expect(signed.status, "no signature for an outsider").toBe(403);
+
+      const sessions = await fetch(`${gatewayUrl}/sessions/${id}`, { method: "DELETE", headers });
+      expect(sessions.status).toBe(403);
+
+      // And nothing moved on their behalf.
+      expect((await fetch(objectUrl(`${id}/meta.json`))).status).toBe(200);
+    });
+
+    it("empties the analytics prefix server-side and reports what it removed", async () => {
+      // §18.1's step 1, and it goes first for the reason the spec gives: it is
+      // the step most likely to fail for a reason that costs nothing.
+      const res = await fetch(`${gatewayUrl}/sessions/${id}`, {
+        method: "DELETE",
+        headers: await authorized(),
+      });
+      expect(res.status, await res.clone().text()).toBe(200);
+      expect(await res.json()).toEqual({ deleted: 2, truncated: false });
+
+      const after = await fetch(`${gatewayUrl}/sessions/${id}`, { headers: await authorized() });
+      expect(((await after.json()) as { sessions: unknown[] }).sessions, "the prefix is empty").toEqual([]);
+
+      // Idempotent: a second pass finds nothing and says so rather than failing.
+      const again = await fetch(`${gatewayUrl}/sessions/${id}`, {
+        method: "DELETE",
+        headers: await authorized(),
+      });
+      expect(await again.json()).toEqual({ deleted: 0, truncated: false });
+    });
+
+    it("signs three DELETEs the browser sends straight to the bucket", async () => {
+      const res = await fetch(`${gatewayUrl}/sign`, {
+        method: "POST",
+        headers: { ...(await authorized()), "content-type": "application/json" },
+        body: JSON.stringify({ op: "delete", id }),
+      });
+      expect(res.status, await res.clone().text()).toBe(200);
+
+      const answer = (await res.json()) as DeleteAnswer;
+      expect(answer.method).toBe("DELETE");
+      expect(answer.urls.map((entry) => entry.key), "SPEC §18.1's order").toEqual([...ORDER]);
+
+      for (const entry of answer.urls) {
+        // Every one of them addresses MinIO, and the key is the gateway's own.
+        const url = new URL(entry.url);
+        expect(url.origin).toBe(new URL(ENDPOINT).origin);
+        expect(url.origin).not.toBe(gatewayOrigin);
+        expect(url.pathname).toBe(`/${BUCKET}/${id}/${entry.key}`);
+
+        // Sent by us, with no credentials of our own: the signature is the whole
+        // authorization, and the gateway is not in this request's path at all.
+        const deleted = await fetch(entry.url, { method: "DELETE" });
+        expect(
+          [204, 200].includes(deleted.status),
+          `presigned DELETE ${entry.key}: ${deleted.status} ${await deleted.clone().text()}`,
+        ).toBe(true);
+      }
+    });
+
+    it("leaves every copy of the share link at a clean 'video not found'", async () => {
+      // SPEC §18.5. The player fetches meta.json first (§8) and its reader
+      // already answers a 404 with "Video not found" — this checks the condition
+      // that path was written for actually arrives, without touching view.html.
+      for (const name of ORDER) {
+        const res = await fetch(objectUrl(`${id}/${name}`));
+        expect(res.status, `anonymous GET ${name} after the delete`).toBe(404);
+      }
+    });
+
+    it("succeeds when repeated, because 404 is success on all three", async () => {
+      // §18.1: DeleteObject is idempotent, thumb.bin is optional, and a delete
+      // retried after a partial failure must not fail on what already went. That
+      // rule is what makes the row's retry button safe, so it is a test.
+      const res = await fetch(`${gatewayUrl}/sign`, {
+        method: "POST",
+        headers: { ...(await authorized()), "content-type": "application/json" },
+        body: JSON.stringify({ op: "delete", id }),
+      });
+      const answer = (await res.json()) as DeleteAnswer;
+
+      for (const entry of answer.urls) {
+        const deleted = await fetch(entry.url, { method: "DELETE" });
+        expect(deleted.status, `second presigned DELETE ${entry.key}`).toBeLessThan(300);
+      }
+    });
+  });
+
+  /**
+   * The same deletion again, driven by the code the browser actually runs:
+   * `deleteVideo` over a real `GatewaySigner` (SPEC §18.3) and `deleteSessions`
+   * over `dashboard.ts`'s repeat-while-truncated loop (§18.4).
+   *
+   * The case above proves the *gateway* answers correctly; this one proves the
+   * client spends that answer correctly — that it asks for one signature and
+   * sends three DELETEs with it, that a 404 on any of the three is success, and
+   * that the analytics loop terminates on a real answer rather than a stub's.
+   * Between them there is no step of §18.1 that only a hand-written fetch has
+   * ever performed.
+   */
+  describe("deleting a video the way the recorder does", () => {
+    const id = randomId();
+    const sessionIds = [randomId(), randomId()];
+    let token: string;
+
+    beforeAll(async () => {
+      track(id);
+      token = await mintToken(UPLOADER_EMAIL);
+      const key = await generateKey();
+
+      const plain = randomBytes(64 * 1024);
+      const meta: VideoMeta = {
+        v: 1,
+        title: "gateway e2e deletion, from the client",
+        mimeType: "video/webm;codecs=vp9,opus",
+        durationMs: 4_000,
+        totalBytes: plain.length,
+        chunkSize: CHUNK_SIZE,
+        chunkCount: 1,
+        createdAt: new Date().toISOString(),
+      };
+      const thumb = await encryptBlock(
+        key,
+        thumbAad(id),
+        Uint8Array.from([0xff, 0xd8, 0xff, 0xe0, ...randomBytes(512), 0xff, 0xd9]),
+      );
+
+      const session = await createUploadSession(signerFor(token), id, key);
+      await session.finish(plain, meta, thumb);
+
+      for (const sessionId of sessionIds) {
+        const block = await encryptBlock(
+          key,
+          analyticsAad(id, sessionId),
+          new TextEncoder().encode(JSON.stringify({ v: 2, sessionId })),
+        );
+        analyticsLitter.push(`${id}/${sessionId}.bin`);
+        const posted = await fetch(`${gatewayUrl}/sessions/${id}/${sessionId}`, {
+          method: "POST",
+          headers: { "content-type": "text/plain;charset=UTF-8" },
+          body: block as Uint8Array<ArrayBuffer>,
+        });
+        expect(posted.status, await posted.text()).toBe(204);
+      }
+    });
+
+    it("empties the analytics prefix through dashboard.ts's own loop", async () => {
+      const deps = { gatewayUrl, token: () => token };
+      expect(await deleteSessions({ id }, deps), "both sessions, in one round").toBe(2);
+      // The loop's terminating case against a real gateway: nothing left, no
+      // truncation, one request, no spin.
+      expect(await deleteSessions({ id }, deps), "a second pass finds nothing").toBe(0);
+    });
+
+    it("asks for one signature and spends it on three DELETEs", async () => {
+      const from = wire.length;
+      await deleteVideo(signerFor(token), id);
+      const during = wire.slice(from);
+
+      // §18.3's caching claim, which nothing else pins: the gateway answers a
+      // `delete` with all three URLs, so the first DELETE pays for the round
+      // trip and the other two are free.
+      const asks = during.filter((entry) => entry.origin === gatewayOrigin);
+      expect(asks.map((entry) => entry.method), "one POST /sign, and only one").toEqual(["POST"]);
+
+      const bucket = new URL(ENDPOINT).origin;
+      const deletes = during.filter(
+        (entry) => entry.origin === bucket && entry.method === "DELETE",
+      );
+      expect(deletes, "three DELETEs, browser to bucket").toHaveLength(3);
+      // The gateway signed and carried nothing: a DELETE has no payload either
+      // way, and the answer is three URLs of JSON.
+      expect(asks[0]!.responseBytes, "three signatures, not an object").toBeLessThan(4096);
+
+      for (const name of DELETE_ORDER) {
+        const res = await fetch(objectUrl(`${id}/${name}`));
+        expect(res.status, `anonymous GET ${name} after the client's delete`).toBe(404);
+      }
+    });
+
+    it("succeeds again on a video that is already gone", async () => {
+      // §18.1's 404-is-success rule, through the client this time: a retry after
+      // a partial failure is what the row's error state invites, so it must not
+      // fail on the objects that already went.
+      await expect(deleteVideo(signerFor(token), id)).resolves.toBeUndefined();
     });
   });
 });

@@ -17,28 +17,40 @@ resource "aws_iam_access_key" "gateway" {
 # complete. Abandoning an upload is a separate action, and without
 # AbortMultipartUpload the recorder's Discard comes back 403.
 #
+# DeleteObject on the VIDEO bucket is what the library's Delete video spends
+# (docs/SPEC.md §18.3). The gateway signs three DELETEs — meta.json, thumb.bin,
+# video.bin — and the browser sends them, so a presigned DELETE is only as
+# authorized as the key that signed it. Without this the delete comes back 403
+# in the browser, the entry stays, and the row says why.
+#
 # GetObject on the analytics bucket looks wrong for a service that never reads an
 # object, and it is the one people leave out. A presigned URL carries the
 # authority of the key that signed it: without it the gateway signs URLs happily
 # and every one of them comes back 403 in the browser.
+#
+# DeleteObject on the ANALYTICS bucket is the other half of the same delete, and
+# the only one the gateway spends itself: that bucket is already its to list
+# (nothing else can enumerate a prefix), so DELETE /sessions/{id} lists and
+# deletes server-side. Without it that route is a 502 — invisible until someone
+# deletes something.
 #
 # ListBucket is granted on the analytics bucket itself, not on `/*` — that is
 # what ListObjectsV2 authorizes against — and on that bucket alone. There is no
 # ListBucket anywhere on the video bucket: video ids stay unguessable.
 data "aws_iam_policy_document" "gateway" {
   statement {
-    sid       = "VideoShareUploadOnly"
+    sid       = "VideoShareUploadAndDelete"
     effect    = "Allow"
-    actions   = ["s3:PutObject", "s3:AbortMultipartUpload"]
+    actions   = ["s3:PutObject", "s3:AbortMultipartUpload", "s3:DeleteObject"]
     resources = ["${aws_s3_bucket.videos.arn}/*"]
   }
 
   dynamic "statement" {
     for_each = var.enable_analytics ? [1] : []
     content {
-      sid       = "VideoShareAnalyticsWriteAndRead"
+      sid       = "VideoShareAnalyticsWriteReadAndDelete"
       effect    = "Allow"
-      actions   = ["s3:PutObject", "s3:GetObject"]
+      actions   = ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"]
       resources = ["${aws_s3_bucket.analytics[0].arn}/*"]
     }
   }

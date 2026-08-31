@@ -6,6 +6,12 @@
       "Effect": "Allow",
       "Action": ["s3:PutObject", "s3:AbortMultipartUpload"],
       "Resource": ["arn:aws:s3:::videoshare/*"]
+    },
+    {
+      "Sid": "VideoShareOptionalDelete",
+      "Effect": "Allow",
+      "Action": ["s3:DeleteObject"],
+      "Resource": ["arn:aws:s3:::videoshare/*"]
     }
   ]
 }

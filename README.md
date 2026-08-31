@@ -28,8 +28,9 @@ The site is three static pages:
 
 - **`index.html`** — the app you use: a sidebar and three views behind one hash
   route. **Videos** is the library — one row per recording this browser made,
-  with its date, duration, size, a Copy link button and, with a gateway and
-  analytics on, how many times it was watched. **New recording** is the recorder:
+  with its date, duration, size, a Copy link button, an overflow menu that can
+  forget a row or delete the video outright, and, with a gateway and analytics
+  on, how many times it was watched. **New recording** is the recorder:
   it captures screen + mic, encodes with WebCodecs — on the machine's hardware
   H.264 encoder where there is one, in software otherwise — encrypts with
   WebCrypto, and sends the ciphertext to your bucket *while you are still
@@ -158,11 +159,19 @@ written into the share link after the `#`. Browsers do not send fragments in
 HTTP requests, and do not include them in `Referer`. Your bucket, your CDN, and
 whoever hosts the static site all see the video id and never the key.
 
-**Upload credentials are scoped to `PutObject` and `AbortMultipartUpload`.**
-Stolen, they let someone write junk into your bucket and cancel an upload that is
-still in flight. They do not let them read, list, delete a stored object, or
+**Upload credentials are scoped to `PutObject` and `AbortMultipartUpload`**, plus
+an optional `DeleteObject`. Stolen, they let someone write junk into your bucket
+and cancel an upload that is still in flight. They do not let them read, list, or
 reach anything else in the account. The bucket has no anonymous `ListBucket`, so
 video ids — 128 random bits each — cannot be enumerated.
+
+The third grant is what the library's **Delete video** spends, and it is
+`examples/iam-uploader-policy.json`'s second statement so that dropping it is one
+edit: without it nothing else changes and Delete video answers with a message
+saying the bucket refused it. With it, a stolen key can delete recordings as well
+as write junk. Pick whichever of those you would rather live with —
+[`docs/storage-setup.md`](docs/storage-setup.md) explains it per provider (on R2
+the choice does not exist: its narrowest token already includes deletion).
 
 ### Optional: getting the credentials out of the browser
 
@@ -188,6 +197,14 @@ stack behind a `--profile gateway` flag.
 
 Without that line you are in the default mode described above: no server, no
 sign-in, credentials in your own browser.
+
+**Who may delete, said plainly:** anyone in `ALLOWED_EMAILS` can delete any video
+id they know, the same way anyone in it can list any video's sessions. That is
+the uploader whitelist doing what it already does — not per-video ownership, and
+not built to be one. Ids are 128 random bits and only reachable through a share
+link, which is a mitigation and not an access control. In the default mode the
+same sentence has one less clause: whoever holds the bucket credentials in that
+browser can delete whatever those credentials allow.
 
 ### Optional: knowing what got watched
 
@@ -242,9 +259,13 @@ Read this list before recording anything sensitive.
 - **Anyone with the link can watch, forever.** The link *is* the credential.
   There is no revocation, no expiry, no per-viewer access, and no way to tell who
   watched — the optional analytics above tell you *that* a link was watched and
-  how much of it, never by whom. Deleting a video from the recorder's library
-  removes the local entry only — the objects stay in the bucket. Forwarded link,
-  forwarded video.
+  how much of it, never by whom. Forwarded link, forwarded video. Forever ends
+  only when the objects do: the library's `⋯` menu has two actions and the names
+  are the difference — **Remove from list** forgets the local entry and leaves
+  the video in the bucket, while **Delete video** removes the objects, after
+  which every copy of the link plays nothing. Neither reaches a copy someone
+  already downloaded, a screen they already recorded, or a cache that is already
+  warm. Deleting removes the objects; it does not un-share.
 - **The link leaks wherever you paste it.** Chat history, browser history,
   screenshots of a chat, someone's clipboard manager. A key in a URL is
   convenient exactly because it travels, which is also the problem.
@@ -421,8 +442,6 @@ existing share link, so treat it accordingly.
 
 - **Camera bubble** — a picture-in-picture webcam overlay composited into the
   recording.
-- **Real deletion** — `DeleteObject` from the recorder, behind a credential scope
-  that allows it, so "delete" means more than "forget locally".
 - **Expiring links** — bucket lifecycle rules plus an expiry stamped into the
   metadata, so a link can stop working.
 - **Trim and pause** — cut the dead air at either end. Harder than it sounds now

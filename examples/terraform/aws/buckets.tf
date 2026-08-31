@@ -104,12 +104,16 @@ resource "aws_s3_bucket_policy" "videos" {
 
 # Mirrors examples/s3-cors.json, narrowed from "*" to the real site origins.
 #
-# DELETE matters as much as PUT: the recorder streams video.bin as an S3
-# multipart upload — POST to create, a PUT per 8 MiB part, POST to complete —
-# and a DELETE to abandon it when you press Discard. Leave DELETE out and the
-# abort's preflight fails, the recorder swallows it (the abort is best-effort by
-# design), and the parts already uploaded sit in the bucket, billed and invisible
-# to a plain listing, until the lifecycle rule below sweeps them.
+# DELETE matters as much as PUT, and it now carries two things rather than one.
+# The recorder streams video.bin as an S3 multipart upload — POST to create, a
+# PUT per 8 MiB part, POST to complete — and a DELETE to abandon it when you
+# press Discard; the library's Delete video sends three more DELETEs, to
+# presigned URLs, from this same origin (docs/SPEC.md §18.3). One rule covers
+# both, so deletion needed no CORS change here. Leave DELETE out and the abort's
+# preflight fails, the recorder swallows it (the abort is best-effort by design)
+# and the parts already uploaded sit in the bucket, billed and invisible to a
+# plain listing, until the lifecycle rule below sweeps them — while Delete video
+# fails with no HTTP status at all.
 #
 # ETag in expose_headers is what lets the completing POST list back the tag every
 # part response returned. A response header the browser is not allowed to read

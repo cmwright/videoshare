@@ -32,7 +32,7 @@ import {
   metaAad,
   thumbAad,
 } from "../src/crypto";
-import { createUploadSession } from "../src/upload";
+import { createLocalSigner, createUploadSession, DELETE_ORDER, deleteVideo } from "../src/upload";
 import { randomId } from "../src/util";
 import type { Settings, VideoMeta } from "../src/types";
 
@@ -61,6 +61,19 @@ const UPLOADER: Credentials = {
   label: "write-only uploader",
   accessKeyId: process.env.E2E_UPLOADER_ACCESS_KEY_ID ?? "videoshare-uploader",
   secretAccessKey: process.env.E2E_UPLOADER_SECRET_ACCESS_KEY ?? "videoshare-uploader-secret",
+};
+
+/**
+ * The optional-IAM contract of SPEC §18.3, as a fixture: the uploader policy
+ * with its second statement (`s3:DeleteObject`) dropped. A deployment can
+ * legitimately look like this, and Delete video has to fail on it with a
+ * sentence that says so rather than quietly becoming a Remove from list.
+ * Minted by examples/docker-compose.yml's init job alongside the real one.
+ */
+const NO_DELETE: Credentials = {
+  label: "uploader without s3:DeleteObject",
+  accessKeyId: process.env.E2E_NODELETE_ACCESS_KEY_ID ?? "videoshare-nodelete",
+  secretAccessKey: process.env.E2E_NODELETE_SECRET_ACCESS_KEY ?? "videoshare-nodelete-secret",
 };
 
 /** 20 MiB of plaintext at an 8 MiB chunk size = 3 parts, the last one short. */
@@ -241,9 +254,11 @@ describe.skipIf(!E2E)("MinIO end-to-end", () => {
   });
 
   afterAll(async () => {
-    // Best-effort: the upload-only key the compose file mints deliberately cannot
-    // DELETE, so fall back to the root key and, if that fails too, say what was
-    // left behind rather than silently littering the bucket.
+    // Best-effort. The uploader key can delete since §18 — that is the second,
+    // optional statement of examples/iam-uploader-policy.json — but the
+    // no-delete fixture below deliberately cannot, so fall back to the root key
+    // and, if that fails too, say what was left behind rather than silently
+    // littering the bucket.
     const tryDelete = async (client: AwsClient, objectKey: string): Promise<boolean> => {
       const res = await client.fetch(objectUrl(objectKey), { method: "DELETE" }).catch(() => undefined);
       return res !== undefined && res.ok;
@@ -495,6 +510,99 @@ describe.skipIf(!E2E)("MinIO end-to-end", () => {
       expect(bytes.length, "only one copy of part 1 is kept").toBe(resent.length + final.length);
       expectBytesEqual(bytes.subarray(0, resent.length), resent, "re-sent part 1 replaced the failed one");
       expectBytesEqual(bytes.subarray(resent.length), final, "final part");
+    });
+  });
+
+  /**
+   * SPEC §18, the legacy half: the browser signs three DELETEs with the same
+   * credentials it uploaded with, and the objects are gone from the bucket for
+   * everyone — which is the only thing that makes "delete" mean more than
+   * "forget locally".
+   */
+  describe("deleteVideo — SPEC §18 over the credentials-in-the-browser path", () => {
+    /**
+     * One small video through the real upload path: a single short part, meta
+     * and §3's thumbnail. Small because what is under test is the removal, and
+     * the 20 MB streaming round trip above already covers the arrival.
+     */
+    async function uploadSmallVideo(creds: Credentials, id: string): Promise<void> {
+      const key = await generateKey();
+      const plain = randomBytes(64 * 1024);
+      const meta: VideoMeta = {
+        v: 1,
+        title: "e2e delete round-trip",
+        mimeType: "video/webm;codecs=vp9,opus",
+        durationMs: 2_000,
+        totalBytes: plain.length,
+        chunkSize: CHUNK_SIZE,
+        chunkCount: 1,
+        createdAt: new Date().toISOString(),
+      };
+
+      const session = await createUploadSession(settingsFor(creds), id, key);
+      await session.finish(plain, meta, await encryptBlock(key, thumbAad(id), jpegShapedBytes()));
+    }
+
+    /** What an anonymous reader — a share link, in other words — sees right now. */
+    async function anonymousStatuses(id: string): Promise<number[]> {
+      return Promise.all(
+        DELETE_ORDER.map(async (object) => (await fetch(objectUrl(`${id}/${object}`))).status),
+      );
+    }
+
+    it("removes all three objects with the recorder's own credentials", async () => {
+      const id = track(rootClient, randomId());
+      await uploadSmallVideo(UPLOADER, id);
+      expect(await anonymousStatuses(id), "all three objects are there first").toEqual([
+        200, 200, 200,
+      ]);
+
+      await deleteVideo(createLocalSigner(settingsFor(UPLOADER)), id);
+
+      // Every copy of the share link is now the player's "video not found"
+      // (§18.5): meta.json is what it fetches first, and it is gone.
+      expect(await anonymousStatuses(id), "nothing is left for a share link to find").toEqual([
+        404, 404, 404,
+      ]);
+    });
+
+    it("succeeds again on a video that is already gone", async () => {
+      // §18.1's "404 is success" rule, which is what makes a retry after a
+      // partial failure safe — and what lets thumb.bin be optional (§3), since
+      // a video recorded before thumbnails existed deletes exactly like one
+      // that has one.
+      const id = track(rootClient, randomId());
+      await uploadSmallVideo(UPLOADER, id);
+
+      const signer = createLocalSigner(settingsFor(UPLOADER));
+      await deleteVideo(signer, id);
+      await expect(deleteVideo(signer, id)).resolves.toBeUndefined();
+      // And on an id that never existed at all.
+      await expect(deleteVideo(signer, randomId())).resolves.toBeUndefined();
+    });
+
+    it("fails honestly on credentials that lack s3:DeleteObject", async () => {
+      const id = track(rootClient, randomId());
+      // The positive control: these credentials are real and may write. If this
+      // is what fails, the fixture user is missing — re-run the compose init
+      // job (`docker compose -f examples/docker-compose.yml up minio-init`).
+      await uploadSmallVideo(NO_DELETE, id);
+      expect(await anonymousStatuses(id), `${NO_DELETE.label} could not upload`).toEqual([
+        200, 200, 200,
+      ]);
+
+      const signer = createLocalSigner(settingsFor(NO_DELETE));
+      // The supported configuration of §18.3: the delete is refused, the reason
+      // is named, and the objects are all still there — nothing is silently
+      // downgraded to a Remove from list.
+      await expect(deleteVideo(signer, id)).rejects.toThrow(/HTTP 403/);
+      await expect(deleteVideo(signer, id)).rejects.toThrow(/s3:DeleteObject is optional/);
+      await expect(deleteVideo(signer, id)).rejects.toThrow(/docs\/storage-setup\.md/);
+
+      expect(
+        await anonymousStatuses(id),
+        "a refused delete leaves the video exactly where it was",
+      ).toEqual([200, 200, 200]);
     });
   });
 

@@ -22,6 +22,14 @@
  * meant for a reader, and its callers render that sentence where the content
  * would have gone: this is a panel about a video, and it must never interrupt a
  * recording or an upload.
+ *
+ * Since §18 it also owns the deletion half of the analytics bucket
+ * (`DELETE /sessions/{id}`, repeated while `truncated`), which lives here
+ * because it shares `AnalyticsDeps` and invalidates the cache above. That
+ * bucket's deletes are the gateway's own — the browser has never held a
+ * credential for it, and the objects under a prefix are not enumerable from a
+ * presigned URL — while the *video* bucket's three deletes are presigned and
+ * sent from the browser, in `upload.ts` (§18.3). Same split as everywhere else.
  */
 
 import { analyticsAad, decryptBlock, importKeyB64 } from "./crypto";
@@ -177,6 +185,138 @@ export function summarize(report: VideoReport): VideoSummary {
     views: report.sessions.length,
     viewers: groupByViewer(report.sessions).length,
   };
+}
+
+/**
+ * Drops one video's cached report — §18.1's third step, beside
+ * `removeFromLibrary(id)` and the row's thumbnail object URL.
+ *
+ * A cache entry is an answer about a video, and once the video is deleted there
+ * is no honest answer left for it to give. The cache lives for the document, so
+ * without this a library that re-rendered after a delete would still hold a
+ * report for an id that no longer exists.
+ */
+export function forgetReport(id: string): void {
+  cache.delete(id);
+}
+
+// --- Deleting one video's sessions (SPEC §18.4) ------------------------------
+
+/**
+ * Rounds of `DELETE /sessions/{id}` one delete may take. 25 × the gateway's
+ * `MAX_DELETED_SESSIONS` (40) is `MAX_LISTED_SESSIONS` (1000) — the most §16.3
+ * was ever willing to *read*, so a prefix past this is one no reader could have
+ * seen either.
+ */
+export const MAX_DELETE_ROUNDS = 25;
+
+/** What to do after one round: another, stop, or give up loudly. */
+export type DeleteRound = "done" | "again" | "stalled";
+
+/**
+ * The loop's stopping rule, pure so it is testable without a gateway.
+ *
+ * `round` is the 1-based number of the round that produced `result`, so
+ * `"again"` means "another round is permitted after this one" — which caps the
+ * whole delete at {@link MAX_DELETE_ROUNDS} requests.
+ *
+ * `"stalled"` covers **both** ways this loop could fail to terminate, and
+ * neither of them spins: a round reporting `truncated: true` with `deleted: 0`
+ * is a gateway that cannot make progress (a prefix holding objects its skip
+ * rule refuses to touch is the way to get there), and running out of rounds is
+ * a prefix larger than §16.3 would ever list. Both surface as a failure on the
+ * row.
+ */
+export function nextDeleteRound(
+  result: { deleted: number; truncated: boolean },
+  round: number,
+): DeleteRound {
+  if (!result.truncated) return "done";
+  if (result.deleted > 0 && round < MAX_DELETE_ROUNDS) return "again";
+  return "stalled";
+}
+
+/**
+ * Repeats §18.4's bounded delete until the prefix is empty; resolves with the
+ * total deleted.
+ *
+ * Called only when the gateway answered `analytics: true` — otherwise §18.1's
+ * first step does not exist and nothing is requested. It runs **before** the
+ * video's own objects go (§18.1): it is the step most likely to fail for a
+ * reason that costs nothing (an ID token that expired since the page loaded),
+ * and failing here leaves the video, the entry and the watch data all intact.
+ */
+export async function deleteSessions(
+  video: { id: string },
+  deps: AnalyticsDeps,
+): Promise<number> {
+  let total = 0;
+  for (let round = 1; ; round++) {
+    const result = await deleteSessionsOnce(deps, video.id);
+    total += result.deleted;
+
+    const next = nextDeleteRound(result, round);
+    if (next === "done") return total;
+    if (next === "stalled") {
+      throw new AnalyticsError(
+        `The gateway stopped part-way through deleting this video's watch data ` +
+          `(${total} object${total === 1 ? "" : "s"} removed). Try again, or clear the rest from ` +
+          `the analytics bucket directly.`,
+      );
+    }
+  }
+}
+
+/** One bounded pass: `DELETE {gatewayUrl}/sessions/{id}` (SPEC §18.4). */
+async function deleteSessionsOnce(
+  deps: AnalyticsDeps,
+  id: string,
+): Promise<{ deleted: number; truncated: boolean }> {
+  const token = deps.token();
+  if (!token) throw new AnalyticsError("Sign in again to delete this video.");
+
+  let res: Response;
+  try {
+    res = await fetch(`${deps.gatewayUrl}/sessions/${id}`, {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${token}`, accept: "application/json" },
+    });
+  } catch {
+    throw new AnalyticsError("Could not reach the gateway to delete this video's watch data.");
+  }
+
+  if (res.status === 401) throw new AnalyticsError("Sign in again to delete this video.");
+  if (res.status === 403) {
+    throw new AnalyticsError("This Google account is not on the gateway's allowed list.");
+  }
+  if (res.status === 404) {
+    throw new AnalyticsError("This gateway has no analytics bucket, so it stores no watch data.");
+  }
+  if (!res.ok) {
+    throw new AnalyticsError(
+      `The gateway answered HTTP ${res.status} deleting this video's watch data.`,
+    );
+  }
+
+  let body: unknown;
+  try {
+    body = (await res.json()) as unknown;
+  } catch {
+    throw new AnalyticsError("The gateway's answer was not JSON.");
+  }
+  return parseDeleteResult(body);
+}
+
+/**
+ * A missing or malformed count reads as `0`, and a missing `truncated` as
+ * `false` — so a gateway that answers something unexpected ends the loop
+ * rather than driving it. `truncated: true` with no progress is `"stalled"`
+ * above, which is the honest reading of an answer this client cannot use.
+ */
+function parseDeleteResult(value: unknown): { deleted: number; truncated: boolean } {
+  const raw = value !== null && typeof value === "object" ? (value as Record<string, unknown>) : {};
+  const deleted = typeof raw.deleted === "number" && Number.isFinite(raw.deleted) ? raw.deleted : 0;
+  return { deleted: Math.max(0, Math.trunc(deleted)), truncated: raw.truncated === true };
 }
 
 // --- Reading one video's sessions --------------------------------------------

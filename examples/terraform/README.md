@@ -51,10 +51,14 @@ The stack is:
   multipart uploads after a day.
 - **`videoshare-{suffix}-analytics`** — private, `GET`/`HEAD` CORS only, created
   when `enable_analytics` is true.
-- An **IAM user** whose whole policy is `PutObject` + `AbortMultipartUpload` on
-  the video bucket, `PutObject` + `GetObject` on the analytics bucket, and
-  `ListBucket` on the analytics bucket itself. Its access key goes into the
-  Lambda's environment and nowhere else.
+- An **IAM user** whose whole policy is `PutObject` + `AbortMultipartUpload` +
+  `DeleteObject` on the video bucket, `PutObject` + `GetObject` + `DeleteObject`
+  on the analytics bucket, and `ListBucket` on the analytics bucket itself. Its
+  access key goes into the Lambda's environment and nowhere else. The two
+  `DeleteObject`s are the library's **Delete video** (`docs/SPEC.md` §18) and
+  both are needed: the video-bucket grant is what the three presigned DELETEs
+  are signed under, and the analytics-bucket grant is what
+  `DELETE /sessions/{id}` spends server-side.
 - The **gateway**, `nodejs22.x`, handler `dist/lambda.handler`, 256 MB, 15 s.
 
 ### Why an HTTP API and not a function URL
@@ -172,10 +176,20 @@ validation run:
   and it is only true of `objectViewer`/`objectAdmin`. `objectCreator` is
   `storage.objects.create` plus `storage.multipartUploads.create/abort/listParts`
   — `gcloud iam roles describe roles/storage.objectCreator` — which is the AWS
-  module's `PutObject` + `AbortMultipartUpload` exactly, with no `get`, no `list`
-  and no `delete`. A leaked HMAC key can write recordings and abandon uploads and
-  nothing else. The analytics bucket adds `objectViewer` on top, which is the
-  `GetObject` + `ListBucket` the beacon reads need and still no `delete`.
+  module's `PutObject` + `AbortMultipartUpload` exactly, with no `get` and no
+  `list`. The analytics bucket adds `objectViewer` on top, which is the
+  `GetObject` + `ListBucket` the beacon reads need.
+- **Deletion is a one-permission custom role**, bound on both buckets:
+  `storage.objects.delete` and nothing else. Every predefined role that carries
+  it (`objectUser`, `objectAdmin`) also carries `get` and `list`, which the
+  binding above deliberately withholds, and trading "cannot read or enumerate a
+  single recording" for "can delete" would be a bad bargain made silently. So
+  what the HMAC key can do, in full, is: create objects, run and abandon
+  multipart uploads, delete objects, and — on the analytics bucket only — read
+  and list them. A leaked key can write junk and destroy recordings; it still
+  cannot download one. Note that GCP soft-deletes a custom role for 7 days, so a
+  destroy-then-apply inside that window fails on the role id until it is
+  undeleted.
 
 The four APIs the module enables (`run`, `artifactregistry`, `storage`, `iam`)
 are all `disable_on_destroy = false`. A destroy of this stack must not switch
@@ -186,6 +200,12 @@ Cloud Run off for the whole project.
 This one is written to be **imported into**, not applied greenfield: the
 production deployment already exists. Every resource carries its
 `terraform import` line as a comment.
+
+`docs/SPEC.md` §18's deletion changes nothing here, which is worth stating since
+it changed both other modules: R2's `Object Read & Write` token is a whole-object
+grant that already includes deletion, and the `cors_rules` output has listed
+`DELETE` since the multipart abort needed it. The three presigned DELETEs a
+Delete video sends go out over the same rule and the same token.
 
 ```sh
 export CLOUDFLARE_API_TOKEN=...

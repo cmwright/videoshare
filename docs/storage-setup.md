@@ -23,18 +23,24 @@ deployment is one bucket configured four ways.
    every part response returned, and a response header the browser is not
    allowed to read might as well not have been sent.
 
-   `examples/s3-cors.json` lists all five methods. Leave `DELETE` out and
+   `examples/s3-cors.json` lists all five methods. `DELETE` now carries two
+   things rather than one: abandoning an upload, and the library's **Delete
+   video**, which sends three `DELETE`s from the same origin. Leave it out and
    Discard's `AbortMultipartUpload` never leaves the browser — its preflight
    fails, the recorder swallows it (the abort is best-effort by design), and the
    parts already uploaded stay in the bucket, billed and invisible to a plain
-   listing, until point 5 sweeps them.
-4. **Upload credentials scoped as narrowly as the provider allows** — ideally
-   `s3:PutObject` and `s3:AbortMultipartUpload` on `{bucket}/*` and nothing
-   else. `PutObject` authorizes the whole multipart write path (create, every
-   part, complete); abandoning an upload is a separate action, and without it
-   Discard comes back 403. They live in the recorder's `localStorage`, so treat
-   them as compromised-in-advance and make sure the worst case is "someone wrote
-   junk into my bucket".
+   listing, until point 5 sweeps them — while Delete video fails on its
+   preflight with no HTTP status at all, which the row reports as a network
+   error. No CORS change is needed for deletion: `DELETE` was already on the
+   list.
+4. **Upload credentials scoped as narrowly as the provider allows** —
+   `s3:PutObject` and `s3:AbortMultipartUpload` on `{bucket}/*`, plus
+   `s3:DeleteObject` if you want **Delete video** to work. `PutObject`
+   authorizes the whole multipart write path (create, every part, complete);
+   abandoning an upload is a separate action, and without it Discard comes back
+   403. They live in the recorder's `localStorage`, so treat them as
+   compromised-in-advance and make sure the worst case is one you can live with
+   — see the note on the optional delete grant below.
 5. **Something that aborts incomplete multipart uploads**, after a day or so. A
    tab closed mid-recording leaves its uploaded parts in the bucket; they are
    billed like stored objects and a plain listing does not show them, so nothing
@@ -54,6 +60,39 @@ that speaks the S3 API; 5 is per-provider. They hardcode the bucket name
 `AllowedOrigins` in `s3-cors.json` is `["*"]`, which is right while you are
 finding your feet and too loose afterwards. Once the site has a stable home,
 narrow it to that exact origin (scheme + host + port, no trailing slash).
+
+### The optional delete grant
+
+`examples/iam-uploader-policy.json` holds **two** statements, and the second one
+is a choice you get to make:
+
+| Sid | Actions | Buys you |
+| --- | --- | --- |
+| `VideoShareUploadOnly` | `s3:PutObject`, `s3:AbortMultipartUpload` | Recording. Required. |
+| `VideoShareOptionalDelete` | `s3:DeleteObject` | **Delete video**. Optional. |
+
+An IAM policy document is strict JSON — neither `aws iam put-user-policy` nor
+`mc admin policy create` will parse a comment out of it — so the `Sid` is where
+the optionality is said. Remove the second statement and apply the file: nothing
+else changes, the app works exactly as it does with it, and the library's
+**Delete video** answers with one muted sentence on the row saying the bucket
+refused the delete and that these credentials may not be allowed to delete. The
+entry stays; it is never quietly downgraded to a **Remove from list**.
+
+What you are choosing between:
+
+- **With it**, a key lifted out of a recorder's `localStorage` can delete your
+  recordings as well as write junk into the bucket.
+- **Without it**, "delete" means "forget locally" and the objects stay in the
+  bucket forever — which was VideoShare's only answer before this existed.
+
+The recorder cannot tell in advance which one a bucket carries — there is no way
+to ask — so **Delete video** is never hidden or disabled on a deployment that
+refuses it. A button with an honest failure behind it beats a disabled one that
+cannot explain itself.
+
+On R2 the choice does not arise: its narrowest token is a whole-object grant that
+already includes deletion (§4 below).
 
 ---
 
@@ -149,9 +188,12 @@ since the bucket is publicly readable anyway, costs you nothing extra. What
 matters is that the token is bucket-scoped and cannot touch bucket settings,
 other buckets, or your account. Rotate it if a recorder machine is lost.
 
-Being a whole-object grant, it covers the multipart calls too — there is no
-separate box to tick for `AbortMultipartUpload` the way there is an IAM action to
-add on S3.
+Being a whole-object grant, it covers the multipart calls too — and deletion —
+so there is no separate box to tick for `AbortMultipartUpload` or for
+`DeleteObject` the way there is an IAM action to add on S3. **Delete video**
+works on R2 with nothing extra configured, which is the flip side of the
+tradeoff above: the same token that can remove a recording could already read
+every object in the bucket.
 
 ### 5. Incomplete multipart uploads
 
@@ -242,7 +284,7 @@ aws s3api put-bucket-cors --bucket "$BUCKET" \
 `s3-bucket-policy.json` grants `s3:GetObject` on `{bucket}/*` and nothing else —
 no `ListBucket`, so `GET /?list-type=2` stays a 403.
 
-### 4. An upload-only IAM user
+### 4. The uploader's IAM user
 
 ```sh
 aws iam create-user --user-name videoshare-uploader
@@ -256,9 +298,15 @@ aws iam create-access-key --user-name videoshare-uploader
 
 The last command prints the only copy of the secret. That user can write objects
 into this one bucket — `s3:PutObject` covers creating a multipart upload, every
-part, and completing it — and abandon an upload of its own that never finished.
-Nothing else at all: no read, no list, no deleting a stored object, no
+part, and completing it — abandon an upload of its own that never finished, and
+delete an object, which is the file's optional second statement and the whole of
+what **Delete video** needs. Nothing else at all: no read, no list, no
 overwriting the bucket policy.
+
+To have an uploader that cannot delete, drop the `VideoShareOptionalDelete`
+statement before running `put-user-policy` (see *The optional delete grant*
+above). Changing your mind later is the same command against the edited file —
+IAM inline policies are replaced wholesale, not merged.
 
 ### 5. Abort incomplete multipart uploads
 
@@ -370,6 +418,12 @@ mc admin policy create myminio videoshare-uploader examples/iam-uploader-policy.
 mc admin policy attach myminio videoshare-uploader --user videoshare-uploader
 ```
 
+`mc admin policy create` applies the same two-statement file the AWS walkthrough
+uses, so this user can write, abandon an upload and delete — drop
+`VideoShareOptionalDelete` from a copy of the file first if you would rather it
+could not (see *The optional delete grant* above). `examples/docker-compose.yml`
+does exactly this and grants the delete.
+
 Use `set-json` rather than `mc anonymous set download myminio/videoshare`. The
 `download` shorthand also grants anonymous `s3:ListBucket`, which lets anyone
 enumerate every video id in the bucket. Verify what you actually applied:
@@ -430,18 +484,24 @@ mc admin policy create myminio videoshare-uploader examples/iam-uploader-policy.
 mc admin policy attach myminio videoshare-uploader --user videoshare-uploader
 ```
 
-…and then hand that one upload-only key to everyone on the VPN and stop thinking
-about it. It is not a secret in any meaningful sense: it can only write objects
-into one bucket, only from inside the perimeter, and there is nothing to rotate
-per person and nothing to revoke when someone leaves — you cut their VPN access
-instead. In practice this is the zero-credential setup: one line in a wiki page.
+…and then hand that one key to everyone on the VPN and stop thinking about it. It
+is not a secret in any meaningful sense: it can only write to and delete from one
+bucket, only from inside the perimeter, and there is nothing to rotate per person
+and nothing to revoke when someone leaves — you cut their VPN access instead. In
+practice this is the zero-credential setup: one line in a wiki page.
+
+The delete half is worth a second's thought before you paste it in a wiki:
+everyone on the VPN can delete anyone's recording, since a shared key is a shared
+key. If that is not what you want, apply a copy of the policy file without its
+`VideoShareOptionalDelete` statement and the whole VPN gets an app whose
+**Delete video** politely refuses.
 
 **Truly anonymous writes do not work with v1.** Adding `s3:PutObject` for
 `Principal: "*"` does make MinIO accept an *unsigned* `PUT`, but VideoShare
 uploads through `aws4fetch`, which always signs. MinIO checks the access key
 before it consults the anonymous policy, so a signed request with an unknown or
 empty key is rejected with `InvalidAccessKeyId` (403) rather than falling through
-to the anonymous grant. Verified. Use the shared upload-only key above.
+to the anonymous grant. Verified. Use the shared uploader key above.
 
 **What you give up either way.** A shared key means uploads are not attributable
 — the bucket cannot tell you who recorded what, only that someone on the VPN
@@ -497,6 +557,8 @@ something short and watch the network tab: one `POST ?uploads`, a `PUT
 
 If the recorder reports a 403 on upload, the credentials or their policy are
 wrong; a 403 specifically on Discard means the policy is missing
-`s3:AbortMultipartUpload`. If it reports a network error with no status, it is
-CORS — check the browser console, which will name the method or header it
-objected to.
+`s3:AbortMultipartUpload`; a 403 on a row's **Delete video**, with a sentence
+saying so, means the policy is missing the optional `s3:DeleteObject` — that one
+is a supported configuration, not a broken one. If it reports a network error
+with no status, it is CORS — check the browser console, which will name the
+method or header it objected to.

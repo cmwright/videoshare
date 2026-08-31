@@ -10,6 +10,13 @@
  * added. Nothing in this package reads a stored object back out of a bucket.
  * The single, deliberately bounded exception is §16.3's analytics beacon: a
  * write-only, ≤ 16 KiB block of opaque ciphertext, with no read path at all.
+ *
+ * §18's deletion does not widen that. The video bucket's three objects are
+ * removed by the browser through presigned DELETEs (§18.3) — there is no
+ * server-side video-bucket delete anywhere in this package. The analytics
+ * bucket's own sessions are removed here (§18.4) because their keys are only
+ * enumerable with the credential this process holds, and a DELETE carries no
+ * bytes in either direction.
  */
 
 import type { AnalyticsStore } from "./analytics.ts";
@@ -131,9 +138,18 @@ export async function handleRequest(request: Request, env: GatewayEnv): Promise<
       if (store === null) return jsonResponse({ error: "Not found." }, 404, cors);
 
       if (route.sessionId === null) {
-        if (request.method !== "GET") return methodNotAllowed("GET, OPTIONS", cors);
-        return await handleBeaconList(request, instance, store, route.videoId, cors);
+        // GET lists one video's sessions (§16.3); DELETE removes them (§18.4).
+        if (request.method === "GET") {
+          return await handleBeaconList(request, instance, store, route.videoId, cors);
+        }
+        if (request.method === "DELETE") {
+          return await handleBeaconDelete(request, instance, store, route.videoId, cors);
+        }
+        return methodNotAllowed("GET, DELETE, OPTIONS", cors);
       }
+      // SPEC §18.4: `DELETE /sessions/{videoId}/{sessionId}` is a 405 like every
+      // other non-POST here. There is no single-session delete because there is
+      // no surface that would ask for one.
       if (request.method !== "POST") return methodNotAllowed("POST, OPTIONS", cors);
       return await handleBeaconWrite(request, store, route.videoId, route.sessionId, cors);
     }
@@ -291,6 +307,60 @@ async function handleBeaconList(
   }
 }
 
+// --- DELETE /beacon/{videoId} ------------------------------------------------
+
+/**
+ * Removes one video's stored sessions (SPEC §18.4) — the one route on which this
+ * service deletes a stored object itself.
+ *
+ * That asymmetry is deliberate rather than convenient. The video bucket's three
+ * objects are deleted by the *browser*, through presigned DELETEs this gateway
+ * signs (§18.3), because §15's invariant says object authority travels as a URL.
+ * The analytics bucket cannot work that way: a presigned URL names one key, and
+ * the keys under a prefix are not enumerable without the credential and the
+ * ListObjectsV2 call this module already makes for the listing above. So the
+ * enumeration — and therefore the deletion — stays here, and no byte flows out
+ * either way: a DELETE moves none.
+ *
+ * Authenticated exactly like the listing, which means exactly like everything
+ * else: **anyone on `ALLOWED_EMAILS` can delete any video id they know.** That
+ * is the uploader whitelist doing what it has always done for the listing (§16.3)
+ * — not per-video ownership, and not built to be one (§18.2).
+ */
+async function handleBeaconDelete(
+  request: Request,
+  instance: Instance,
+  store: AnalyticsStore,
+  videoId: string,
+  cors: Record<string, string>,
+): Promise<Response> {
+  const auth = await instance.authenticator.authenticate(request.headers.get("Authorization"));
+  if (!auth.ok) return jsonResponse({ error: auth.error }, auth.status, cors);
+
+  if (!ID_PATTERN.test(videoId)) {
+    return jsonResponse({ error: '"id" must be 22 base64url characters.' }, 400, cors);
+  }
+
+  let result;
+  try {
+    result = await store.deleteAll(videoId);
+  } catch (err) {
+    const status = err instanceof AnalyticsStoreError ? err.status : 0;
+    console.error(`[videoshare-gateway] analytics deletion failed id=${videoId} storage-status=${status}`);
+    return jsonResponse({ error: "The analytics bucket refused the deletion." }, 502, cors);
+  }
+
+  // One line per call, in the shape the listing logs (SPEC §18.4): the video id,
+  // the verified email, and the count. No session id — the count is what an
+  // operator needs and a session id is a viewer-minted label — and, as
+  // everywhere on this path, no IP-bearing header was read to produce it. It is
+  // written after the pass because the count does not exist before it.
+  console.log(
+    `[videoshare-gateway] sessions deleted id=${videoId} email=${auth.email} count=${result.deleted}`,
+  );
+  return jsonResponse(result, 200, cors);
+}
+
 /**
  * The body, or null if it is over `limit` bytes.
  *
@@ -370,7 +440,10 @@ async function readBoundedBytes(request: Request, limit: number): Promise<Uint8A
 type Route =
   | { kind: "config" }
   | { kind: "sign" }
-  /** `sessionId` present is the write (POST); absent is the listing (GET). */
+  /**
+   * `sessionId` present is the write (POST); absent is the listing (GET) or the
+   * deletion (DELETE, SPEC §18.4).
+   */
   | { kind: "beacon"; videoId: string; sessionId: string | null };
 
 /**
@@ -419,12 +492,13 @@ function corsHeaders(origin: string | null): Record<string, string> {
 }
 
 function preflightResponse(route: Route, cors: Record<string, string>): Response {
-  // The beacon route carries both: POST writes one session, GET lists them.
+  // The beacon route carries all three: POST writes one session, GET lists them,
+  // DELETE removes them (SPEC §18.4).
   const methods =
     route.kind === "config"
       ? "GET, OPTIONS"
       : route.kind === "beacon"
-        ? "GET, POST, OPTIONS"
+        ? "GET, POST, DELETE, OPTIONS"
         : "POST, OPTIONS";
   return new Response(null, {
     status: 204,

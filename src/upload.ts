@@ -1,5 +1,6 @@
 /**
- * Streaming upload of one video (docs/SPEC.md §7, §15.5).
+ * Streaming upload of one video (docs/SPEC.md §7, §15.5) — and its deletion
+ * (§18.3), which lives here because the `Signer` seam does.
  *
  * `{id}/video.bin` is an S3 multipart upload that runs *alongside* the
  * recording: encrypted chunk i (§4) is uploaded as part number i+1, so the
@@ -30,6 +31,23 @@ export interface UploadResult {
   id: string;
   link: string;
 }
+
+/**
+ * §3's three objects, by the suffix the seam and the gateway's answer both use.
+ * A name, never a key: the signer builds `{id}/{object}` itself (SPEC §18.3).
+ */
+export type VideoObjectName = "video.bin" | "meta.json" | "thumb.bin";
+
+/**
+ * §18.1's deletion order, which is §7's write order exactly reversed.
+ *
+ * `meta.json` first because it is the completion marker: a player fetches it
+ * before anything else (§8), so from the instant it is gone every copy of the
+ * share link is already the clean "video not found" of §18.5. A delete that
+ * fails halfway therefore leaves a video that reads as *absent*, never as a
+ * torso that still looks complete and then fails deeper in.
+ */
+export const DELETE_ORDER: readonly VideoObjectName[] = ["meta.json", "thumb.bin", "video.bin"];
 
 /** One video's in-flight multipart upload. Created at record start, finished at Finish. */
 export interface UploadSession {
@@ -84,7 +102,10 @@ export type SignOp =
   | { kind: "complete"; id: string; uploadId: string }
   | { kind: "abort"; id: string; uploadId: string }
   | { kind: "put-meta"; id: string }
-  | { kind: "put-thumb"; id: string };
+  | { kind: "put-thumb"; id: string }
+  // §18.3. `object` is a closed union of three suffixes, not a key: the signer
+  // still builds `{id}/{object}`, so the rule above holds for deletes too.
+  | { kind: "delete"; id: string; object: VideoObjectName };
 
 /** What the session is about to send — a signer that signs payloads needs the bytes. */
 export interface SignRequest {
@@ -111,8 +132,15 @@ export interface Signer {
   sign(req: SignRequest): Promise<SignedRequest>;
   /** An authorization that just failed must not be reused: drop anything cached for `op`. */
   forget(op: SignOp): void;
-  /** Advice appended to an HTTP failure message. */
-  statusHint(status: number, method: HttpMethod): string;
+  /**
+   * Advice appended to an HTTP failure message. `kind` is the op that failed,
+   * which the method alone cannot stand in for: the seam sends `DELETE` for two
+   * different intents — the one that abandons a multipart upload and the three
+   * that remove stored objects (§18.3) — and they are refused for two different
+   * missing grants. Omitting it means "an object delete", the case §18.3's
+   * optional-IAM contract is written about.
+   */
+  statusHint(status: number, method: HttpMethod, kind?: SignOp["kind"]): string;
   /** The whole message for a request that never reached an HTTP status. */
   networkMessage(what: string, method: HttpMethod): string;
 }
@@ -127,6 +155,7 @@ const METHODS: Record<SignOp["kind"], HttpMethod> = {
   abort: "DELETE",
   "put-meta": "PUT",
   "put-thumb": "PUT",
+  delete: "DELETE",
 };
 
 // --- LocalSigner: credentials in this browser (SPEC §7) ----------------------
@@ -182,8 +211,26 @@ class LocalSigner implements Signer {
     // Nothing is cached: each attempt is signed as it is sent.
   }
 
-  statusHint(status: number, method: HttpMethod): string {
+  statusHint(status: number, method: HttpMethod, kind?: SignOp["kind"]): string {
     const settings = this.settings;
+    // §18.3's optional-IAM contract: a deployment whose upload credentials lack
+    // s3:DeleteObject is *supported*, and its one failure has to read like a
+    // configuration choice rather than a bug.
+    //
+    // Discard's AbortMultipartUpload is a DELETE too, and it is refused for the
+    // *other* missing grant — which is why the op, not just the method, decides.
+    // `docs/storage-setup.md` tells an operator that a 403 on Discard means
+    // s3:AbortMultipartUpload; an abort therefore falls through to the general
+    // 403 below, which names that grant, rather than sending them to add an
+    // s3:DeleteObject that would change nothing.
+    if (status === 403 && method === "DELETE" && kind !== "abort") {
+      return (
+        `The bucket refused the delete. These upload credentials may not be allowed to delete a ` +
+        `stored object: s3:DeleteObject is optional (it is the second statement of ` +
+        `examples/iam-uploader-policy.json), and without it everything else still works and ` +
+        `Delete video fails exactly here. See ${DOCS}.`
+      );
+    }
     if (status === 403) {
       return (
         `The credentials were rejected or may not write here. Check accessKeyId/secretAccessKey, ` +
@@ -220,10 +267,10 @@ class LocalSigner implements Signer {
 
   networkMessage(what: string, method: HttpMethod): string {
     return (
-      `Could not reach ${this.settings.endpoint} to upload ${what}: the request failed before any HTTP ` +
-      `status. That is almost always CORS (the bucket must allow ${method} from ${originLabel()}, ` +
-      `allow the authorization/x-amz-* headers, and expose the ETag header) or an unreachable ` +
-      `endpoint. See examples/s3-cors.json and ${DOCS}.`
+      `Could not reach ${this.settings.endpoint} to ${verbFor(method)} ${what}: the request failed ` +
+      `before any HTTP status. That is almost always CORS (the bucket must allow ${method} from ` +
+      `${originLabel()}, allow the authorization/x-amz-* headers, and expose the ETag header) or an ` +
+      `unreachable endpoint. See examples/s3-cors.json and ${DOCS}.`
     );
   }
 }
@@ -234,6 +281,8 @@ function localUrl(settings: Settings, op: SignOp): string {
   if (op.kind === "put-meta") return `${base}/${op.id}/meta.json`;
   // The same direct SigV4 PUT meta.json gets, against a different key (SPEC §15.5).
   if (op.kind === "put-thumb") return `${base}/${op.id}/thumb.bin`;
+  // The same path again, a different method (SPEC §18.3).
+  if (op.kind === "delete") return `${base}/${op.id}/${op.object}`;
 
   const video = `${base}/${op.id}/video.bin`;
   if (op.kind === "create") return `${video}?uploads`;
@@ -301,6 +350,12 @@ class GatewaySigner implements Signer {
 
   /** Presigned part URLs, keyed by `{uploadId}\n{partNumber}`. */
   private readonly parts = new Map<string, SignedUrl>();
+  /**
+   * Presigned DELETE URLs, keyed by `{id}\n{object}` (SPEC §18.3). One
+   * `{ op: "delete", id }` answers with all three, so the first of the three
+   * DELETEs pays for the round trip and the other two are free.
+   */
+  private readonly deletes = new Map<string, SignedUrl>();
   /** One request per in-flight batch, so a top-up and a demand never double-sign. */
   private readonly batches = new Map<string, Promise<void>>();
   private readonly gateway: string;
@@ -313,7 +368,9 @@ class GatewaySigner implements Signer {
     const url =
       req.op.kind === "part"
         ? await this.partUrl(req.op)
-        : (await this.askForUrl(req.op)).url;
+        : req.op.kind === "delete"
+          ? await this.deleteUrl(req.op)
+          : (await this.askForUrl(req.op)).url;
 
     // No `x-amz-content-sha256`: a query-signed URL is UNSIGNED-PAYLOAD (§15.3),
     // and a payload hash the signature does not cover only invites a 403.
@@ -326,9 +383,25 @@ class GatewaySigner implements Signer {
 
   forget(op: SignOp): void {
     if (op.kind === "part") this.parts.delete(partKey(op.uploadId, op.partNumber));
+    // Only the one object's URL: a retry re-signs it rather than re-sending a
+    // signature the bucket has already refused, and the other two are still
+    // good (SPEC §18.3).
+    if (op.kind === "delete") this.deletes.delete(deleteKey(op.id, op.object));
   }
 
-  statusHint(status: number, method: HttpMethod): string {
+  statusHint(status: number, method: HttpMethod, kind?: SignOp["kind"]): string {
+    // §18.3's optional-IAM contract, gateway side: the credentials that sign
+    // are the gateway's, so this points at the gateway's own setup rather than
+    // at a policy file the reader's browser never held. Discard's abort is a
+    // DELETE too and wants a different grant, so it takes the general 403 —
+    // same reason as LocalSigner.
+    if (status === 403 && method === "DELETE" && kind !== "abort") {
+      return (
+        `The bucket refused the delete. The presigned URL may have expired (a retry signs a fresh ` +
+        `one), or the gateway's bucket credentials may not be allowed to delete a stored object — ` +
+        `s3:DeleteObject on the video bucket is what Delete video spends. See ${GATEWAY_DOCS}.`
+      );
+    }
     if (status === 403) {
       return (
         `The bucket rejected the presigned URL. It may have expired (a retry signs a fresh one), or ` +
@@ -360,17 +433,19 @@ class GatewaySigner implements Signer {
 
   networkMessage(what: string, method: HttpMethod): string {
     return (
-      `Could not upload ${what}: the ${method} to the presigned URL failed before any HTTP status. ` +
-      `That is almost always the bucket's CORS configuration (it must allow ${method} from ` +
-      `${originLabel()} and expose the ETag header) or an unreachable bucket — the gateway itself ` +
-      `answered, so its own CORS is fine. See examples/s3-cors.json and ${GATEWAY_DOCS}.`
+      `Could not ${verbFor(method)} ${what}: the ${method} to the presigned URL failed before any ` +
+      `HTTP status. That is almost always the bucket's CORS configuration (it must allow ${method} ` +
+      `from ${originLabel()} and expose the ETag header) or an unreachable bucket — the gateway ` +
+      `itself answered, so its own CORS is fine. See examples/s3-cors.json and ${GATEWAY_DOCS}.`
     );
   }
 
   // --- internals -------------------------------------------------------------
 
   /** One presigned URL for an op the session needs exactly once. */
-  private async askForUrl(op: Exclude<SignOp, { kind: "part" }>): Promise<SignedUrl> {
+  private async askForUrl(
+    op: Exclude<SignOp, { kind: "part" } | { kind: "delete" }>,
+  ): Promise<SignedUrl> {
     const body = await this.ask({
       op: op.kind,
       id: op.id,
@@ -439,6 +514,50 @@ class GatewaySigner implements Signer {
         checkedUrl(part.url, `part ${part.partNumber}`),
       );
     }
+  }
+
+  /**
+   * One of §18.1's three DELETEs. The gateway answers a `delete` with all three
+   * URLs in one body (SPEC §15.3), so this asks once and the two DELETEs behind
+   * it are already held — the same shape `part` has, cached the same way.
+   */
+  private async deleteUrl(op: { id: string; object: VideoObjectName }): Promise<string> {
+    const held = this.freshDelete(op.id, op.object);
+    if (held) return held;
+
+    await this.requestDeletes(op.id);
+    const url = this.freshDelete(op.id, op.object);
+    if (!url) {
+      throw new Error(
+        `The upload gateway did not return a URL for ${op.id}/${op.object}. See ${GATEWAY_DOCS}.`,
+      );
+    }
+    return url;
+  }
+
+  private async requestDeletes(id: string): Promise<void> {
+    const body = record(await this.ask({ op: "delete", id }));
+    if (!Array.isArray(body.urls)) {
+      throw new Error(`The upload gateway returned no delete URLs. See ${GATEWAY_DOCS}.`);
+    }
+    for (const entry of body.urls) {
+      const object = record(entry);
+      // The key is a suffix the gateway chose from a closed set; anything else
+      // is not one of §3's three objects and has no row to belong to.
+      if (!isVideoObjectName(object.key)) continue;
+      this.deletes.set(deleteKey(id, object.key), checkedUrl(object.url, `${id}/${object.key}`));
+    }
+  }
+
+  private freshDelete(id: string, object: VideoObjectName): string | null {
+    const key = deleteKey(id, object);
+    const entry = this.deletes.get(key);
+    if (!entry) return null;
+    if (entry.usableUntil <= Date.now()) {
+      this.deletes.delete(key);
+      return null;
+    }
+    return entry.url;
   }
 
   private freshPart(uploadId: string, partNumber: number): string | null {
@@ -524,6 +643,14 @@ class GatewaySigner implements Signer {
 
 function partKey(uploadId: string, partNumber: number): string {
   return `${uploadId}\n${partNumber}`;
+}
+
+function deleteKey(id: string, object: VideoObjectName): string {
+  return `${id}\n${object}`;
+}
+
+function isVideoObjectName(value: unknown): value is VideoObjectName {
+  return value === "video.bin" || value === "meta.json" || value === "thumb.bin";
 }
 
 function signInError(detail = ""): Error {
@@ -917,9 +1044,50 @@ class MultipartSession implements UploadSession {
   }
 }
 
+// --- Deletion (SPEC §18.3) ---------------------------------------------------
+
+/**
+ * Deletes `{id}`'s three objects in {@link DELETE_ORDER}, sequentially.
+ *
+ * Resolves when all three are gone — **a 404 counts as gone**: `DeleteObject`
+ * is idempotent, most implementations answer 204 whether or not the object was
+ * there and the ones that answer 404 mean the same thing, `thumb.bin` is
+ * optional (§3) so its absence is the ordinary case, and a delete retried after
+ * a partial failure must not fail on the objects that already went. Any other
+ * non-2xx is a failure.
+ *
+ * Rejects with the first failure's message and leaves whatever came after it
+ * untouched. There is deliberately **no retry ladder**: the part queue's exists
+ * because a recording is unrepeatable, while a failed delete loses nothing, the
+ * library entry stays, and the reader can press the button again with a better
+ * error in front of them. One attempt per object.
+ *
+ * Sequential rather than parallel, because §18.1's order is the guarantee: once
+ * `meta.json` is gone the share link is already the clean "video not found" of
+ * §18.5, and three parallel DELETEs would trade that for a few hundred
+ * milliseconds.
+ */
+export async function deleteVideo(signer: Signer, id: string): Promise<void> {
+  for (const object of DELETE_ORDER) {
+    await send(signer, { op: { kind: "delete", id, object } }, `${id}/${object}`, {
+      goneIsSuccess: true,
+    });
+  }
+}
+
 // --- Signed requests ---------------------------------------------------------
 
-async function send(signer: Signer, req: SignRequest, what: string): Promise<Response> {
+interface SendOptions {
+  /** A 404 means the object is not there, which is what the caller wanted (§18.1). */
+  goneIsSuccess?: boolean;
+}
+
+async function send(
+  signer: Signer,
+  req: SignRequest,
+  what: string,
+  options?: SendOptions,
+): Promise<Response> {
   const method = METHODS[req.op.kind];
   // lib.dom's BodyInit accepts only ArrayBuffer-backed views; nothing here is
   // ever backed by a SharedArrayBuffer.
@@ -938,11 +1106,12 @@ async function send(signer: Signer, req: SignRequest, what: string): Promise<Res
     signer.forget(req.op);
     throw new Error(signer.networkMessage(what, method), { cause });
   }
+  if (res.status === 404 && options?.goneIsSuccess) return res;
   if (!res.ok) {
     // A signature that produced a failure is not reused: the retry signs a new one.
     signer.forget(req.op);
     const text = await res.text().catch(() => "");
-    throw new Error(httpMessage(what, method, signer, res.status, res.statusText, text));
+    throw new Error(httpMessage(what, req.op.kind, signer, res.status, res.statusText, text));
   }
   return res;
 }
@@ -1031,15 +1200,28 @@ function s3ErrorDetail(body: string): string {
 
 function httpMessage(
   what: string,
-  method: HttpMethod,
+  kind: SignOp["kind"],
   signer: Signer,
   status: number,
   statusText: string,
   body: string,
 ): string {
+  const method = METHODS[kind];
   const detail = s3ErrorDetail(body);
-  const head = `Upload of ${what} failed: HTTP ${status}${statusText ? ` ${statusText}` : ""}`;
-  return `${head}${detail ? ` (${detail})` : ""}. ${signer.statusHint(status, method)}`;
+  const head =
+    method === "DELETE"
+      ? `Deleting ${what} failed: HTTP ${status}${statusText ? ` ${statusText}` : ""}`
+      : `Upload of ${what} failed: HTTP ${status}${statusText ? ` ${statusText}` : ""}`;
+  return `${head}${detail ? ` (${detail})` : ""}. ${signer.statusHint(status, method, kind)}`;
+}
+
+/**
+ * What a failed request was *for*, in a sentence. The seam carries one DELETE
+ * that abandons an upload and three that remove objects (§18.3); both read as
+ * "delete" and neither reads as "upload".
+ */
+function verbFor(method: HttpMethod): string {
+  return method === "DELETE" ? "delete" : "upload";
 }
 
 // --- Small helpers -----------------------------------------------------------

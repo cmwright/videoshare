@@ -21,6 +21,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { AddressInfo } from "node:net";
 import { SignJWT, exportJWK, generateKeyPair, type JWK } from "jose";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { MAX_DELETED_SESSIONS, MAX_DELETE_LIST_PAGES } from "../gateway/src/analytics";
 import { handleRequest, type GatewayEnv } from "../gateway/src/core";
 import { randomId } from "../src/util";
 
@@ -91,14 +92,32 @@ let bucketWrites: BucketWrite[] = [];
 let bucketObjects: StoredObject[] = [];
 /** Non-null makes the bucket refuse everything with that status. */
 let bucketFailure: number | null = null;
+/**
+ * Non-null makes DELETE alone refuse, so §18.4's deletion can be failed *after*
+ * a listing has succeeded — which is the only interesting way for it to fail.
+ */
+let bucketDeleteFailure: number | null = null;
 /** Keys per listing page, so pagination can be exercised without 1000-key pages. */
 let bucketPageSize = 1000;
+/**
+ * Makes the bucket claim `IsTruncated` while withholding the continuation token
+ * — a store that says "there is more" and gives nothing to ask with. Neither the
+ * listing nor the deletion may read that as a complete listing.
+ */
+let bucketWithholdsToken = false;
 
 function resetBucket(): void {
   bucketWrites = [];
   bucketObjects = [];
   bucketFailure = null;
+  bucketDeleteFailure = null;
   bucketPageSize = 1000;
+  bucketWithholdsToken = false;
+}
+
+/** `/{bucket}/{key}` → `{key}`, which for an analytics object holds a `/`. */
+function keyOf(pathname: string): string {
+  return pathname.split("/").slice(2).join("/");
 }
 
 function listXml(prefix: string, start: number): string {
@@ -113,9 +132,10 @@ function listXml(prefix: string, start: number): string {
         `<StorageClass>STANDARD</StorageClass></Contents>`,
     )
     .join("");
-  const next = more
-    ? `<NextContinuationToken>${Buffer.from(String(start + page.length)).toString("base64")}</NextContinuationToken>`
-    : "";
+  const next =
+    more && !bucketWithholdsToken
+      ? `<NextContinuationToken>${Buffer.from(String(start + page.length)).toString("base64")}</NextContinuationToken>`
+      : "";
   return (
     `<?xml version="1.0" encoding="UTF-8"?>` +
     `<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">` +
@@ -148,6 +168,20 @@ function serveBucket(req: IncomingMessage, res: ServerResponse): void {
       const start = token === null ? 0 : Number(Buffer.from(token, "base64").toString());
       res.writeHead(200, { "content-type": "application/xml" });
       res.end(listXml(url.searchParams.get("prefix") ?? "", start));
+      return;
+    }
+    if (req.method === "DELETE") {
+      if (bucketDeleteFailure !== null) {
+        res.writeHead(bucketDeleteFailure, { "content-type": "application/xml" });
+        res.end("<Error><Code>AccessDenied</Code><Message>no</Message></Error>");
+        return;
+      }
+      // The object really goes, so a caller that repeats while `truncated`
+      // (SPEC §18.4) converges here the way it would against a real bucket.
+      // S3 answers 204 whether or not the key was there.
+      const key = keyOf(url.pathname);
+      bucketObjects = bucketObjects.filter((object) => object.key !== key);
+      res.writeHead(204).end();
       return;
     }
     res.writeHead(200, { etag: '"d41d8cd98f00b204e9800998ecf8427e"' });
@@ -602,7 +636,10 @@ describe("POST /api/sign — request validation", () => {
   const malformed: Array<[string, unknown]> = [
     ["no body at all", undefined],
     ["an empty object", {}],
-    ["an unknown op", { op: "delete", id }],
+    // `delete` used to stand here as the unknown op; SPEC §18.3 made it the
+    // seventh real one, so the case moves to a name that is still not an op
+    // rather than disappearing.
+    ["an unknown op", { op: "remove", id }],
     ["op as a non-string", { op: 7, id }],
     ["a proxy-shaped op", { op: "get", id }],
     ["create with no id", { op: "create" }],
@@ -825,6 +862,9 @@ describe("POST /api/sign — presigned URLs", () => {
       { op: "abort", id, uploadId: UPLOAD_ID },
       { op: "put-meta", id },
       { op: "put-thumb", id },
+      // §18.3's delete belongs in this list more than any of them: a DELETE
+      // carries no payload, so a proxy of it would have looked harmless.
+      { op: "delete", id },
     ]) {
       const answer = await sign(body);
       expect(answer.status, answer.text).toBe(200);
@@ -950,6 +990,129 @@ describe("POST /api/sign — put-thumb", () => {
 
     expect(answer.status, answer.text).toBe(200);
     expectPresigned(answer.json.url, thumbKey);
+  });
+});
+
+// --- delete (SPEC §18.3, §15.3) ----------------------------------------------
+
+/**
+ * The seventh op, written in the style of the `put-thumb` suite above because it
+ * is the same kind of thing: same route, same auth, same id validation, same
+ * 400s. Two things are its own.
+ *
+ * One: it answers with *three* URLs for one request, in §18.1's deletion order,
+ * and the order is the guarantee — `meta.json` first, so a delete that fails
+ * halfway leaves a video that reads as absent rather than as a torso; `video.bin`
+ * last. Nothing but this assertion enforces that on the gateway's side.
+ *
+ * Two: `delete` takes no key, suffix or object name from the body at all. There
+ * is no field to steer, which is a stronger property than the other ops have —
+ * they at least accept an id — and it is worth a test that tries to steer it.
+ */
+describe("POST /api/sign — delete", () => {
+  const id = randomId();
+  /** SPEC §18.1: meta first, video last. */
+  const ORDER = ["meta.json", "thumb.bin", "video.bin"];
+
+  interface DeleteAnswer {
+    urls: { key: string; url: string }[];
+    method: string;
+  }
+
+  it("presigns a DELETE for all three objects, in §18.1's deletion order", async () => {
+    const answer = await sign({ op: "delete", id });
+
+    expect(answer.status, answer.text).toBe(200);
+    const body = answer.json as unknown as DeleteAnswer;
+    expect(body.method, "the method is stated once, at the top level").toBe("DELETE");
+    expect(body.urls.map((entry) => entry.key), "SPEC §18.1's order").toEqual(ORDER);
+
+    for (const entry of body.urls) {
+      // The `key` is the suffix; the full object key is the gateway's to build.
+      const url = expectPresigned(entry.url, `${id}/${entry.key}`);
+      expect(url.pathname).toBe(`/${BUCKET}/${id}/${entry.key}`);
+      // A DELETE of the object itself, not an abort: no multipart query at all.
+      expect(url.searchParams.has("uploadId")).toBe(false);
+      expect(url.searchParams.has("uploads")).toBe(false);
+      expect(url.searchParams.has("partNumber")).toBe(false);
+    }
+  });
+
+  it("signs three distinct URLs, one per key, and none of them for another video", async () => {
+    const answer = await sign({ op: "delete", id });
+    const body = answer.json as unknown as DeleteAnswer;
+
+    const paths = body.urls.map((entry) => new URL(entry.url).pathname);
+    expect(new Set(paths).size, "three keys, three URLs").toBe(3);
+    for (const path of paths) expect(path.startsWith(`/${BUCKET}/${id}/`)).toBe(true);
+  });
+
+  it("carries the same X-Amz-Expires every other op gets", async () => {
+    const answer = await sign({ op: "delete", id }, { envOverrides: { PRESIGN_EXPIRY_SECONDS: "120" } });
+
+    expect(answer.status, answer.text).toBe(200);
+    const body = answer.json as unknown as DeleteAnswer;
+    for (const entry of body.urls) {
+      expect(new URL(entry.url).searchParams.get("X-Amz-Expires")).toBe("120");
+    }
+  });
+
+  it("rejects a request with no Authorization header", async () => {
+    expectError(await sign({ op: "delete", id }, { token: null }), 401, "delete, no bearer");
+  });
+
+  it("refuses a valid token from an address that is not whitelisted", async () => {
+    // 403, not 401: a real identity that simply may not delete (SPEC §18.2).
+    const token = await mintToken({ email: "carol@example.com", emailVerified: true });
+    expectError(await sign({ op: "delete", id }, { token }), 403, "delete, not whitelisted");
+  });
+
+  const badIds: Array<[string, unknown]> = [
+    ["absent", undefined],
+    ["21 characters", "aaaaaaaaaaaaaaaaaaaaa"],
+    ["23 characters", "aaaaaaaaaaaaaaaaaaaaaaa"],
+    ["a slash", "aaaaaaaaaaa/aaaaaaaaaa"],
+    ["a dot", "aaaaaaaaaaa.aaaaaaaaaa"],
+    ["a traversal attempt", "../../../etc/passwd222"],
+  ];
+
+  it.each(badIds)("rejects an id that is %s with 400", async (_label, badId) => {
+    const body = badId === undefined ? { op: "delete" } : { op: "delete", id: badId };
+    expectError(await sign(body), 400, `delete id=${String(badId)}`);
+  });
+
+  it("takes no key from the body: an objectKey or key changes nothing", async () => {
+    const other = randomId();
+    const answer = await sign({
+      op: "delete",
+      id,
+      // Everything a caller would reach for to delete something that is not
+      // theirs. None of it is read: the three keys below are derived from `id`.
+      key: "../../etc/passwd",
+      objectKey: `${other}/video.bin`,
+      Key: `${other}/meta.json`,
+      object: "video.bin",
+      keys: [`${other}/thumb.bin`],
+      bucket: "not-your-bucket",
+      endpoint: "https://attacker.example.net",
+      method: "GET",
+    });
+
+    expect(answer.status, answer.text).toBe(200);
+    const body = answer.json as unknown as DeleteAnswer;
+    expect(body.urls.map((entry) => entry.key)).toEqual(ORDER);
+    for (const entry of body.urls) expectPresigned(entry.url, `${id}/${entry.key}`);
+    expect(answer.text, "no URL was signed for the other video").not.toContain(other);
+  });
+
+  it("hands back URLs at the bucket, so the gateway deletes nothing itself", async () => {
+    // SPEC §18.3 is presign-or-bust: there is no route on which this service
+    // removes a video-bucket object. A URL pointing at the gateway would mean
+    // one had appeared.
+    const answer = await sign({ op: "delete", id });
+    expect(answer.text).not.toContain("gateway.example.com");
+    expect(answer.text).not.toContain(SECRET_ACCESS_KEY);
+    expect(answer.text).toContain(BUCKET_ENDPOINT);
   });
 });
 
@@ -1366,7 +1529,9 @@ describe("GET /beacon/{videoId}", () => {
     expectError(answer, 404, "analytics disabled");
   });
 
-  it.each(["POST", "PUT", "DELETE"])("refuses %s on the listing path with 405", async (method) => {
+  // DELETE left this list when SPEC §18.4 gave it a meaning on this exact path;
+  // its own suite below owns it now. Everything else is still a 405.
+  it.each(["POST", "PUT", "PATCH"])("refuses %s on the listing path with 405", async (method) => {
     const answer = await beacon(`/beacon/${randomId()}`, { method, token: await goodToken() });
     expectError(answer, 405, method);
     expect(answer.headers.get("allow")).toContain("GET");
@@ -1406,6 +1571,324 @@ describe("GET /beacon/{videoId}", () => {
     });
     expect(answer.status, answer.text).toBe(200);
     expect(answer.headers.get("access-control-allow-origin")).toBe(SITE_ORIGIN);
+  });
+});
+
+// --- Session deletion (SPEC §18.4) -------------------------------------------
+
+/**
+ * The one route on which this gateway removes a stored object itself, and the
+ * suite mirrors the listing above case for case because the contract does: same
+ * auth, same `ID_PATTERN`, same 404 when analytics is off, same 502 when the
+ * bucket refuses.
+ *
+ * What is only here is the bound. One call costs at most `MAX_DELETE_LIST_PAGES`
+ * listings and `MAX_DELETED_SESSIONS` deletes because that is what fits under
+ * the Cloudflare Workers free plan's 50 subrequests per request — so the request
+ * *counts* are asserted rather than described, and `truncated` is asserted to be
+ * the honest "call me again" that makes the cap cost nothing.
+ */
+describe("DELETE /beacon/{videoId}", () => {
+  interface Deletion {
+    deleted: number;
+    truncated: boolean;
+  }
+
+  /** `count` real session objects under `videoId`, plus whatever else is asked for. */
+  function store(videoId: string, count: number, extra: string[] = []): string[] {
+    const sessionIds = Array.from({ length: count }, () => randomId());
+    bucketObjects = [
+      ...sessionIds.map((sessionId) => ({
+        key: `${videoId}/${sessionId}.bin`,
+        size: 291,
+        lastModified: "2026-08-27T21:41:02.000Z",
+      })),
+      ...extra.map((key) => ({ key, size: 7, lastModified: "2026-08-27T21:41:02.000Z" })),
+    ];
+    return sessionIds;
+  }
+
+  async function remove(videoId: string, options: BeaconOptions = {}): Promise<Answer> {
+    return beacon(`/beacon/${videoId}`, {
+      method: "DELETE",
+      token: await goodToken(),
+      ...options,
+    });
+  }
+
+  function deletes(): string[] {
+    return bucketWrites.filter((write) => write.method === "DELETE").map((write) => keyOf(write.path));
+  }
+
+  function listings(): number {
+    return bucketWrites.filter((write) => write.method === "GET").length;
+  }
+
+  it("deletes exactly one object per session and answers { deleted, truncated: false }", async () => {
+    const videoId = randomId();
+    const sessionIds = store(videoId, 3);
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    const answer = await remove(videoId);
+
+    expect(answer.status, answer.text).toBe(200);
+    expect(answer.json as unknown as Deletion).toEqual({ deleted: 3, truncated: false });
+    expect(deletes().sort()).toEqual(sessionIds.map((s) => `${videoId}/${s}.bin`).sort());
+    expect(bucketObjects, "and they are actually gone").toHaveLength(0);
+  });
+
+  it("answers { deleted: 0, truncated: false } for a prefix that holds nothing", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const answer = await remove(randomId());
+
+    expect(answer.status, answer.text).toBe(200);
+    expect(answer.json as unknown as Deletion).toEqual({ deleted: 0, truncated: false });
+    expect(deletes(), "nothing to delete, so nothing was deleted").toHaveLength(0);
+  });
+
+  it("skips keys that are not {videoId}/{22 base64url}.bin and never deletes them", async () => {
+    // SPEC §16.3's skip rule, unchanged — and here it is load-bearing in a way
+    // it is not for a listing: a listing that included a stray key would show a
+    // bad row, a deletion that included one would destroy something.
+    const videoId = randomId();
+    const [real] = store(videoId, 1, [
+      `${videoId}/`,
+      `${videoId}/notanid.bin`,
+      `${videoId}/${randomId()}.json`,
+      `${videoId}/nested/${randomId()}.bin`,
+    ]);
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    const answer = await remove(videoId);
+
+    expect(answer.status, answer.text).toBe(200);
+    expect(answer.json as unknown as Deletion).toEqual({ deleted: 1, truncated: false });
+    expect(deletes()).toEqual([`${videoId}/${real!}.bin`]);
+    expect(bucketObjects, "the four strays are all still there").toHaveLength(4);
+  });
+
+  it("stops at MAX_DELETED_SESSIONS and says truncated: true instead of trimming", async () => {
+    const videoId = randomId();
+    store(videoId, MAX_DELETED_SESSIONS + 5);
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    const answer = await remove(videoId);
+
+    expect(answer.status, answer.text).toBe(200);
+    expect(answer.json as unknown as Deletion).toEqual({
+      deleted: MAX_DELETED_SESSIONS,
+      truncated: true,
+    });
+    expect(deletes()).toHaveLength(MAX_DELETED_SESSIONS);
+    expect(bucketObjects, "the remainder waits for the next call").toHaveLength(5);
+  });
+
+  it("walks no more than MAX_DELETE_LIST_PAGES listings, whatever the page size", async () => {
+    // The subrequest bound is the reason both constants exist (SPEC §18.4), so
+    // it is asserted rather than described. Tiny pages are the adversarial case:
+    // a prefix that pages slowly must still cost a bounded number of requests.
+    const videoId = randomId();
+    store(videoId, 100);
+    bucketPageSize = 2;
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    const answer = await remove(videoId);
+
+    expect(answer.status, answer.text).toBe(200);
+    const result = answer.json as unknown as Deletion;
+    expect(listings(), "at most four listings per call").toBeLessThanOrEqual(MAX_DELETE_LIST_PAGES);
+    expect(result.deleted).toBe(MAX_DELETE_LIST_PAGES * bucketPageSize);
+    expect(result.truncated, "stopped early, so the caller must come back").toBe(true);
+    expect(
+      listings() + deletes().length,
+      "one call stays under a Worker's 50-subrequest ceiling",
+    ).toBeLessThan(50);
+  });
+
+  it("does not read a tokenless truncated listing as an empty prefix", async () => {
+    // A store that claims more and hands back nothing to ask with. Answering
+    // `truncated: false` there would tell the caller the prefix is clean when
+    // the bucket has just said it is not — the one lie this endpoint must not
+    // tell, since nothing else will ever look at that prefix again.
+    const videoId = randomId();
+    store(videoId, 3);
+    bucketPageSize = 2;
+    bucketWithholdsToken = true;
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    const first = await remove(videoId);
+    expect(first.status, first.text).toBe(200);
+    expect(first.json as unknown as Deletion).toEqual({ deleted: 2, truncated: true });
+
+    // And repeating still converges: the next call re-lists over a prefix this
+    // one has already shortened.
+    const second = await remove(videoId);
+    expect(second.json as unknown as Deletion).toEqual({ deleted: 1, truncated: false });
+    expect(bucketObjects).toHaveLength(0);
+  });
+
+  it("empties a large prefix when the caller repeats while truncated", async () => {
+    // The loop §18.4 puts in the client, run here against the bucket stub, so
+    // the endpoint's half of the contract — that repeating actually converges —
+    // is pinned by something other than the client's stopping rule.
+    const videoId = randomId();
+    store(videoId, 95);
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    let total = 0;
+    let rounds = 0;
+    for (;;) {
+      const answer = await remove(videoId);
+      expect(answer.status, answer.text).toBe(200);
+      const result = answer.json as unknown as Deletion;
+      total += result.deleted;
+      rounds++;
+      if (!result.truncated) break;
+      expect(result.deleted, "a truncated round that deleted nothing would never converge").toBeGreaterThan(0);
+      expect(rounds, "and it converges in a sane number of rounds").toBeLessThan(10);
+    }
+
+    expect(total).toBe(95);
+    expect(bucketObjects).toHaveLength(0);
+  });
+
+  it("rejects a request with no token, before it touches the bucket", async () => {
+    const answer = await beacon(`/beacon/${randomId()}`, { method: "DELETE" });
+    expectError(answer, 401, "delete sessions, no bearer");
+    expect(bucketWrites, "an unauthenticated caller costs the bucket nothing").toHaveLength(0);
+  });
+
+  it("rejects a verified token that is not on the upload whitelist with 403", async () => {
+    const token = await mintToken({ email: "carol@example.com", emailVerified: true });
+    const answer = await remove(randomId(), { token });
+    expectError(answer, 403, "delete sessions, not whitelisted");
+    expect(bucketWrites).toHaveLength(0);
+  });
+
+  it("rejects an expired token with 401", async () => {
+    const token = await mintToken({ emailVerified: true, expiresIn: "-1m" });
+    expectError(await remove(randomId(), { token }), 401, "expired");
+    expect(bucketWrites).toHaveLength(0);
+  });
+
+  it("rejects a malformed videoId with 400", async () => {
+    for (const videoId of ["short", "aaaaaaaaaaa.aaaaaaaaaa", "aaaaaaaaaa%2Faaaaaaaaa"]) {
+      expectError(await remove(videoId), 400, videoId);
+    }
+    expect(bucketWrites, "a bad id never becomes a prefix").toHaveLength(0);
+  });
+
+  it("404s when the gateway has no ANALYTICS_BUCKET, token or not", async () => {
+    const answer = await remove(randomId(), { envOverrides: { ANALYTICS_BUCKET: undefined } });
+    expectError(answer, 404, "analytics disabled");
+    expect(bucketWrites).toHaveLength(0);
+  });
+
+  it("405s a DELETE that names a single session: there is no such thing", async () => {
+    // SPEC §18.4. No surface asks to delete one session, so the route that would
+    // is a 405 rather than an undocumented convenience.
+    const answer = await beacon(`/beacon/${randomId()}/${randomId()}`, {
+      method: "DELETE",
+      token: await goodToken(),
+    });
+    expectError(answer, 405, "single-session delete");
+    expect(answer.headers.get("allow")).toContain("POST");
+    expect(bucketWrites).toHaveLength(0);
+  });
+
+  it("answers 502 when the bucket refuses the listing", async () => {
+    bucketFailure = 503;
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    expectError(await remove(randomId()), 502, "listing refused");
+    expect(deletes(), "a listing that failed deletes nothing").toHaveLength(0);
+  });
+
+  it("answers 502 when the bucket refuses a delete", async () => {
+    // The listing succeeds and the delete does not, which is exactly what a
+    // deployment whose credentials lack s3:DeleteObject on this bucket sees.
+    const videoId = randomId();
+    store(videoId, 3);
+    bucketDeleteFailure = 403;
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    expectError(await remove(videoId), 502, "delete refused");
+    expect(deletes(), "it stops at the first refusal rather than trying all three").toHaveLength(1);
+    expect(String(error.mock.calls[0]?.[0] ?? "")).toContain("403");
+  });
+
+  it("logs the id, the email and the count, and no session id", async () => {
+    // SPEC §18.4: one line per call, in the shape the listing already logs. The
+    // count is what an operator needs; a session id is a viewer-minted label.
+    const videoId = randomId();
+    const sessionIds = store(videoId, 2);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    expect((await remove(videoId)).status).toBe(200);
+
+    expect(log).toHaveBeenCalledTimes(1);
+    const line = String(log.mock.calls[0]?.[0] ?? "");
+    expect(line).toContain(videoId);
+    expect(line).toContain(ALLOWED_EMAIL);
+    expect(line, "the count is the thing an operator needs").toContain("count=2");
+    for (const sessionId of sessionIds) expect(line).not.toContain(sessionId);
+  });
+
+  it("never carries a stored byte back: the answer is two numbers", async () => {
+    const videoId = randomId();
+    store(videoId, 2);
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    const answer = await remove(videoId);
+    expect(answer.headers.get("content-type")).toContain("application/json");
+    expect(Object.keys(answer.json).sort()).toEqual(["deleted", "truncated"]);
+    expect(answer.text).not.toContain(SECRET_ACCESS_KEY);
+  });
+
+  it("mounts at /sessions and /api/sessions and /api/beacon", async () => {
+    const token = await goodToken();
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    for (const prefix of ["/sessions", "/api/sessions", "/api/beacon"]) {
+      const videoId = randomId();
+      store(videoId, 1);
+      const answer = await beacon(`${prefix}/${videoId}`, { method: "DELETE", token });
+      expect(answer.status, `${prefix}: ${answer.text}`).toBe(200);
+      expect((answer.json as unknown as Deletion).deleted).toBe(1);
+    }
+  });
+
+  it("advertises DELETE on the preflight, so a browser will send one", async () => {
+    const res = await handleRequest(
+      new Request(`${GATEWAY_ORIGIN}/sessions/${randomId()}`, {
+        method: "OPTIONS",
+        headers: { origin: SITE_ORIGIN, "access-control-request-method": "DELETE" },
+      }),
+      env({ BUCKET_ENDPOINT: bucketEndpoint, ANALYTICS_BUCKET }),
+    );
+
+    expect(res.status).toBeLessThan(300);
+    const methods = res.headers.get("access-control-allow-methods") ?? "";
+    for (const method of ["GET", "POST", "DELETE", "OPTIONS"]) {
+      expect(methods, "SPEC §18.4").toContain(method);
+    }
+  });
+
+  it("puts CORS headers on the answer so the library row can read it", async () => {
+    const videoId = randomId();
+    store(videoId, 1);
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    const answer = await remove(videoId, { origin: SITE_ORIGIN });
+    expect(answer.status, answer.text).toBe(200);
+    expect(answer.headers.get("access-control-allow-origin")).toBe(SITE_ORIGIN);
+    expect(answer.headers.get("access-control-allow-credentials")).toBeNull();
+  });
+
+  it("refuses an origin that is not in ALLOWED_ORIGINS", async () => {
+    const answer = await remove(randomId(), { origin: EVIL_ORIGIN });
+    expectError(answer, 403, "unlisted origin");
+    expect(bucketWrites).toHaveLength(0);
   });
 });
 

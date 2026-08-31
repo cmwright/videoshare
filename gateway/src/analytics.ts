@@ -1,13 +1,18 @@
 /**
- * Playback analytics storage (SPEC §16.3, §16.4): the beacon write and the
- * authenticated session listing.
+ * Playback analytics storage (SPEC §16.3, §16.4, §18.4): the beacon write, the
+ * authenticated session listing, and the bounded deletion of one video's
+ * sessions.
  *
  * This is the only module in the gateway that speaks to a bucket over the wire,
  * and §16.3 draws the line it may not cross: **one direction, opaque bytes**. A
  * beacon body is at most `MAX_BEACON_BYTES` of ciphertext that gets PUT and is
  * never read back; the listing hands out presigned GETs so the *browser* fetches
  * that ciphertext straight from the bucket. No stored byte is ever read into
- * this process, so §15's no-proxy invariant survives whole.
+ * this process, so §15's no-proxy invariant survives whole. §18.4's deletion is
+ * the one place the gateway removes a stored object itself, and it does not
+ * cross that line either: a DELETE moves no bytes out, and the objects under a
+ * prefix are not enumerable from a presigned URL, so the enumeration has to
+ * happen where the credential and the listing already live.
  *
  * Nothing here sees a viewer. The two ids in an object key are random labels the
  * browser minted, the payload they name is encrypted under a key this gateway
@@ -22,6 +27,25 @@ import { ID_PATTERN, bucketUrl, createQuerySigner, encodeQueryValue, objectUrl }
 export const MAX_BEACON_BYTES = 16 * 1024;
 /** SPEC §16.3: how many sessions one listing will follow pagination for. */
 export const MAX_LISTED_SESSIONS = 1000;
+
+/**
+ * SPEC §18.4: how many session objects one `DELETE /sessions/{videoId}` call
+ * removes, and how many listing pages it will walk to find them.
+ *
+ * The numbers are a real constraint rather than a taste. One call costs at most
+ * `MAX_DELETE_LIST_PAGES` listings plus `MAX_DELETED_SESSIONS` deletes — 44
+ * outbound requests, chosen for the **Cloudflare Workers free plan's 50
+ * subrequests per request**. A pass bounded at `MAX_LISTED_SESSIONS` instead
+ * would fail on the free plan outright and sit exactly on the paid plan's
+ * ceiling. Lambda and the Node adapter have no such limit; the bound applies to
+ * all three anyway, so every adapter behaves identically and a deployment does
+ * not discover its own ceiling by deleting something.
+ *
+ * A caller that has more than this to remove repeats the call while `truncated`
+ * (§18.4), which is why the cap costs correctness nothing.
+ */
+export const MAX_DELETED_SESSIONS = 40;
+export const MAX_DELETE_LIST_PAGES = 4;
 
 /** Every analytics object is `{videoId}/{sessionId}.bin`. */
 const KEY_SUFFIX = ".bin";
@@ -44,9 +68,21 @@ export interface SessionListing {
   truncated: boolean;
 }
 
+export interface DeleteResult {
+  /** Session objects removed by this pass. */
+  deleted: number;
+  /**
+   * The pass stopped early and there may be more (SPEC §18.4): call again.
+   * `false` means the prefix holds no sessions any more.
+   */
+  truncated: boolean;
+}
+
 export interface AnalyticsStore {
   put(videoId: string, sessionId: string, body: Uint8Array): Promise<void>;
   list(videoId: string): Promise<SessionListing>;
+  /** One bounded pass of SPEC §18.4; `truncated` means "call me again". */
+  deleteAll(videoId: string): Promise<DeleteResult>;
 }
 
 /**
@@ -142,6 +178,76 @@ export function createAnalyticsStore(config: BucketConfig): AnalyticsStore {
       );
       return { sessions, truncated };
     },
+
+    /**
+     * SPEC §18.4. One bounded pass: walk at most `MAX_DELETE_LIST_PAGES` listing
+     * pages collecting at most `MAX_DELETED_SESSIONS` keys that look like
+     * sessions, then issue one DELETE per key.
+     *
+     * The skip rule is §16.3's, unchanged: nothing but `{videoId}/{22
+     * base64url}.bin` belongs under this prefix, and anything else there is not
+     * a session and is not this gateway's to remove. That is also the one way a
+     * caller's retry loop could fail to make progress — a prefix full of objects
+     * the skip rule refuses to touch answers `truncated: true` with `deleted:
+     * 0` forever — which is why §18.4's client loop treats exactly that shape as
+     * stalled rather than as a reason to call again.
+     */
+    async deleteAll(videoId: string): Promise<DeleteResult> {
+      assertId(videoId, "video id");
+
+      const prefix = `${videoId}/`;
+      const keys: string[] = [];
+      let token: string | null = null;
+      let capped = false;
+      let more = true;
+
+      for (let page = 0; page < MAX_DELETE_LIST_PAGES; page++) {
+        const listing = parseListing(await fetchPage(client, config, prefix, token));
+        for (const entry of listing.entries) {
+          if (sessionIdOf(entry.key, prefix) === null) continue;
+          if (keys.length >= MAX_DELETED_SESSIONS) {
+            capped = true;
+            break;
+          }
+          keys.push(entry.key);
+        }
+        if (capped) break;
+        if (!listing.isTruncated) {
+          // The listing ran out: everything under the prefix has been seen, so
+          // once these keys are gone the prefix is empty of sessions. Note that
+          // filling the cap *exactly* on a complete listing lands here and
+          // answers `truncated: false` — which is the honest answer, and saves
+          // the caller a round trip that would find nothing.
+          more = false;
+          break;
+        }
+        if (listing.nextToken === null) {
+          // A store that claims more without handing back a token has nothing
+          // this call can ask it for — the shape `list` above also refuses to
+          // paper over. Stopping with `truncated: true` says "call me again",
+          // which is both true and progress: the next call re-lists from the
+          // start, over a prefix this one has already shortened.
+          break;
+        }
+        token = listing.nextToken;
+      }
+
+      // Deleted one at a time, and a failure stops the rest. The caller's next
+      // call re-lists and picks up whatever survived, so there is no state to
+      // reconcile — and stopping keeps a bucket that has started refusing from
+      // being hit another 39 times to learn the same thing.
+      for (const key of keys) {
+        const response = await send(client, "DELETE", objectUrl(config, key));
+        await discard(response);
+        // 404 is success: DeleteObject is idempotent, and a key that was listed
+        // and is already gone is exactly the outcome asked for (SPEC §18.1).
+        if (!response.ok && response.status !== 404) {
+          throw new AnalyticsStoreError(response.status, "the analytics bucket refused the delete");
+        }
+      }
+
+      return { deleted: keys.length, truncated: capped || more };
+    },
   };
 }
 
@@ -149,7 +255,7 @@ export function createAnalyticsStore(config: BucketConfig): AnalyticsStore {
 
 async function send(
   client: AwsClient,
-  method: "GET" | "PUT",
+  method: "GET" | "PUT" | "DELETE",
   url: string,
   body?: Uint8Array,
 ): Promise<Response> {

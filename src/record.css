@@ -1100,6 +1100,22 @@ a.library-title:focus-visible {
   box-shadow: var(--shadow-md);
 }
 
+/* Two panes in one popup: the items, and the confirm step that replaces them in
+   place (SPEC §17.3). Only ever one of them is showing. */
+.row-menu-items,
+.row-menu-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+/* `hidden` must win over the `display: flex` above, or the pane that is not
+   showing would still take space. */
+.row-menu-items[hidden],
+.row-menu-confirm[hidden] {
+  display: none;
+}
+
 .row-menu-item {
   justify-content: flex-start;
   width: 100%;
@@ -1110,6 +1126,22 @@ a.library-title:focus-visible {
 }
 
 .row-menu-item:hover:not(:disabled) {
+  border-color: transparent;
+  background: var(--surface-sunken);
+  color: var(--text);
+}
+
+/* Delete video is the destructive item and is styled as one — red from the
+   start, not only on hover, because the difference between it and Remove from
+   list is the whole point of there being two (SPEC §17.3, §18). The transparent
+   border overrides app.css's `button.danger`, which draws one. */
+.row-menu-item.danger {
+  border-color: transparent;
+  background: transparent;
+  color: var(--danger);
+}
+
+.row-menu-item.danger:hover:not(:disabled) {
   border-color: transparent;
   background: color-mix(in srgb, var(--danger) 10%, transparent);
   color: var(--danger);
@@ -1123,6 +1155,53 @@ a.library-title:focus-visible {
   font-size: 0.75rem;
   line-height: 1.45;
   text-wrap: pretty;
+}
+
+/* The confirm step, in the page's own design language rather than the
+   browser's: one sentence naming what is about to happen, then Cancel and
+   Delete. Nothing is deleted until Delete is pressed (SPEC §17.3). */
+.row-menu-confirm {
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3) var(--space-1);
+}
+
+.row-menu-confirm-text {
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  text-wrap: pretty;
+}
+
+.row-menu-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+.row-menu-confirm-actions button {
+  padding: var(--space-1) var(--space-3);
+  font-size: 0.84375rem;
+}
+
+/* "Deleting…" while it runs, and the one muted sentence a failure leaves
+   behind. Text, never a colour: a row whose delete failed has to say so to a
+   reader who cannot see red (SPEC §17.7). */
+.row-status {
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+  line-height: 1.45;
+  text-wrap: pretty;
+}
+
+/* A busy row reads as busy without moving: the thumbnail dims, the controls are
+   disabled, and the status line above says what is happening. No animation, so
+   there is nothing for prefers-reduced-motion to take away. */
+.library-item[aria-busy="true"] .thumb {
+  opacity: 0.55;
+}
+
+.library-item[aria-busy="true"] .library-title {
+  color: var(--text-muted);
 }
 
 /* --- Responsive ----------------------------------------------------------- */

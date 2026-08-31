@@ -1,5 +1,6 @@
 /**
- * SigV4 query-string presigning for the six upload operations (SPEC §15.3).
+ * SigV4 query-string presigning for the seven operations of `POST /api/sign`
+ * (SPEC §15.3).
  *
  * The gateway hands the browser a *URL*; the bytes then flow browser↔bucket
  * directly. Nothing here fetches, streams or buffers object data — that is the
@@ -8,13 +9,22 @@
  * key, and the ~15–50 KB of ciphertext travels browser↔bucket like every other
  * object.
  *
+ * §18's deletion changes nothing about it either, and is the sharpest case:
+ * `delete` is **presign-or-bust**. The gateway signs three DELETEs and the
+ * browser sends them, so there is no route on which this service removes a
+ * video-bucket object itself and none may be added (§15.3, §18.3). A DELETE
+ * carries no payload, which makes it the one method where a proxy would have
+ * looked harmless — that is exactly why the rule is written down rather than
+ * inferred from the size of the body.
+ *
  * Two things make this safe to expose to an authenticated but otherwise
  * untrusted caller:
  *
  *  1. Object keys are built here, from a `{22}` id that matched `ID_PATTERN`,
  *     as exactly `{id}/video.bin`, `{id}/meta.json` or `{id}/thumb.bin`. The
  *     caller supplies the id, never a key, so no request can be steered at
- *     another object.
+ *     another object. `delete` takes **no** key, suffix or object name from the
+ *     body at all: it answers with all three, so there is nothing to choose.
  *  2. `uploadId` and `partNumber` are syntax-checked and then percent-encoded
  *     with the *same* RFC 3986 encoder aws4fetch uses to build its canonical
  *     query string. They land as query *values* and can neither add a parameter
@@ -55,6 +65,17 @@ export interface BucketConfig {
   expirySeconds: number;
 }
 
+/**
+ * §3's three objects, named by the suffix the client's seam and this gateway's
+ * answer both use. The order is SPEC §18.1's deletion order and is load-bearing:
+ * `meta.json` is the completion marker a player fetches first (§8), so removing
+ * it first means a delete that fails halfway leaves a video that reads as
+ * *absent* rather than as a torso that still looks complete. `video.bin` — the
+ * one object whose absence costs anything to be wrong about — goes last.
+ */
+export const DELETE_ORDER = ["meta.json", "thumb.bin", "video.bin"] as const;
+export type VideoObjectName = (typeof DELETE_ORDER)[number];
+
 export type SignRequest =
   | { op: "create"; id: string }
   | { op: "part"; id: string; uploadId: string; partNumbers: number[] }
@@ -62,11 +83,14 @@ export type SignRequest =
   | { op: "abort"; id: string; uploadId: string }
   | { op: "put-meta"; id: string }
   /** SPEC §3: one encrypted block whose plaintext is a JPEG. Optional per video. */
-  | { op: "put-thumb"; id: string };
+  | { op: "put-thumb"; id: string }
+  /** SPEC §18.3: an id and nothing else; the answer is all three keys. */
+  | { op: "delete"; id: string };
 
 export type SignResponse =
   | { url: string; method: "POST" | "PUT" | "DELETE" }
-  | { urls: { partNumber: number; url: string }[]; method: "PUT" };
+  | { urls: { partNumber: number; url: string }[]; method: "PUT" }
+  | { urls: { key: VideoObjectName; url: string }[]; method: "DELETE" };
 
 export interface Presigner {
   sign(request: SignRequest): Promise<SignResponse>;
@@ -77,7 +101,7 @@ export type ParseResult = { ok: true; request: SignRequest } | { ok: false; erro
 
 /**
  * Validates a decoded `POST /api/sign` body (SPEC §15.3). Everything that is not
- * exactly one of the six shapes is a 400 — unknown ops, unknown/misspelled
+ * exactly one of the seven shapes is a 400 — unknown ops, unknown/misspelled
  * fields' absence, out-of-range part numbers, ids that are not 22 base64url
  * characters. Extra properties are ignored rather than rejected so the client
  * can add a field later without a lockstep gateway deploy.
@@ -101,6 +125,11 @@ export function parseSignRequest(body: unknown): ParseResult {
   // §3's thumbnail is an id and nothing else, exactly like `put-meta`: same
   // validation, same shape, a different key built below.
   if (op === "put-thumb") return { ok: true, request: { op, id } };
+  // §18.3's delete is an id and nothing else too — deliberately, and this is
+  // the point at which that is enforced. There is no field here through which a
+  // caller could name *which* object to remove: the answer is all three keys,
+  // each built below from this id.
+  if (op === "delete") return { ok: true, request: { op, id } };
 
   if (op === "part" || op === "complete" || op === "abort") {
     const uploadId = raw["uploadId"];
@@ -187,6 +216,22 @@ export function createPresigner(config: BucketConfig): Presigner {
             method: "DELETE",
           };
 
+        // SPEC §18.3. Three signatures, one request, in §18.1's order — a
+        // client that only wanted one still gets three, which costs three
+        // HMACs against the cached signing key and no round trip. The `key` is
+        // the *suffix*, not the full object key: the full key is this module's
+        // to build, and the client's only use for the name is telling the three
+        // URLs apart.
+        case "delete": {
+          const urls = await Promise.all(
+            DELETE_ORDER.map(async (key) => ({
+              key,
+              url: await presign("DELETE", videoObjectUrl(config, request.id, key)),
+            })),
+          );
+          return { urls, method: "DELETE" };
+        }
+
         case "part": {
           const base = videoUrl(config, request.id);
           const upload = uploadIdParam(request.uploadId);
@@ -234,6 +279,22 @@ function metaUrl(config: BucketConfig, id: string): string {
 }
 function thumbUrl(config: BucketConfig, id: string): string {
   return objectUrl(config, thumbKey(id));
+}
+
+/**
+ * One of the three, by name. Routed through the same three key builders rather
+ * than interpolating the suffix, so `videoKey`/`metaKey`/`thumbKey` stay the
+ * only places in this gateway where an object key is spelled out.
+ */
+function videoObjectUrl(config: BucketConfig, id: string, name: VideoObjectName): string {
+  switch (name) {
+    case "video.bin":
+      return videoUrl(config, id);
+    case "meta.json":
+      return metaUrl(config, id);
+    case "thumb.bin":
+      return thumbUrl(config, id);
+  }
 }
 
 function uploadIdParam(uploadId: string): string {

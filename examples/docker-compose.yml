@@ -61,9 +61,13 @@ services:
       start_period: 2s
 
   # One-shot: creates the video bucket and makes it anonymously readable
-  # (objects only), mints an upload-only access key, creates the *private*
-  # analytics bucket and the gateway's own key for it, and sets abandoned
-  # multipart uploads to be swept after a day. Safe to re-run; exits 0 when done.
+  # (objects only), mints the recorder's access key — write plus §18's optional
+  # delete — and a second key without the delete for the e2e suite, creates the
+  # *private* analytics bucket and the gateway's own key for it, and sets
+  # abandoned multipart uploads to be swept after a day. Safe to re-run; exits 0
+  # when done. Re-run it after pulling §18 (`docker compose -f
+  # examples/docker-compose.yml up -d minio-init`): a stack created before it
+  # has neither the delete grant nor the second key.
   minio-init:
     image: minio/mc:latest
     depends_on:
@@ -102,10 +106,45 @@ services:
         # abandoning an upload is authorized separately: without
         # s3:AbortMultipartUpload, MinIO answers the recorder's Discard with a
         # 403 (verified against RELEASE.2025-09-07T16-13-09Z). These keys still
-        # cannot read, list, or delete a stored object, so losing them costs you
-        # spam in the bucket, not your videos.
+        # cannot read or list a stored object, so losing them costs you spam in
+        # the bucket, not your videos.
+        #
+        # The second statement is the library's Delete video (docs/SPEC.md §18)
+        # and it is OPTIONAL: drop VideoShareOptionalDelete and everything else
+        # works exactly as before, while Delete video answers with a 403 and a
+        # sentence saying so. It is granted here so the local stack can delete
+        # and the e2e suite has something to run against.
         # Mirrors examples/iam-uploader-policy.json.
         cat > /tmp/uploader-policy.json <<'JSON'
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "VideoShareUploadOnly",
+              "Effect": "Allow",
+              "Action": ["s3:PutObject", "s3:AbortMultipartUpload"],
+              "Resource": ["arn:aws:s3:::videoshare/*"]
+            },
+            {
+              "Sid": "VideoShareOptionalDelete",
+              "Effect": "Allow",
+              "Action": ["s3:DeleteObject"],
+              "Resource": ["arn:aws:s3:::videoshare/*"]
+            }
+          ]
+        }
+        JSON
+        mc admin user add local videoshare-uploader videoshare-uploader-secret
+        mc admin policy create local videoshare-uploader /tmp/uploader-policy.json
+        mc admin policy attach local videoshare-uploader --user videoshare-uploader
+
+        # The same policy with that second statement dropped — the deployment
+        # SPEC §18.3 calls the optional-IAM contract, kept here as a fixture so
+        # the e2e suite can check that Delete video fails on it with the 403 and
+        # the message that names the missing grant, rather than silently
+        # degrading to a Remove from list. Nothing but the test uses this key;
+        # paste videoshare-uploader into the recorder, not this one.
+        cat > /tmp/uploader-nodelete-policy.json <<'JSON'
         {
           "Version": "2012-10-17",
           "Statement": [
@@ -118,9 +157,9 @@ services:
           ]
         }
         JSON
-        mc admin user add local videoshare-uploader videoshare-uploader-secret
-        mc admin policy create local videoshare-uploader /tmp/uploader-policy.json
-        mc admin policy attach local videoshare-uploader --user videoshare-uploader
+        mc admin user add local videoshare-nodelete videoshare-nodelete-secret
+        mc admin policy create local videoshare-nodelete /tmp/uploader-nodelete-policy.json
+        mc admin policy attach local videoshare-nodelete --user videoshare-nodelete
 
         # The analytics bucket (docs/SPEC.md §16). It holds one small encrypted
         # object per viewing session and it is PRIVATE: no anonymous policy is
@@ -147,20 +186,28 @@ services:
         # come back 403. ListBucket is scoped to the bucket itself (no /*),
         # which is what ListObjectsV2 authorizes against, and it is granted on
         # the analytics bucket alone: video ids stay unguessable.
+        #
+        # DeleteObject is on BOTH buckets and both are needed for §18. On the
+        # video bucket it is what the three presigned DELETEs are signed under —
+        # the gateway signs, the browser sends. On the analytics bucket it is
+        # what DELETE /sessions/{id} spends itself, server-side, because that
+        # bucket is already the gateway's to list. Unlike the recorder's, this
+        # grant is not optional: without it Delete video 403s and the sessions
+        # delete answers 502.
         cat > /tmp/gateway-policy.json <<'JSON'
         {
           "Version": "2012-10-17",
           "Statement": [
             {
-              "Sid": "VideoShareUploadOnly",
+              "Sid": "VideoShareUploadAndDelete",
               "Effect": "Allow",
-              "Action": ["s3:PutObject", "s3:AbortMultipartUpload"],
+              "Action": ["s3:PutObject", "s3:AbortMultipartUpload", "s3:DeleteObject"],
               "Resource": ["arn:aws:s3:::videoshare/*"]
             },
             {
-              "Sid": "VideoShareAnalyticsWriteAndRead",
+              "Sid": "VideoShareAnalyticsWriteReadAndDelete",
               "Effect": "Allow",
-              "Action": ["s3:PutObject", "s3:GetObject"],
+              "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"],
               "Resource": ["arn:aws:s3:::videoshare-analytics/*"]
             },
             {

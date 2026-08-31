@@ -34,6 +34,8 @@ import {
 } from "./crypto";
 import {
   type AnalyticsDeps,
+  deleteSessions,
+  forgetReport,
   LIBRARY_CONCURRENCY,
   LIBRARY_SUMMARY_EAGER,
   loadReport,
@@ -85,6 +87,7 @@ import {
   createGatewaySigner,
   createLocalSigner,
   createUploadSession,
+  deleteVideo,
   type Signer,
   type UploadSession,
 } from "./upload";
@@ -1105,10 +1108,63 @@ function copyButton(entry: LibraryEntry): HTMLButtonElement {
 let closeOpenMenu: (() => void) | null = null;
 
 /**
- * The row's `⋯` menu. One item, Remove, with §9's warning kept visible rather
- * than hidden in a tooltip — the entry goes, the video stays in the bucket.
+ * The confirm sentence currently sitting in the library's live region, so
+ * cancelling can take it back out again without clobbering someone else's
+ * message (SPEC §17.3, §17.7).
  */
-function overflowMenu(entry: LibraryEntry): HTMLElement {
+let announcedConfirm = "";
+
+/**
+ * A line in the library's own live region — not `announce`, which follows the
+ * reader into whichever view they are in. Everything here is *about* the
+ * library, so it belongs to the library's region whether or not the reader is
+ * looking at it; a delete that finishes while someone is recording must not
+ * write into the recorder's running commentary.
+ */
+function libraryNote(text: string, isError: boolean): void {
+  libraryStatus.textContent = text;
+  libraryStatus.classList.toggle("error", isError);
+}
+
+function announceConfirm(text: string): void {
+  announcedConfirm = text;
+  libraryNote(text, false);
+}
+
+function clearConfirmAnnouncement(): void {
+  if (!announcedConfirm) return;
+  if (libraryStatus.textContent === announcedConfirm) libraryStatus.textContent = "";
+  announcedConfirm = "";
+}
+
+/**
+ * What **Delete video** is about to do, in one sentence (SPEC §17.3).
+ *
+ * The analytics clause appears only when the gateway answered `analytics: true`
+ * — a deployment that stores no watch data must not be told its watch data is
+ * going, and legacy mode has none at all.
+ */
+function deleteConfirmSentence(entry: LibraryEntry): string {
+  const title = entry.title || "Untitled recording";
+  const watchData = analyticsEnabled ? " and its watch data" : "";
+  return (
+    `Deleting “${title}” removes the video${watchData} from the bucket: every copy of the share ` +
+    `link stops working, and this cannot be undone.`
+  );
+}
+
+/**
+ * The row's `⋯` menu: **two** items, and the names are the contract, because
+ * the difference between them is the whole point (SPEC §17.3, §18).
+ *
+ * - **Remove from list** — §9's warning kept visible rather than hidden in a
+ *   tooltip: the entry goes, the video stays in the bucket.
+ * - **Delete video** — the objects go, then the entry goes. Destructive, styled
+ *   as such, last in the menu, and behind an inline confirm step in the page's
+ *   own design language: choosing it replaces the menu's contents in place, and
+ *   nothing is deleted until **Delete** is pressed. No `window.confirm`.
+ */
+function overflowMenu(entry: LibraryEntry): { node: HTMLElement; trigger: HTMLButtonElement } {
   const wrap = document.createElement("div");
   wrap.className = "row-menu";
 
@@ -1125,22 +1181,69 @@ function overflowMenu(entry: LibraryEntry): HTMLElement {
   menu.setAttribute("role", "menu");
   menu.hidden = true;
 
+  // --- The two items ---------------------------------------------------------
+
+  const items = document.createElement("div");
+  items.className = "row-menu-items";
+
   const remove = document.createElement("button");
   remove.type = "button";
   remove.className = "row-menu-item";
   remove.setAttribute("role", "menuitem");
-  remove.textContent = "Remove";
+  remove.textContent = "Remove from list";
 
   const note = document.createElement("p");
   note.className = "row-menu-note";
   note.textContent = "Removes this entry from this browser only. The video stays in the bucket.";
 
-  menu.append(remove, note);
+  const destroy = document.createElement("button");
+  destroy.type = "button";
+  destroy.className = "row-menu-item danger";
+  destroy.setAttribute("role", "menuitem");
+  destroy.textContent = "Delete video";
+
+  items.append(remove, note, destroy);
+
+  // --- The confirm step, in place --------------------------------------------
+
+  const confirmStep = document.createElement("div");
+  confirmStep.className = "row-menu-confirm";
+  confirmStep.hidden = true;
+
+  const question = document.createElement("p");
+  question.className = "row-menu-confirm-text";
+
+  const buttons = document.createElement("div");
+  buttons.className = "row-menu-confirm-actions";
+
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.textContent = "Cancel";
+
+  const confirmDelete = document.createElement("button");
+  confirmDelete.type = "button";
+  confirmDelete.className = "danger";
+  confirmDelete.textContent = "Delete";
+
+  buttons.append(cancel, confirmDelete);
+  confirmStep.append(question, buttons);
+
+  menu.append(items, confirmStep);
   wrap.append(trigger, menu);
+
+  /** Back to the two items — the state the menu opens in. */
+  function showItems(): void {
+    confirmStep.hidden = true;
+    items.hidden = false;
+    clearConfirmAnnouncement();
+  }
 
   function close(returnFocus: boolean): void {
     if (menu.hidden) return;
     menu.hidden = true;
+    // Reset rather than remember: a menu reopened on the confirm step would be
+    // a destructive button under a `⋯` press (SPEC §17.3).
+    showItems();
     trigger.setAttribute("aria-expanded", "false");
     document.removeEventListener("pointerdown", onOutside, true);
     document.removeEventListener("keydown", onKey, true);
@@ -1152,6 +1255,7 @@ function overflowMenu(entry: LibraryEntry): HTMLElement {
     close(false);
   }
 
+  // Both Cancel: nothing is deleted until Delete is pressed (SPEC §17.3).
   function onOutside(event: Event): void {
     if (!(event.target instanceof Node) || !wrap.contains(event.target)) close(false);
   }
@@ -1183,7 +1287,198 @@ function overflowMenu(entry: LibraryEntry): HTMLElement {
     renderLibrary();
   });
 
-  return wrap;
+  destroy.addEventListener("click", () => {
+    // Gateway mode requires a signed-in session: with no token this does not
+    // fail and does not fetch (SPEC §17.3).
+    if (gatewayBase && signInRequired) {
+      close(false);
+      demandSignIn("Sign in with Google before deleting — the gateway has to authorize it.");
+      return;
+    }
+    const sentence = deleteConfirmSentence(entry);
+    question.textContent = sentence;
+    items.hidden = true;
+    confirmStep.hidden = false;
+    // Text and announcement both: the sentence has to be heard as well as seen
+    // (SPEC §17.7).
+    announceConfirm(sentence);
+    // Focus lands on the safe half.
+    cancel.focus();
+  });
+
+  cancel.addEventListener("click", () => {
+    // Back to the two items rather than closed, so a mis-click costs one press.
+    showItems();
+    remove.focus();
+  });
+
+  confirmDelete.addEventListener("click", () => {
+    close(false);
+    void runDelete(entry);
+  });
+
+  return { node: wrap, trigger };
+}
+
+// --- Deleting a video (SPEC §18) ---------------------------------------------
+
+/** What a row shows while, and after, a delete (SPEC §17.3). */
+interface DeleteState {
+  busy: boolean;
+  /** The one muted sentence a failed delete leaves on the row, or null. */
+  error: string | null;
+}
+
+/**
+ * Per video id, beside `thumbUrls` and for the same reason: a sign-in change or
+ * a finished recording can re-render the library while a delete is in flight,
+ * and `libraryRow` reads this while building so the row's busy state and its
+ * error survive that (SPEC §17.3). Cleared on the next attempt for that id, and
+ * when the id leaves `loadLibrary()`.
+ */
+const deleteStates = new Map<string, DeleteState>();
+
+/** The parts of a row a delete changes, for the render that is on screen now. */
+interface RowControls {
+  item: HTMLLIElement;
+  title: HTMLElement;
+  /**
+   * The thumbnail block. It is `aria-hidden` and `tabIndex -1`, so it is nothing
+   * to a keyboard or a screen reader — but it is an `<a>` to a pointer, aimed at
+   * the same video page the title is, and a busy row has to stop being a link on
+   * both of them or the mouse keeps the door the title just closed.
+   */
+  frame: HTMLElement;
+  /** The row's video-page URL, so a busy row can stop being a link and become one again. */
+  href: string | null;
+  copy: HTMLButtonElement;
+  trigger: HTMLButtonElement;
+  status: HTMLElement;
+}
+
+/** Rows of the current render, by entry id — replaced wholesale by `renderLibrary`. */
+const rowControls = new Map<string, RowControls>();
+
+/**
+ * Paints one row's delete state: `aria-busy`, the muted line where "Deleting…"
+ * and an error both go, and the row's own controls disabled while it runs. Rows
+ * delete independently — one row's delete never disables another's.
+ */
+function applyRowState(id: string, controls: RowControls): void {
+  const state = deleteStates.get(id);
+  const busy = state?.busy === true;
+
+  if (busy) controls.item.setAttribute("aria-busy", "true");
+  else controls.item.removeAttribute("aria-busy");
+
+  controls.copy.disabled = busy;
+  controls.trigger.disabled = busy;
+
+  // An anchor cannot be `disabled`, so a busy row's title stops being a link and
+  // says so, then becomes one again.
+  if (controls.title instanceof HTMLAnchorElement) {
+    if (busy) {
+      controls.title.removeAttribute("href");
+      controls.title.setAttribute("aria-disabled", "true");
+    } else if (controls.href) {
+      controls.title.href = controls.href;
+      controls.title.removeAttribute("aria-disabled");
+    }
+  }
+
+  // The thumbnail is the same target for a pointer, so it loses its href for as
+  // long as the title does. No `aria-disabled` to go with it: the frame is
+  // `aria-hidden` decoration, and a state nobody can reach is not worth
+  // announcing. The dimming CSS already gives it looks the row can be read by.
+  if (controls.frame instanceof HTMLAnchorElement) {
+    if (busy) controls.frame.removeAttribute("href");
+    else if (controls.href) controls.frame.href = controls.href;
+  }
+
+  const text = busy ? "Deleting…" : (state?.error ?? "");
+  controls.status.textContent = text;
+  controls.status.hidden = text === "";
+}
+
+function setDeleteState(id: string, state: DeleteState | null): void {
+  if (state) deleteStates.set(id, state);
+  else deleteStates.delete(id);
+  const controls = rowControls.get(id);
+  if (controls) applyRowState(id, controls);
+}
+
+/**
+ * Who authorizes the three DELETEs. The same seam a recording uploads through
+ * (SPEC §18.3) — gateway mode presigns them, legacy mode signs them here.
+ */
+function deleteSigner(): Signer {
+  if (gatewayBase) {
+    if (!gateway) throw new Error("The upload gateway is not ready yet — see Settings → Account.");
+    return gateway.signer;
+  }
+  const settings = loadSettings();
+  if (!settings) {
+    throw new Error(
+      "This browser has no storage settings, so it cannot delete from the bucket. Add them in " +
+        "Settings, or use Remove from list.",
+    );
+  }
+  return createLocalSigner(settings);
+}
+
+/**
+ * §18.1, in order: the analytics sessions, then the three video objects, then
+ * the local entry, its cached report and its thumbnail URL.
+ *
+ * Analytics goes first because it is the step most likely to fail for a reason
+ * that costs nothing — an ID token that expired since the page loaded — and
+ * failing there leaves the video, the entry and the watch data all intact. The
+ * cost of that choice, stated rather than hidden: a delete that fails on the
+ * video objects has already destroyed that video's watch data. That is the
+ * right trade (watch data is an artifact of a video, not the other way round)
+ * and the error sentence must not pretend nothing happened.
+ */
+async function runDelete(entry: LibraryEntry): Promise<void> {
+  // The id the row actually points at: the stored link's own, which is what the
+  // bucket objects, the thumbnail cache and the report cache are all keyed by.
+  const videoId = entryVideo(entry)?.id ?? entry.id;
+  const title = entry.title || "Untitled recording";
+
+  let signer: Signer;
+  try {
+    signer = deleteSigner();
+  } catch (err) {
+    setDeleteState(entry.id, { busy: false, error: describe(err) });
+    return;
+  }
+
+  setDeleteState(entry.id, { busy: true, error: null });
+  // Pressing Delete closes the menu and disables the row's own controls, so
+  // there is nothing left for focus to sit on: the live region is what tells a
+  // reader who cannot see the row that anything is happening. The detail stays
+  // on the row (§17.3) — these lines are only ever the transition.
+  libraryNote(`Deleting “${title}”…`, false);
+  try {
+    // Only when the gateway answered `analytics: true`; otherwise there is
+    // nothing under that prefix and nothing is requested (SPEC §18.4).
+    if (analyticsEnabled && analyticsDeps) await deleteSessions({ id: videoId }, analyticsDeps);
+    await deleteVideo(signer, videoId);
+  } catch (err) {
+    // Never silently downgraded to a Remove from list: the entry stays, the busy
+    // state lifts, and the row says what happened (SPEC §17.3).
+    setDeleteState(entry.id, { busy: false, error: describe(err) });
+    libraryNote(`Could not delete “${title}”. The reason is on the row.`, true);
+    return;
+  }
+
+  // A cached report is an answer about a video that no longer exists.
+  forgetReport(videoId);
+  deleteStates.delete(entry.id);
+  removeFromLibrary(entry.id);
+  // The re-render revokes the row's thumbnail object URL, since the id has now
+  // left `loadLibrary()` (SPEC §17.3).
+  renderLibrary();
+  libraryNote(`Deleted “${title}”.`, false);
 }
 
 /** The two numbers, once they arrive (SPEC §17.3). */
@@ -1321,11 +1616,23 @@ function libraryRow(
   if (title instanceof HTMLAnchorElement && href) title.href = href;
   title.textContent = entry.title || "Untitled recording";
 
-  details.append(title, span("library-sub muted", librarySubtitle(entry)));
+  // Where "Deleting…" goes, and where a failed delete leaves its one muted
+  // sentence (SPEC §17.3). Empty and out of the way until there is something to
+  // say; §16.6's "a failed thing on a row renders as nothing at all" does not
+  // apply here, and deliberately: a summary is something the row went and got
+  // unasked, a delete is something the reader pressed a button for.
+  const status = document.createElement("p");
+  status.className = "row-status muted";
+  status.hidden = true;
+
+  details.append(title, span("library-sub muted", librarySubtitle(entry)), status);
+
+  const copy = copyButton(entry);
+  const menu = overflowMenu(entry);
 
   const actions = document.createElement("div");
   actions.className = "library-actions";
-  actions.append(copyButton(entry), overflowMenu(entry));
+  actions.append(copy, menu.node);
 
   const frame = thumbnail(entry, href);
   item.append(frame, details);
@@ -1355,6 +1662,13 @@ function libraryRow(
   deferRow(item, jobs, index);
 
   item.append(actions);
+
+  // A delete in flight survives a re-render: the state is held by id, and the
+  // row is built out of it rather than the other way round (SPEC §17.3).
+  const controls: RowControls = { item, title, frame, href, copy, trigger: menu.trigger, status };
+  rowControls.set(entry.id, controls);
+  applyRowState(entry.id, controls);
+
   return item;
 }
 
@@ -1400,6 +1714,14 @@ function renderLibrary(): void {
   // The only place a thumbnail URL is revoked: an id that has left the library
   // (SPEC §17.3). A re-render on its own revokes nothing.
   revokeRemovedThumbnails(entries);
+  // The rows about to be replaced, and the delete state of any id that has left
+  // the library — a busy state or an error for an entry nobody can see is a row
+  // that will never clear it (SPEC §17.3).
+  rowControls.clear();
+  const liveIds = new Set(entries.map((entry) => entry.id));
+  for (const id of [...deleteStates.keys()]) {
+    if (!liveIds.has(id)) deleteStates.delete(id);
+  }
   libraryEmpty.classList.toggle("hidden", entries.length > 0);
   libraryCount.textContent = entries.length > 0 ? librarySummaryLine(entries) : "";
 

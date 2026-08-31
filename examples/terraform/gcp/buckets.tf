@@ -105,9 +105,13 @@ resource "google_storage_bucket" "videos" {
   # and with the header list spelled out — see cors_response_headers above for
   # why there is no wildcard here.
   #
-  # DELETE matters as much as PUT: without it the recorder's Discard
-  # (AbortMultipartUpload) never leaves the browser and its already-uploaded
-  # parts sit in the bucket until the lifecycle rule below sweeps them.
+  # DELETE matters as much as PUT, and carries two things rather than one:
+  # without it the recorder's Discard (AbortMultipartUpload) never leaves the
+  # browser and its already-uploaded parts sit in the bucket until the lifecycle
+  # rule below sweeps them, and the library's Delete video — three DELETEs to
+  # presigned URLs from this same origin (SPEC §18.3) — fails on its preflight
+  # with no HTTP status at all. One rule covers both, so deletion needed no CORS
+  # change here.
   cors {
     origin          = local.site_origins
     method          = ["GET", "HEAD", "PUT", "POST", "DELETE"]
