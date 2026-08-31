@@ -125,7 +125,9 @@ export function viewerId(): string {
 export function startWatchBeacon(video: HTMLMediaElement, opts: BeaconOptions): WatchBeacon {
   /** One session = one page load = one storage object (SPEC §16.1). */
   const sessionId = randomId();
-  const url = `${opts.gatewayUrl}/beacon/${opts.videoId}/${sessionId}`;
+  // "/sessions", not "/beacon": ad-block filter lists match "/beacon/" on
+  // cross-site requests, killing the send before any HTTP (SPEC §16.3).
+  const url = `${opts.gatewayUrl}/sessions/${opts.videoId}/${sessionId}`;
   const aad = analyticsAad(opts.videoId, sessionId);
 
   let firstPlayedAt: string | null = null;

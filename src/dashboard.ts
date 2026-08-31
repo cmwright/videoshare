@@ -90,7 +90,7 @@ export interface VideoSummary {
   viewers: number;
 }
 
-/** One row of `GET {gatewayUrl}/beacon/{videoId}` (SPEC §16.3). */
+/** One row of `GET {gatewayUrl}/sessions/{videoId}` (SPEC §16.3). */
 interface SessionSummary {
   sessionId: string;
   lastModified: string;
@@ -206,7 +206,7 @@ async function readVideo(
 }
 
 /**
- * `GET {gatewayUrl}/beacon/{id}` (SPEC §16.3) — the only request this module
+ * `GET {gatewayUrl}/sessions/{id}` (SPEC §16.3) — the only request this module
  * makes to the gateway, and it carries the video id and nothing else.
  */
 async function listSessions(deps: AnalyticsDeps, id: string): Promise<SessionListing> {
@@ -217,7 +217,7 @@ async function listSessions(deps: AnalyticsDeps, id: string): Promise<SessionLis
 
   let res: Response;
   try {
-    res = await fetch(`${deps.gatewayUrl}/beacon/${id}`, {
+    res = await fetch(`${deps.gatewayUrl}/sessions/${id}`, {
       headers: { authorization: `Bearer ${token}`, accept: "application/json" },
     });
   } catch {

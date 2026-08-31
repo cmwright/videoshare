@@ -1186,6 +1186,17 @@ describe("POST /beacon/{videoId}/{sessionId}", () => {
     expect(answer.status, answer.text).toBe(204);
     expect(puts()).toHaveLength(1);
   });
+
+  // "/sessions" is the name clients actually use (SPEC §16.3): "beacon" is an
+  // ad-block filter pattern, fatal on a cross-site gateway. "/beacon" above
+  // stays accepted for already-deployed pages.
+  it("mounts at /sessions and /api/sessions", async () => {
+    for (const prefix of ["/sessions", "/api/sessions"]) {
+      const answer = await beacon(`${prefix}/${randomId()}/${randomId()}`, { body: ciphertext() });
+      expect(answer.status, `${prefix}: ${answer.text}`).toBe(204);
+    }
+    expect(puts()).toHaveLength(2);
+  });
 });
 
 // --- Session listing ---------------------------------------------------------
@@ -1346,6 +1357,14 @@ describe("GET /beacon/{videoId}", () => {
     const videoId = randomId();
     store(videoId, 1);
     const answer = await beacon(`/api/beacon/${videoId}`, { token: await goodToken() });
+    expect(answer.status, answer.text).toBe(200);
+    expect((answer.json as unknown as Listing).sessions).toHaveLength(1);
+  });
+
+  it("lists at /sessions, the name clients use (SPEC §16.3)", async () => {
+    const videoId = randomId();
+    store(videoId, 1);
+    const answer = await beacon(`/sessions/${videoId}`, { token: await goodToken() });
     expect(answer.status, answer.text).toBe(200);
     expect((answer.json as unknown as Listing).sessions).toHaveLength(1);
   });

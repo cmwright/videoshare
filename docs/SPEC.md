@@ -1038,8 +1038,13 @@ that with an assertion on a pathological v2 payload rather than an argument.
 
 ### 16.3 Beacon endpoint (viewer → gateway → bucket)
 
-`POST {gatewayUrl}/beacon/{videoId}/{sessionId}` — **unauthenticated**. Viewers have
-no identity and must never be asked for one.
+`POST {gatewayUrl}/sessions/{videoId}/{sessionId}` — **unauthenticated**. Viewers have
+no identity and must never be asked for one. (`/beacon/…` is the same route
+under its original name, accepted for already-deployed clients but never used
+by new ones: "beacon" appears in ad-block filter lists as a tracker pattern,
+and on a gateway that is cross-site from the pages — a Lambda URL, workers.dev
+— those lists kill the request before any HTTP happens. Clients say
+`/sessions`; the gateway answers both.)
 
 - Sent with `navigator.sendBeacon(url, blob)`, body = the raw ciphertext bytes.
   `sendBeacon` cannot set headers, so **all routing lives in the path**. The Blob's
@@ -1068,7 +1073,8 @@ on purpose: one direction (write only), ≤ 16 KiB, opaque bytes, a key the gate
 constructs itself from two validated ids, and no read path whatsoever. Nothing may
 be added to it, and no response on any route may ever carry stored bytes.
 
-`GET {gatewayUrl}/beacon/{videoId}` — **authenticated exactly like `POST /api/sign`**
+`GET {gatewayUrl}/sessions/{videoId}` (alias `/beacon/{videoId}`, as above) —
+**authenticated exactly like `POST /api/sign`**
 (§15.4: Google bearer token, `ALLOWED_EMAILS`; 401 bad/expired token, 403 valid token
 not whitelisted, 503 identity provider unreachable). It lists the analytics bucket
 under prefix `{videoId}/` with `ListObjectsV2`, server-side, and answers:

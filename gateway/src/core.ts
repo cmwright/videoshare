@@ -202,7 +202,7 @@ async function handleBeaconWrite(
 ): Promise<Response> {
   if (!ID_PATTERN.test(videoId) || !ID_PATTERN.test(sessionId)) {
     return jsonResponse(
-      { error: "Beacon path must be /beacon/{videoId}/{sessionId}, each 22 base64url characters." },
+      { error: "Beacon path must be /sessions/{videoId}/{sessionId}, each 22 base64url characters." },
       400,
       cors,
     );
@@ -331,11 +331,17 @@ type Route =
   | { kind: "beacon"; videoId: string; sessionId: string | null };
 
 /**
- * `/beacon/{videoId}` and `/beacon/{videoId}/{sessionId}` (SPEC §16.3).
+ * `/sessions/{videoId}` and `/sessions/{videoId}/{sessionId}` (SPEC §16.3).
  * Deliberately loose about what an id *contains*: a malformed one is a 400 from
  * the handler, not a 404 from here, and the handler is where `ID_PATTERN` lives.
+ *
+ * `/beacon/…` is the same route under its original name, kept so already-open
+ * player tabs from older builds still land. New clients say `/sessions`:
+ * "beacon" is a tracker-blocking pattern in ad-block filter lists, and on a
+ * gateway that is cross-site from the pages (a Lambda URL, workers.dev) those
+ * lists silently kill the request before any HTTP happens.
  */
-const BEACON_PATH = /^(?:\/api)?\/beacon\/([^/]+)(?:\/([^/]+))?$/;
+const BEACON_PATH = /^(?:\/api)?\/(?:sessions|beacon)\/([^/]+)(?:\/([^/]+))?$/;
 
 /**
  * `gatewayUrl` in the client's config may be an origin or a path prefix, and a
