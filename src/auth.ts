@@ -1,11 +1,13 @@
 /**
  * Google sign-in for gateway mode (docs/SPEC.md §15.5).
  *
- * The ID token this obtains is the only thing the gateway trusts, and it lives
- * in one module-private variable for the lifetime of the tab: never
- * localStorage, never sessionStorage, never a cookie, never a URL. Reload the
- * page and the token is gone — which is the point, since anyone holding it can
- * upload as this user until it expires.
+ * The ID token this obtains is the only thing the gateway trusts. It lives in
+ * a module-private variable, cached in `sessionStorage` for at most its own
+ * lifetime — never localStorage, never a cookie, never a URL — so it survives
+ * navigation between the owner pages and a reload, and dies with the tab.
+ * Script running on this origin could read either home equally, so the cache
+ * concedes nothing the in-memory copy kept; what it must not do is outlive
+ * the tab.
  *
  * Nothing here verifies anything. The gateway checks the token's signature,
  * issuer, audience, expiry, `email_verified` and the whitelist (§15.4); the
@@ -20,6 +22,12 @@ import { b64urlDecode } from "./util";
 
 const GIS_SCRIPT = "https://accounts.google.com/gsi/client";
 const GATEWAY_DOCS = "docs/gateway-setup.md";
+/**
+ * Same-tab token cache (SPEC §15.5). Its presence also marks "this tab signed
+ * in", which is what allows the one silent refresh on a later page load —
+ * a visitor who never signed in is never prompted.
+ */
+const AUTH_KEY = "videoshare.auth";
 
 /** A token this close to expiry is treated as gone, so a part never fails on a stale one. */
 const EXPIRY_MARGIN_MS = 60_000;
@@ -123,7 +131,11 @@ class GoogleAuth implements Auth {
   /** When the last empty refresh finished, for REFRESH_COOLDOWN_MS. */
   private refusedAt = 0;
 
+  /** Whether this tab signed in before, even if the cached token has expired. */
+  private hadSession = false;
+
   constructor(private readonly clientId: string) {
+    this.adoptCached();
     void this.start();
   }
 
@@ -201,6 +213,8 @@ class GoogleAuth implements Auth {
     this.expiresAt = 0;
     this.refusedAt = 0;
     this.message = null;
+    this.hadSession = false;
+    clearCache();
     // Without this, auto_select would sign the same account straight back in.
     this.api?.disableAutoSelect();
     this.api?.cancel();
@@ -213,6 +227,23 @@ class GoogleAuth implements Auth {
   }
 
   // --- internals -------------------------------------------------------------
+
+  /**
+   * Restores the same-tab session (SPEC §15.5): a fresh cached token signs
+   * this page in before Google's script has even loaded; a stale one is only
+   * the marker that lets `start()` try a silent refresh.
+   */
+  private adoptCached(): void {
+    const cached = readCache();
+    if (cached === null) return;
+    this.hadSession = true;
+    const claims = readClaims(cached);
+    if (!claims.expiresAt || claims.expiresAt - EXPIRY_MARGIN_MS <= Date.now()) return;
+    this.token = cached;
+    this.email = claims.email;
+    this.expiresAt = claims.expiresAt;
+    this.status = "signed-in";
+  }
 
   private async start(): Promise<void> {
     let api: GoogleIdApi;
@@ -246,9 +277,16 @@ class GoogleAuth implements Auth {
     }
 
     this.api = api;
-    this.status = "signed-out";
+    // A fresh cached token already put this tab in "signed-in" before the
+    // script finished loading; don't demote it.
+    if (this.status === "loading") this.status = this.getToken() ? "signed-in" : "signed-out";
     this.renderButton();
     this.emit();
+    // The tab signed in earlier but the token aged out (e.g. parked on the
+    // video page past the hour): one silent auto-select gets a live Google
+    // session back in without a click (SPEC §15.5). Empty is fine — the
+    // button is on the page.
+    if (this.hadSession && !this.getToken()) void this.refresh();
   }
 
   private renderButton(): void {
@@ -284,6 +322,8 @@ class GoogleAuth implements Auth {
     this.refusedAt = 0;
     this.message = null;
     this.status = "signed-in";
+    this.hadSession = true;
+    writeCache(token);
     // A refresh that timed out already resolved null; the queue's next attempt
     // picks this token up regardless.
     this.settle?.(token);
@@ -308,6 +348,35 @@ class GoogleAuth implements Auth {
   private emit(): void {
     const snapshot = this.state;
     for (const listener of this.listeners) listener(snapshot);
+  }
+}
+
+// --- Session cache -----------------------------------------------------------
+// sessionStorage refusing (private windows, blocked site data) degrades to the
+// old behavior — sign in again per page — never to an error.
+
+function readCache(): string | null {
+  try {
+    const raw = sessionStorage.getItem(AUTH_KEY);
+    return raw && raw.split(".").length === 3 ? raw : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeCache(token: string): void {
+  try {
+    sessionStorage.setItem(AUTH_KEY, token);
+  } catch {
+    // Kept in memory only, as before.
+  }
+}
+
+function clearCache(): void {
+  try {
+    sessionStorage.removeItem(AUTH_KEY);
+  } catch {
+    // Nothing was stored.
   }
 }
 

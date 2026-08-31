@@ -607,8 +607,15 @@ token itself must never be logged.
   `"/api"` for same-origin deployments). Present → **gateway mode**: the
   **storage** settings form is not rendered (credentials never live in this
   browser); client fetches `{gatewayUrl}/config`; recording requires Google
-  sign-in (Google Identity Services script, ID token kept in memory only —
-  never localStorage). Absent → **legacy mode**, §9 unchanged.
+  sign-in (Google Identity Services script). The ID token is cached in
+  `sessionStorage` under `videoshare.auth` for at most its own lifetime — never
+  localStorage, never a cookie — so it survives same-tab navigation between the
+  owner pages and a reload, and dies with the tab. On page load the cache is
+  adopted when the token is still fresh (per the §15.4 expiry margin); when the
+  tab has signed in before but the cached token is stale, one silent
+  auto-select refresh runs so a live Google session re-signs in without a
+  click. A visitor who never signed in is never prompted. Sign-out clears the
+  cache and disables auto-select. Absent → **legacy mode**, §9 unchanged.
 - What gateway mode does keep is the encoder half of §9, as a **Recording
   options** block of its own: `quality`, `codec` and `videoBitsPerSecond` with
   the same values, defaults and normalization, persisted at
