@@ -1,10 +1,20 @@
 # VideoShare
 
-Record your screen, get a link. The video is encrypted in your browser before it
-leaves it, and the key lives in the link's `#fragment` — which browsers never
-send over the network.
+Self-hosted screen recording and sharing.
 
-No server. No account. No SaaS in the middle. A static site and a bucket you own.
+- **End-to-end encrypted video.** Recordings are captured, encoded, and
+  encrypted in the browser, and uploaded to your own S3-compatible bucket while
+  you record. The AES key lives in the share link's `#fragment`, which browsers
+  never send over the network — the bucket and every server in the path hold
+  only ciphertext.
+- **End-to-end encrypted analytics** (optional). Views, unique viewers,
+  completion, and per-viewer replay heatmaps. Each report is encrypted in the
+  viewer's tab with the video's own key before it is sent; no IP address is
+  read or stored on any analytics path.
+- **Serverless hosting, no database.** The site is static files; storage is one
+  or two buckets. The optional gateway — for Google sign-in and analytics — is
+  a stateless function (Cloudflare Worker, Lambda, or a Node process) that
+  verifies tokens and presigns URLs; it keeps no data of its own.
 
 ```
 https://videoshare.example.com/view.html#8Kq2vTnR1sYbLm3wXpQdEg.b0Zx…
@@ -12,14 +22,9 @@ https://videoshare.example.com/view.html#8Kq2vTnR1sYbLm3wXpQdEg.b0Zx…
                                                               never sent anywhere
 ```
 
-## Why
+## How it works
 
-Loom is good and Loom is a subscription that holds your screen recordings —
-often of internal tools, customer data, half-finished work — on someone else's
-computer. The recordings themselves are not complicated: capture, encode, upload,
-serve. Browsers have done all four natively for years.
-
-So VideoShare is the smallest thing that works:
+The site is three static pages:
 
 - **`index.html`** — the app you use: a sidebar and three views behind one hash
   route. **Videos** is the library — one row per recording this browser made,
@@ -29,8 +34,7 @@ So VideoShare is the smallest thing that works:
   H.264 encoder where there is one, in software otherwise — encrypts with
   WebCrypto, and sends the ciphertext to your bucket *while you are still
   recording*: every 8 MiB goes up as one part of a SigV4-signed S3 multipart
-  upload, so stopping only leaves the tail to flush and the link lands about as
-  fast as you can read it. One chunk is encrypted at a time, so an hour-long
+  upload, so stopping only leaves the tail to flush before the link is ready. One chunk is encrypted at a time, so an hour-long
   recording costs no more memory than a one-minute one. **Settings** holds the
   bucket credentials and the encoder choices. All of it — settings and the
   library of your links — lives in `localStorage`, and a recording keeps
@@ -79,11 +83,10 @@ Open **http://localhost:8080**, go to **Settings**, and fill in the storage form
 
 (The compose stack prints these too — `docker compose -f examples/docker-compose.yml logs minio-init`.)
 
-Now record something. The upload has been running the whole time you were
-recording, so stopping and hitting **Finish** hands you the share link almost at
-once, already copied to your clipboard. Open it in a different browser to prove
-the point: no credentials, no login, and the bucket only ever handed over
-ciphertext.
+Record something. The upload runs while you record, so stopping and hitting
+**Finish** hands you the share link almost at once, already copied to your
+clipboard. Open it in a different browser: it plays with no credentials and no
+login, and the bucket only ever served ciphertext.
 
 The MinIO console is at **http://localhost:9001** (`minioadmin` / `minioadmin`)
 if you want to watch the objects appear.
@@ -100,13 +103,13 @@ clears out multipart uploads a closed tab left behind.
 applied, and why MinIO needs a different mechanism for that last one than S3
 does.
 
-## Deploying for real
+## Deploying
 
 Two things move: the bucket, and where the static site lives.
 
 1. **Set up a bucket.** [`docs/storage-setup.md`](docs/storage-setup.md) has
-   copy-pasteable walkthroughs for **Cloudflare R2** (recommended — egress is
-   free, which is the entire cost of hosting video), **AWS S3**, and
+   copy-pasteable walkthroughs for **Cloudflare R2** (recommended — egress,
+   the dominant cost of serving video, is free there), **AWS S3**, and
    **self-hosted MinIO**, including a VPN-only variant. The policy and CORS
    documents it applies are in `examples/`.
 2. **Edit one line.** `public/config.js` holds the URL where your bucket is
@@ -156,10 +159,9 @@ video ids — 128 random bits each — cannot be enumerated.
 
 ### Optional: getting the credentials out of the browser
 
-The one uncomfortable line in that list is the `localStorage` one. If you want
-the upload credentials off your colleagues' laptops — or you simply want more
-than one person recording without handing the same keys to each of them — there
-is an optional **gateway**: a small stateless service that holds the bucket
+To keep upload credentials out of browsers entirely — or to let several people
+record without handing the same keys to each of them — there is an optional
+**gateway**: a small stateless service that holds the bucket
 credentials, verifies a Google sign-in against an email whitelist you control,
 and answers with **presigned URLs**. The browser then uploads to those URLs
 directly. The gateway signs; it never carries a byte of video, by design and by
@@ -207,7 +209,7 @@ one is. They do not learn which parts were watched, how much, whether it
 finished, or anything about the viewer — no account, no cookie, no fingerprint
 and no IP address, because none is read or logged on any analytics path.
 
-Three consequences to be blunt about before you switch it on:
+Three consequences of the design, before you switch it on:
 
 - **Watch data is readable by exactly the holders of the share link.** Sharing
   the link shares the analytics. There is no second key and no separate audience.
@@ -228,7 +230,7 @@ reading its config, sends nothing, and writes no key at all.
 
 ### What this does *not* protect against
 
-Be clear-eyed about this list before you record anything sensitive.
+Read this list before recording anything sensitive.
 
 - **Anyone with the link can watch, forever.** The link *is* the credential.
   There is no revocation, no expiry, no per-viewer access, and no way to tell who
@@ -295,9 +297,9 @@ So the codec is a setting, and the trade is real in both directions:
 
 | Codec | What you get |
 | --- | --- |
-| **Auto** (default) | Hardware H.264 if this machine has one, VP9 if it does not. The right answer unless you have a reason. |
+| **Auto** (default) | Hardware H.264 if this machine has one, VP9 if it does not. |
 | **H.264** | Encoded on the GPU, so it holds frame rate at 4K no matter what else the machine is doing, and the result plays in **everything** — Safari, iPhones, QuickTime, a video tag someone pasted into a wiki. Files run roughly **2–3× larger** than VP9 at a comparable quality. Fragmented MP4. |
-| **VP9** | The smallest files that still play widely, and no help at all from hardware: software all the way down. Comfortable at 1080p, drops frames on a big display. WebM. |
+| **VP9** | The smallest files that still play widely; encoded in software, with no hardware assistance. Comfortable at 1080p, drops frames on a big display. WebM. |
 | **AV1** | Smaller again, slower again. Safari decodes it only on hardware that can — M3-class Apple silicon and newer — with no software fallback, so pick it when you know who is watching. WebM. |
 
 Pick a codec this browser cannot encode and the recorder walks down the same
@@ -358,8 +360,7 @@ belongs to the WebCodecs engine, which Safari cannot reach.
 **Watching depends on what you recorded.** Chrome, Edge and Firefox play all
 three codecs and stream them progressively: the player fetches, decrypts and
 appends chunk by chunk, and starts playing after the first 8 MiB. Safari is the
-one that cares which you picked, and it is the practical argument for the
-default:
+one that cares which you picked:
 
 - **H.264 in MP4** plays there natively, and macOS Safari's `MediaSource`
   accepts it, so it streams the same way it does everywhere else.
@@ -375,7 +376,7 @@ Phones are best-effort throughout: iPhone Safari exposes `ManagedMediaSource`
 rather than the `MediaSource` the player looks for, so it takes the whole-file
 path even for an MP4.
 
-One honest caveat on the MP4 path: its audio is AAC where the browser can encode
+One caveat on the MP4 path: its audio is AAC where the browser can encode
 AAC, and Opus otherwise — which today means Chrome on desktop Linux, the one
 platform with no AAC encoder in WebCodecs. Safari cannot play Opus in MP4, so if
 you record on Linux, H.264 buys you the smooth 4K but not the Safari viewers.
@@ -412,7 +413,7 @@ existing share link, so treat it accordingly.
 ## Future work
 
 - **Camera bubble** — a picture-in-picture webcam overlay composited into the
-  recording, the one Loom feature people actually miss.
+  recording.
 - **Real deletion** — `DeleteObject` from the recorder, behind a credential scope
   that allows it, so "delete" means more than "forget locally".
 - **Expiring links** — bucket lifecycle rules plus an expiry stamped into the
