@@ -5,7 +5,9 @@
  * recording: encrypted chunk i (§4) is uploaded as part number i+1, so the
  * completed object is byte-identical to the plain concatenation of blocks the
  * player expects. `{id}/meta.json` stays a single PUT and goes last — a video
- * is complete iff its meta exists.
+ * is complete iff its meta exists. §3's optional `{id}/thumb.bin` slots in
+ * between the two: after the video exists, before it is marked complete, and
+ * unable to fail the finish either way.
  *
  * Who authorizes those requests is the one thing that varies: a `Signer` turns
  * an operation into a ready-to-send URL + headers. `LocalSigner` signs with
@@ -40,10 +42,17 @@ export interface UploadSession {
   addChunk(plain: Uint8Array): Promise<void>;
   /**
    * Flushes the final (possibly short) chunk, re-sends any parts that failed
-   * earlier, completes the multipart upload, then PUTs `meta.json`. Safe to
-   * call again after a failure: the final chunk is only ever added once.
+   * earlier, completes the multipart upload, PUTs `thumb.bin` when there is one,
+   * then PUTs `meta.json`. Safe to call again after a failure: the final chunk
+   * is only ever added once.
+   *
+   * `thumb` is SPEC §3's **already-encrypted** block, or null for no thumbnail.
    */
-  finish(finalPlain: Uint8Array | null, meta: VideoMeta): Promise<UploadResult>;
+  finish(
+    finalPlain: Uint8Array | null,
+    meta: VideoMeta,
+    thumb?: Uint8Array | null,
+  ): Promise<UploadResult>;
   /** Best-effort `AbortMultipartUpload`; never throws. */
   abort(): Promise<void>;
   /** Ciphertext bytes confirmed uploaded so far. */
@@ -64,16 +73,18 @@ const EMPTY = new Uint8Array(0);
 
 /**
  * One S3 operation the session needs authorized. Object keys never cross this
- * seam: a signer derives them from `id` as exactly `{id}/video.bin` and
- * `{id}/meta.json`, so no part of the session can aim a write at another key.
- * The `kind` values are the gateway's wire vocabulary (SPEC §15.3).
+ * seam: a signer derives them from `id` as exactly `{id}/video.bin`,
+ * `{id}/meta.json` and `{id}/thumb.bin`, so no part of the session can aim a
+ * write at another key. The `kind` values are the gateway's wire vocabulary
+ * (SPEC §15.3).
  */
 export type SignOp =
   | { kind: "create"; id: string }
   | { kind: "part"; id: string; uploadId: string; partNumber: number }
   | { kind: "complete"; id: string; uploadId: string }
   | { kind: "abort"; id: string; uploadId: string }
-  | { kind: "put-meta"; id: string };
+  | { kind: "put-meta"; id: string }
+  | { kind: "put-thumb"; id: string };
 
 /** What the session is about to send — a signer that signs payloads needs the bytes. */
 export interface SignRequest {
@@ -115,6 +126,7 @@ const METHODS: Record<SignOp["kind"], HttpMethod> = {
   complete: "POST",
   abort: "DELETE",
   "put-meta": "PUT",
+  "put-thumb": "PUT",
 };
 
 // --- LocalSigner: credentials in this browser (SPEC §7) ----------------------
@@ -220,6 +232,8 @@ class LocalSigner implements Signer {
 function localUrl(settings: Settings, op: SignOp): string {
   const base = `${settings.endpoint.replace(/\/+$/, "")}/${settings.bucket}`;
   if (op.kind === "put-meta") return `${base}/${op.id}/meta.json`;
+  // The same direct SigV4 PUT meta.json gets, against a different key (SPEC §15.5).
+  if (op.kind === "put-thumb") return `${base}/${op.id}/thumb.bin`;
 
   const video = `${base}/${op.id}/video.bin`;
   if (op.kind === "create") return `${video}?uploads`;
@@ -679,7 +693,11 @@ class MultipartSession implements UploadSession {
     return this.enqueue(plain);
   }
 
-  async finish(finalPlain: Uint8Array | null, meta: VideoMeta): Promise<UploadResult> {
+  async finish(
+    finalPlain: Uint8Array | null,
+    meta: VideoMeta,
+    thumb?: Uint8Array | null,
+  ): Promise<UploadResult> {
     if (this.state !== "open") throw new Error(this.closedMessage());
 
     let finalTask: Promise<void> | null = null;
@@ -711,6 +729,10 @@ class MultipartSession implements UploadSession {
       await this.completeUpload();
       this.completed = true;
     }
+    // After the video exists, before meta: a reader that finds meta may or may
+    // not find a thumbnail (SPEC §3 says it must cope either way), but it never
+    // finds a thumbnail for a video that does not exist.
+    if (thumb) await this.putThumb(thumb);
     await this.putMeta(meta);
 
     this.state = "done";
@@ -841,6 +863,32 @@ class MultipartSession implements UploadSession {
           `${s3ErrorDetail(body) ? ` (${s3ErrorDetail(body)})` : ""}. ` +
           `Every part except the last must be at least 5 MiB. See ${DOCS}.`,
       );
+    }
+  }
+
+  /**
+   * SPEC §3's optional `thumb.bin`, and the one write here that cannot fail the
+   * finish: attempted once, inside a `try`/`catch` that swallows everything.
+   * Whatever happens to it, `finish()` goes on to PUT meta and returns the share
+   * link — the video and the link are what the user asked for, and a decorative
+   * image must never be able to cost them either. It gets none of the part
+   * queue's retry ladder for the same reason.
+   *
+   * The block arrives already encrypted under `thumbAad(id)` (SPEC §6): this
+   * file never sees the plaintext, does not re-encrypt it and does not inspect
+   * it. A `finish()` retried after a failure re-sends it — an idempotent PUT of
+   * the same bytes to the same key. It is not counted in `uploadedBytes`, which
+   * is the recording's progress and not a 30 KB image arriving at the end.
+   */
+  private async putThumb(block: Uint8Array): Promise<void> {
+    try {
+      await send(
+        this.signer,
+        { op: { kind: "put-thumb", id: this.id }, body: block, contentType: CONTENT_TYPE },
+        `${this.id}/thumb.bin`,
+      );
+    } catch (err) {
+      console.warn("[videoshare] could not upload the thumbnail; the video is unaffected", err);
     }
   }
 

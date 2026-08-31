@@ -37,6 +37,7 @@ import {
 import { fetchMeta, type Playback, PlaybackError, startPlayback } from "./playback";
 import { type AccountChip, initAccountChip } from "./shell";
 import { fetchGatewayConfig, gatewayUrl, publicBaseUrl } from "./settings";
+import { fetchThumbnail } from "./thumbnail";
 import type { GatewayConfig, VideoMeta } from "./types";
 import { codecLabel, formatBytes, formatDuration, parseShareFragment, shareLink } from "./util";
 
@@ -177,6 +178,22 @@ function wireCopyLink(id: string, keyB64: string): void {
       }
     })();
   });
+}
+
+/**
+ * §3's thumbnail as the hero's poster (§17.4), so the frame shows the recording
+ * instead of a black rectangle while the first chunk is fetched and decrypted.
+ *
+ * Never awaited by anything: it runs beside `fetchMeta` and `startPlayback`, and
+ * nothing about playback waits on a decorative image. Same silent fallback as
+ * everywhere else — no thumbnail, no poster, no message, and the hero's existing
+ * loading treatment stands. Once a frame has painted the element ignores the
+ * poster, which is the correct outcome and needs no guard; the one object URL
+ * lives for the document, because the page owns it until it goes.
+ */
+async function applyPoster(base: string, id: string, key: CryptoKey): Promise<void> {
+  const blob = await fetchThumbnail(base, id, key);
+  if (blob) video.poster = URL.createObjectURL(blob);
 }
 
 // --- Engagement (SPEC §17.6) -------------------------------------------------
@@ -481,6 +498,10 @@ async function main(): Promise<void> {
   }
 
   wireCopyLink(fragment.id, fragment.keyB64);
+
+  // Started as soon as the key exists and never awaited (§17.4). One
+  // `fetchThumbnail` call, not a queue: one video, one document.
+  void applyPoster(base, fragment.id, key).catch(() => undefined);
 
   setStatus("Loading…");
   meta = await fetchMeta(base, fragment.id, key);

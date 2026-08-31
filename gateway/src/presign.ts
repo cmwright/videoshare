@@ -1,16 +1,20 @@
 /**
- * SigV4 query-string presigning for the five multipart operations (SPEC §15.3).
+ * SigV4 query-string presigning for the six upload operations (SPEC §15.3).
  *
  * The gateway hands the browser a *URL*; the bytes then flow browser↔bucket
  * directly. Nothing here fetches, streams or buffers object data — that is the
- * core invariant of §15 and there is deliberately no code path that could.
+ * core invariant of §15 and there is deliberately no code path that could. §3's
+ * thumbnail changes nothing about that: `put-thumb` signs a URL for one more
+ * key, and the ~15–50 KB of ciphertext travels browser↔bucket like every other
+ * object.
  *
  * Two things make this safe to expose to an authenticated but otherwise
  * untrusted caller:
  *
  *  1. Object keys are built here, from a `{22}` id that matched `ID_PATTERN`,
- *     as exactly `{id}/video.bin` or `{id}/meta.json`. The caller supplies the
- *     id, never a key, so no request can be steered at another object.
+ *     as exactly `{id}/video.bin`, `{id}/meta.json` or `{id}/thumb.bin`. The
+ *     caller supplies the id, never a key, so no request can be steered at
+ *     another object.
  *  2. `uploadId` and `partNumber` are syntax-checked and then percent-encoded
  *     with the *same* RFC 3986 encoder aws4fetch uses to build its canonical
  *     query string. They land as query *values* and can neither add a parameter
@@ -56,7 +60,9 @@ export type SignRequest =
   | { op: "part"; id: string; uploadId: string; partNumbers: number[] }
   | { op: "complete"; id: string; uploadId: string }
   | { op: "abort"; id: string; uploadId: string }
-  | { op: "put-meta"; id: string };
+  | { op: "put-meta"; id: string }
+  /** SPEC §3: one encrypted block whose plaintext is a JPEG. Optional per video. */
+  | { op: "put-thumb"; id: string };
 
 export type SignResponse =
   | { url: string; method: "POST" | "PUT" | "DELETE" }
@@ -71,7 +77,7 @@ export type ParseResult = { ok: true; request: SignRequest } | { ok: false; erro
 
 /**
  * Validates a decoded `POST /api/sign` body (SPEC §15.3). Everything that is not
- * exactly one of the five shapes is a 400 — unknown ops, unknown/misspelled
+ * exactly one of the six shapes is a 400 — unknown ops, unknown/misspelled
  * fields' absence, out-of-range part numbers, ids that are not 22 base64url
  * characters. Extra properties are ignored rather than rejected so the client
  * can add a field later without a lockstep gateway deploy.
@@ -92,6 +98,9 @@ export function parseSignRequest(body: unknown): ParseResult {
 
   if (op === "create") return { ok: true, request: { op, id } };
   if (op === "put-meta") return { ok: true, request: { op, id } };
+  // §3's thumbnail is an id and nothing else, exactly like `put-meta`: same
+  // validation, same shape, a different key built below.
+  if (op === "put-thumb") return { ok: true, request: { op, id } };
 
   if (op === "part" || op === "complete" || op === "abort") {
     const uploadId = raw["uploadId"];
@@ -163,6 +172,9 @@ export function createPresigner(config: BucketConfig): Presigner {
         case "put-meta":
           return { url: await presign("PUT", metaUrl(config, request.id)), method: "PUT" };
 
+        case "put-thumb":
+          return { url: await presign("PUT", thumbUrl(config, request.id)), method: "PUT" };
+
         case "complete":
           return {
             url: await presign("POST", `${videoUrl(config, request.id)}?${uploadIdParam(request.uploadId)}`),
@@ -203,12 +215,15 @@ export function bucketUrl(config: BucketConfig): string {
   return `${config.endpoint}/${config.bucket}`;
 }
 
-/** The only two keys this gateway will ever sign for (SPEC §3). */
+/** The only three keys this gateway will ever sign for (SPEC §3). */
 export function videoKey(id: string): string {
   return `${id}/video.bin`;
 }
 export function metaKey(id: string): string {
   return `${id}/meta.json`;
+}
+export function thumbKey(id: string): string {
+  return `${id}/thumb.bin`;
 }
 
 function videoUrl(config: BucketConfig, id: string): string {
@@ -216,6 +231,9 @@ function videoUrl(config: BucketConfig, id: string): string {
 }
 function metaUrl(config: BucketConfig, id: string): string {
   return objectUrl(config, metaKey(id));
+}
+function thumbUrl(config: BucketConfig, id: string): string {
+  return objectUrl(config, thumbKey(id));
 }
 
 function uploadIdParam(uploadId: string): string {

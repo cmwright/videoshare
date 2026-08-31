@@ -39,6 +39,7 @@ import {
   generateKey,
   importKeyB64,
   metaAad,
+  thumbAad,
 } from "../src/crypto";
 import { createGatewaySigner, createUploadSession } from "../src/upload";
 import type { Signer } from "../src/upload";
@@ -274,7 +275,7 @@ describe.skipIf(!E2E)("gateway end-to-end", () => {
     if (realFetch) globalThis.fetch = realFetch;
 
     for (const id of litter) {
-      for (const key of [`${id}/video.bin`, `${id}/meta.json`]) {
+      for (const key of [`${id}/video.bin`, `${id}/meta.json`, `${id}/thumb.bin`]) {
         await rootClient.fetch(objectUrl(key), { method: "DELETE" }).catch(() => undefined);
       }
     }
@@ -415,6 +416,76 @@ describe.skipIf(!E2E)("gateway end-to-end", () => {
       const block = new Uint8Array(await res.arrayBuffer());
       const decoded = new TextDecoder().decode(await decryptBlock(viewerKey, metaAad(id), block));
       expect(JSON.parse(decoded)).toEqual(meta);
+    });
+
+    /**
+     * §3's thumbnail, the whole way round, with the same shape as the meta test
+     * above: the gateway signs a URL, the block goes browser↔bucket, and an
+     * anonymous reader with only the link key gets the plaintext back.
+     *
+     * The payload is a JPEG-shaped stand-in rather than a real encoded frame,
+     * and that is the honest boundary of this test: Node has no canvas, no
+     * `MediaStream` and no `<video>`, so the *capture* half (§6) cannot run here
+     * and a fabricated JPEG would prove nothing about it. Every byte between
+     * `encryptBlock` and the reader's `decryptBlock` is real, which is the half
+     * the gateway is responsible for.
+     */
+    it("signs a put-thumb, stores the block at thumb.bin, and reads it back anonymously", async () => {
+      const thumbKey = `${id}/thumb.bin`;
+      // SOI ‖ JFIF APP0 ‖ filler ‖ EOI: opaque to everything in this path, but
+      // shaped like what `canvas.toBlob` would hand the recorder.
+      const jpeg = Uint8Array.from([
+        0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00,
+        ...randomBytes(4096),
+        0xff, 0xd9,
+      ]);
+      const block = await encryptBlock(key, thumbAad(id), jpeg);
+
+      // 1. Ask the running gateway for the URL — nothing else changes about the
+      //    call: same route, same token, same JSON body shape as `put-meta`.
+      const signed = await fetch(`${gatewayUrl}/sign`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${await mintToken(UPLOADER_EMAIL)}`,
+        },
+        body: JSON.stringify({ op: "put-thumb", id }),
+      });
+      expect(signed.status, await signed.clone().text()).toBe(200);
+      const answer = (await signed.json()) as { url: string; method: string };
+      expect(answer.method).toBe("PUT");
+
+      // The key is the gateway's, derived from the id it was given, and it
+      // addresses the bucket rather than the gateway (SPEC §15).
+      const url = new URL(answer.url);
+      expect(url.origin).toBe(new URL(ENDPOINT).origin);
+      expect(url.origin).not.toBe(gatewayOrigin);
+      expect(url.pathname).toBe(`/${BUCKET}/${thumbKey}`);
+
+      // 2. The ciphertext goes straight to MinIO through that URL. No
+      //    credentials of our own: the signature is the whole authorization.
+      const put = await fetch(answer.url, {
+        method: "PUT",
+        headers: { "content-type": "application/octet-stream" },
+        body: block as Uint8Array<ArrayBuffer>,
+      });
+      expect(put.status, `presigned PUT ${thumbKey}: ${await put.clone().text()}`).toBe(200);
+
+      // 3. What a library row and the video page do (§3): an anonymous GET,
+      //    then decrypt with the key out of the link fragment.
+      const got = await fetch(objectUrl(thumbKey));
+      expect(got.status, `anonymous GET ${thumbKey}`).toBe(200);
+      const stored = new Uint8Array(await got.arrayBuffer());
+      expectBytesEqual(stored, block, "thumbnail ciphertext survived the round trip");
+
+      const viewerKey = await importKeyB64(keyB64);
+      const plainThumb = await decryptBlock(viewerKey, thumbAad(id), stored);
+      expectBytesEqual(plainThumb, jpeg, "thumbnail plaintext");
+
+      // And it is bound to *this* video: the same block under another id's AAD
+      // is unreadable, which is what stops a thumb.bin copied between videos
+      // from silently becoming that video's thumbnail (§4).
+      await expect(decryptBlock(viewerKey, thumbAad(randomId()), stored)).rejects.toThrow();
     });
 
     it("Range-fetches every chunk anonymously and rebuilds the original bytes", async () => {

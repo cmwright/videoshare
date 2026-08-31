@@ -8,7 +8,10 @@
  * The whole loop runs twice: once with the MinIO root credentials and once with
  * the write-only uploader key from examples/docker-compose.yml, because
  * multipart create/part/complete/abort must all work under the SPEC §14
- * uploader policy, not just under an admin key.
+ * uploader policy, not just under an admin key. §3's optional `thumb.bin` rides
+ * along for the same reason: SPEC §7 claims it "adds nothing to this list" —
+ * no new CORS rule, no new IAM action — and the write-only run is what makes
+ * that a checked claim rather than a stated one.
  *
  * Needs the local stack from examples/docker-compose.yml and runs only under
  * `E2E=1 npm run test:e2e`.
@@ -22,10 +25,12 @@ import {
   chunkAad,
   decryptBlock,
   decryptChunkRange,
+  encryptBlock,
   exportKeyB64,
   generateKey,
   importKeyB64,
   metaAad,
+  thumbAad,
 } from "../src/crypto";
 import { createUploadSession } from "../src/upload";
 import { randomId } from "../src/util";
@@ -66,6 +71,23 @@ const CIPHERTEXT_BYTES = VIDEO_BYTES + EXPECTED_PARTS * CHUNK_OVERHEAD;
 
 /** S3 rejects a non-final multipart part smaller than this at CompleteMultipartUpload. */
 const MIN_PART_BYTES = 5 * 1024 * 1024;
+
+/**
+ * SOI ‖ JFIF APP0 ‖ filler ‖ EOI — shaped like what `canvas.toBlob` hands the
+ * recorder, and opaque to everything on this path.
+ *
+ * A fabricated JPEG is the honest boundary here: Node has no canvas, no
+ * `MediaStream` and no `<video>`, so §6's *capture* half cannot run and a real
+ * encoded frame would prove nothing extra. What this suite is responsible for
+ * starts at `encryptBlock` and ends at the reader's `decryptBlock`.
+ */
+function jpegShapedBytes(): Uint8Array {
+  return Uint8Array.from([
+    0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00,
+    ...randomBytes(4096),
+    0xff, 0xd9,
+  ]);
+}
 
 /** crypto.getRandomValues rejects any single request larger than 65536 bytes. */
 function randomBytes(n: number): Uint8Array {
@@ -229,7 +251,7 @@ describe.skipIf(!E2E)("MinIO end-to-end", () => {
 
     const stranded = new Set<string>();
     for (const { client, id } of litter) {
-      for (const objectKey of [`${id}/video.bin`, `${id}/meta.json`]) {
+      for (const objectKey of [`${id}/video.bin`, `${id}/meta.json`, `${id}/thumb.bin`]) {
         const gone = (await tryDelete(client, objectKey)) || (await tryDelete(rootClient, objectKey));
         if (!gone) stranded.add(id);
       }
@@ -250,11 +272,15 @@ describe.skipIf(!E2E)("MinIO end-to-end", () => {
     const id = randomId();
     const videoKey = `${id}/video.bin`;
     const metaKey = `${id}/meta.json`;
+    const thumbKey = `${id}/thumb.bin`;
 
     let plain: Uint8Array;
     let key: CryptoKey;
     let keyB64: string;
     let meta: VideoMeta;
+    /** §3's optional block, already encrypted the way §6 hands it to `finish()`. */
+    let jpeg: Uint8Array;
+    let thumbBlock: Uint8Array;
 
     beforeAll(async () => {
       track(client, id);
@@ -262,6 +288,10 @@ describe.skipIf(!E2E)("MinIO end-to-end", () => {
       plain = randomBytes(VIDEO_BYTES);
       key = await generateKey();
       keyB64 = await exportKeyB64(key);
+      jpeg = jpegShapedBytes();
+      // `upload.ts` never sees the plaintext (§7): the recorder encrypts on
+      // capture, and `finish()` re-sends exactly these bytes.
+      thumbBlock = await encryptBlock(key, thumbAad(id), jpeg);
       meta = {
         v: 1,
         title: "e2e streaming round-trip",
@@ -293,14 +323,18 @@ describe.skipIf(!E2E)("MinIO end-to-end", () => {
         expect(early.status, "parts must not be visible before CompleteMultipartUpload").toBe(404);
       }
 
-      // Finish flushes the short remainder as the final part, completes, then puts meta.
-      const result = await session.finish(plain.subarray(FULL_CHUNKS * CHUNK_SIZE), meta);
+      // Finish flushes the short remainder as the final part, completes, puts
+      // thumb.bin, then puts meta (§7's order).
+      const result = await session.finish(plain.subarray(FULL_CHUNKS * CHUNK_SIZE), meta, thumbBlock);
 
       expect(result.id).toBe(id);
       // No `location` in Node, so the link degrades to the relative form (SPEC §2 shape).
       expect(result.link).toBe(`view.html#${id}.${keyB64}`);
       // Every part landed, so this is exact: a part counted twice (a re-sent one,
-      // say) would still satisfy a "at least this much" assertion.
+      // say) would still satisfy a "at least this much" assertion. It also pins
+      // §7's rule that the thumbnail is *not* counted — `uploadedBytes` is the
+      // recording's progress, and a 4 KB image arriving at the end is not
+      // progress the user is waiting on.
       expect(session.uploadedBytes, "the final part counts too, exactly once").toBe(CIPHERTEXT_BYTES);
 
       expect(progress.length, "progress is reported as parts land").toBeGreaterThanOrEqual(FULL_CHUNKS);
@@ -314,6 +348,22 @@ describe.skipIf(!E2E)("MinIO end-to-end", () => {
         const head = await fetch(objectUrl(objKey), { method: "HEAD" });
         expect(head.status, `HEAD ${objKey}`).toBe(200);
       }
+
+      // §7 gives the thumbnail PUT no way to fail the finish: it happens inside a
+      // try/catch that swallows everything and at most console.warn's. So a
+      // policy that refused it would still leave `finish()` returning a share
+      // link, and this HEAD is the only thing standing between that and a
+      // silently thumbnail-less deployment. Which is exactly the claim worth
+      // checking under the write-only key: §7 says the thumbnail adds no IAM
+      // action, so PutObject alone must already authorize thumb.bin.
+      const thumbHead = await fetch(objectUrl(thumbKey), { method: "HEAD" });
+      expect(
+        thumbHead.status,
+        `HEAD ${thumbKey} — ${creds.label} credentials must be allowed to PUT it (SPEC §7)`,
+      ).toBe(200);
+      expect(Number(thumbHead.headers.get("content-length")), "one §4 block, not re-encrypted").toBe(
+        jpeg.length + CHUNK_OVERHEAD,
+      );
 
       const head = await fetch(objectUrl(videoKey), { method: "HEAD" });
       expect(Number(head.headers.get("content-length")), "completed object is the §4 concatenation").toBe(
@@ -337,6 +387,31 @@ describe.skipIf(!E2E)("MinIO end-to-end", () => {
 
       const decoded = new TextDecoder().decode(await decryptBlock(viewerKey, metaAad(id), block));
       expect(JSON.parse(decoded)).toEqual(meta);
+    });
+
+    /**
+     * §3's thumbnail over the legacy, credentials-in-the-browser path: written
+     * by the real `UploadSession.finish()` with a direct SigV4 PUT, read back
+     * the way a library row (§17.3) and the video page's poster (§17.4) read it
+     * — one anonymous GET of `{id}/thumb.bin`, decrypted with the key out of the
+     * link fragment and nothing else.
+     */
+    it("serves thumb.bin to an anonymous reader and decrypts it with the link key", async () => {
+      const res = await fetch(objectUrl(thumbKey));
+      expect(res.status, `anonymous GET ${thumbKey}`).toBe(200);
+
+      const stored = new Uint8Array(await res.arrayBuffer());
+      expectBytesEqual(stored, thumbBlock, "thumbnail ciphertext survived the round trip");
+
+      const viewerKey = await importKeyB64(keyB64);
+      expectBytesEqual(await decryptBlock(viewerKey, thumbAad(id), stored), jpeg, "thumbnail plaintext");
+
+      // And it is bound to this video and to the thumbnail role (§4): the same
+      // block under another id's AAD, or under this id's meta AAD, is
+      // unreadable — which is what stops a thumb.bin copied between videos from
+      // silently becoming that video's picture.
+      await expect(decryptBlock(viewerKey, thumbAad(randomId()), stored)).rejects.toThrow();
+      await expect(decryptBlock(viewerKey, metaAad(id), stored)).rejects.toThrow();
     });
 
     it("Range-fetches every chunk anonymously and rebuilds the original bytes", async () => {

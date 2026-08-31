@@ -861,9 +861,10 @@ code {
   background: color-mix(in srgb, var(--surface-sunken) 45%, var(--surface));
 }
 
-/* Thumbnail placeholder: a CSS pattern, a play glyph and a duration chip. No
-   image is fetched, decoded or stored — real thumbnails are a separate item,
-   and nothing here anticipates them beyond leaving the block's shape for one
+/* The row's 16:9 block. The CSS pattern below is the *fallback*: a row also
+   tries §3's thumb.bin and, when it reads, covers the pattern with it. The
+   pattern therefore stays in the DOM of every row, so any failure — including
+   the <img>'s own error event — needs no re-render to show through
    (SPEC §17.3). */
 .thumb {
   position: relative;
@@ -927,6 +928,19 @@ code {
     );
   background-size: 46% 7%, 78% 5%, 64% 5%, 71% 5%;
   background-position: 8% 18%, 8% 38%, 8% 55%, 8% 72%;
+}
+
+/* The decrypted thumbnail (SPEC §3), over the pattern and under the glyph and
+   the chip — which follow it in the DOM and so paint above it. `cover` because
+   a portrait or 4:3 capture keeps its own shape on the way in (SPEC §6) and
+   this frame is 16:9. */
+.thumb-image {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
 }
 
 .thumb-play {

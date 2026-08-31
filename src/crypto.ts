@@ -105,6 +105,16 @@ export function chunkAad(id: string, index: number): string {
 }
 
 /**
+ * Binds the optional thumbnail block to one video *and* to the thumbnail role
+ * (SPEC §3). One block, so no index: a `thumb.bin` copied under another id's
+ * prefix fails to decrypt rather than rendering as that video's picture, and a
+ * `meta.json` renamed to `thumb.bin` fails for the same reason.
+ */
+export function thumbAad(id: string): string {
+  return `${id}:thumb`;
+}
+
+/**
  * Binds one encrypted watch-data block to one video *and* one viewing session
  * (SPEC §16.2). The analytics write endpoint is unauthenticated, so this is what
  * makes an object copied to another key — another session, or another video —

@@ -11,6 +11,7 @@ import {
   generateKey,
   importKeyB64,
   metaAad,
+  thumbAad,
 } from "../src/crypto";
 import { b64urlDecode, b64urlEncode, randomId } from "../src/util";
 import type { VideoMeta } from "../src/types";
@@ -148,6 +149,53 @@ describe("AAD strings", () => {
     expect(chunkAad("abc", 12)).toBe("abc:video:12");
     expect(chunkAad("abc", 1234)).toBe("abc:video:1234");
     expect(analyticsAad("abc", "xyz")).toBe("abc:analytics:xyz");
+    expect(thumbAad("abc")).toBe("abc:thumb");
+  });
+});
+
+/**
+ * SPEC §3/§4: `thumb.bin` is one block whose AAD names a role and an id, and
+ * that is the whole reason it does. The bucket may be publicly readable, so the
+ * cases worth pinning are the ones an operator could set up by copying objects
+ * around: a thumbnail moved under another video's prefix must not render as that
+ * video's picture, and a renamed `meta.json` must not either.
+ */
+describe("thumbnail blocks (SPEC §3)", () => {
+  const jpeg = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0xff, 0xd9]);
+
+  it("round-trips a thumbnail under its own video's AAD", async () => {
+    const key = await generateKey();
+    const id = randomId();
+
+    const block = await encryptBlock(key, thumbAad(id), jpeg);
+    expect(block.length, "one block: IV + ciphertext + tag").toBe(jpeg.length + CHUNK_OVERHEAD);
+    expectBytesEqual(await decryptBlock(key, thumbAad(id), block), jpeg, "thumbnail round-trip");
+  });
+
+  it("refuses a thumb.bin copied under another video's prefix", async () => {
+    const key = await generateKey();
+    const idA = randomId();
+    const idB = randomId();
+
+    const block = await encryptBlock(key, thumbAad(idA), jpeg);
+    await expect(decryptBlock(key, thumbAad(idB), block)).rejects.toThrow();
+  });
+
+  it("refuses a thumbnail read as meta, and meta read as a thumbnail", async () => {
+    const key = await generateKey();
+    const id = randomId();
+
+    const thumb = await encryptBlock(key, thumbAad(id), jpeg);
+    await expect(decryptBlock(key, metaAad(id), thumb)).rejects.toThrow();
+
+    const meta = await encryptBlock(key, metaAad(id), new TextEncoder().encode('{"v":1}'));
+    await expect(decryptBlock(key, thumbAad(id), meta)).rejects.toThrow();
+  });
+
+  it("refuses a thumbnail under another video's key", async () => {
+    const id = randomId();
+    const block = await encryptBlock(await generateKey(), thumbAad(id), jpeg);
+    await expect(decryptBlock(await generateKey(), thumbAad(id), block)).rejects.toThrow();
   });
 });
 

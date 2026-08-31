@@ -24,7 +24,14 @@ import "./shell.css";
 import "./record.css";
 
 import { type Auth, type AuthState, createAuth } from "./auth";
-import { CHUNK_OVERHEAD, CHUNK_SIZE, generateKey } from "./crypto";
+import {
+  CHUNK_OVERHEAD,
+  CHUNK_SIZE,
+  encryptBlock,
+  generateKey,
+  importKeyB64,
+  thumbAad,
+} from "./crypto";
 import {
   type AnalyticsDeps,
   LIBRARY_CONCURRENCY,
@@ -57,6 +64,14 @@ import {
   saveSettings,
 } from "./settings";
 import { type AccountChip, demand, initAccountChip, startRouter, type ViewName } from "./shell";
+import {
+  captureThumbnail,
+  fetchThumbnail,
+  LIBRARY_THUMB_CONCURRENCY,
+  THUMB_FIRST_TRY_MS,
+  THUMB_RETRY_MS,
+  type ThumbnailOutcome,
+} from "./thumbnail";
 import type {
   CodecChoice,
   GatewayConfig,
@@ -238,7 +253,26 @@ let codecNoted = false;
 
 let session: UploadSession | null = null;
 let videoId = "";
+/**
+ * The recording's key, retained for the life of the session (SPEC §11): the
+ * thumbnail has to encrypt with it seconds after the recording starts, and
+ * `UploadSession` deliberately grows no key accessor — widening that seam would
+ * put the key somewhere new for no gain. Cleared by the same reset as the rest.
+ */
+let videoKey: CryptoKey | null = null;
 let mimeType = "";
+
+/** SPEC §3's thumbnail, encrypted the moment it exists and held until Finish. */
+let thumbBlock: Uint8Array | null = null;
+/** The pending first-try or retry timer, or 0. */
+let thumbTimer = 0;
+/**
+ * Bumped whenever the recording this belongs to stops, is discarded or is
+ * superseded. An attempt already in flight compares against it and discards its
+ * own result: the ciphertext belongs to one recording, and there is no path by
+ * which one recording's frame can be uploaded under another's id (SPEC §6).
+ */
+let thumbAttempt = 0;
 
 /** Every emitted container slice as a Blob, retained until the share link exists (SPEC §6). */
 let recordedParts: Blob[] = [];
@@ -862,6 +896,193 @@ function thumbnail(entry: LibraryEntry, href: string | null): HTMLElement {
   return frame;
 }
 
+/**
+ * Where a row reads §3's `thumb.bin` from: `publicBaseUrl()` from config.js, in
+ * **both** modes — a thumbnail is a public read, not a gateway one. Null when
+ * config.js is missing or malformed, in which case no row fetches anything and
+ * every pattern stands, exactly as it does today (SPEC §17.3).
+ */
+const thumbBase: string | null = (() => {
+  try {
+    return publicBaseUrl();
+  } catch {
+    return null;
+  }
+})();
+
+/**
+ * Decrypted thumbnails as object URLs, by video id, for the document's lifetime;
+ * `null` records "this video has no thumbnail" so a re-render does not retry a
+ * fact. A network or transport failure is deliberately *not* recorded here — the
+ * usual cause has since gone away (SPEC §17.3, on §16.6's reasoning).
+ *
+ * A URL is revoked exactly when its id leaves `loadLibrary()`, i.e. on Remove,
+ * and never when a re-render replaces a row's DOM node — which is what "cache
+ * for the page, revoke on row removal" has to mean if both halves are to hold.
+ */
+const thumbUrls = new Map<string, string | null>();
+
+/**
+ * The image goes over the pattern rather than replacing it, so the pattern is
+ * still there for the `<img>`'s own `error` event to fall back to without a
+ * re-render. The play glyph and the duration chip follow it in the DOM and so
+ * stay above it (SPEC §17.3).
+ */
+function applyThumbnailImage(frame: HTMLElement, url: string): void {
+  if (frame.querySelector(".thumb-image")) return;
+
+  const img = document.createElement("img");
+  img.className = "thumb-image";
+  // Decoration inside an aria-hidden block: the title beside it is the row's
+  // real link, and this image says nothing a screen reader needs.
+  img.alt = "";
+  img.decoding = "async";
+  img.addEventListener("error", () => img.remove());
+  img.src = url;
+
+  const pattern = frame.querySelector(".thumb-pattern");
+  if (pattern) pattern.after(img);
+  else frame.prepend(img);
+}
+
+/**
+ * The ids the last render had rows for. It is what "still in the library" means
+ * to a load that finishes *after* a Remove: the render that would have revoked
+ * its URL has already run, so a URL minted for a departed id has to revoke
+ * itself rather than wait for a re-render that may never come (SPEC §17.3).
+ */
+let liveThumbIds: ReadonlySet<string> = new Set();
+
+/** Revokes the URLs of ids that have left the library — the Remove path (SPEC §17.3). */
+function revokeRemovedThumbnails(entries: readonly LibraryEntry[]): void {
+  // Keyed the way the cache is: by the id the row actually fetched with, which
+  // is the stored link's own — `entry.id` for anything this app wrote, and the
+  // fallback for an entry whose link no longer parses.
+  const live = new Set(entries.map((entry) => entryVideo(entry)?.id ?? entry.id));
+  liveThumbIds = live;
+  for (const [id, url] of thumbUrls) {
+    if (live.has(id)) continue;
+    if (url) URL.revokeObjectURL(url);
+    thumbUrls.delete(id);
+  }
+}
+
+interface ThumbJob {
+  generation: number;
+  video: { id: string; keyB64: string };
+  frame: HTMLElement;
+}
+
+/**
+ * A second queue beside the summaries', deliberately not a share of theirs: a
+ * summary is an authenticated gateway listing plus every session behind it, a
+ * thumbnail is one public GET of ~30 KB, and one blocking the other either way
+ * would be an accident. They share only the observer that decides a row is
+ * visible — not a counter, not a generation, not a concurrency budget (§17.3).
+ */
+let thumbGeneration = 0;
+const thumbPending: ThumbJob[] = [];
+let thumbInFlight = 0;
+
+function queueThumb(job: ThumbJob): void {
+  if (job.generation !== thumbGeneration) return;
+  thumbPending.push(job);
+  pumpThumbs();
+}
+
+function pumpThumbs(): void {
+  const base = thumbBase;
+  if (!base) return;
+
+  while (thumbInFlight < LIBRARY_THUMB_CONCURRENCY) {
+    const job = thumbPending.shift();
+    if (!job) return;
+    if (job.generation !== thumbGeneration) continue;
+
+    thumbInFlight++;
+    void loadThumb(base, job).finally(() => {
+      thumbInFlight--;
+      pumpThumbs();
+    });
+  }
+}
+
+/**
+ * The reads running right now, by video id. The cache above only starts
+ * answering once a read has *finished*, so without this a re-render that
+ * arrives mid-flight — a sign-in change, a finished recording, a Remove of some
+ * other row — sees `undefined` for a row already being fetched and starts a
+ * second fetch of the same object. Both would decrypt, both would mint a URL,
+ * and whichever lost the race to `thumbUrls` would be unreachable and never
+ * revoked. §17.3's rule is that a re-render must never refetch, redecrypt or
+ * re-mint a URL, so the second job waits on the first instead.
+ */
+const thumbReads = new Map<string, Promise<void>>();
+
+/**
+ * One row's thumbnail. Never rejects and never says anything: on any failure the
+ * pattern already in the row stands, which is a finished state rather than a gap
+ * (SPEC §3, §17.3).
+ */
+async function loadThumb(base: string, job: ThumbJob): Promise<void> {
+  const cached = thumbUrls.get(job.video.id);
+  if (cached !== undefined) {
+    if (cached && job.generation === thumbGeneration) applyThumbnailImage(job.frame, cached);
+    return;
+  }
+
+  // One read per id at a time, shared by every job that wants it — including a
+  // job of a later generation, since what it produces is cached by id and not
+  // by row.
+  let read = thumbReads.get(job.video.id);
+  if (!read) {
+    read = readThumb(base, job.video)
+      .catch(() => undefined)
+      .finally(() => thumbReads.delete(job.video.id));
+    thumbReads.set(job.video.id, read);
+  }
+  await read;
+
+  const url = thumbUrls.get(job.video.id);
+  if (url && job.generation === thumbGeneration) applyThumbnailImage(job.frame, url);
+}
+
+/**
+ * The fetch, the decrypt and the one object URL behind them — the half of a
+ * thumbnail that belongs to the video rather than to a row, which is why it
+ * writes only the by-id cache and touches no DOM.
+ */
+async function readThumb(base: string, video: { id: string; keyB64: string }): Promise<void> {
+  let key: CryptoKey;
+  try {
+    key = await importKeyB64(video.keyB64);
+  } catch {
+    // A stored link whose key is not a key is a fact about the entry.
+    thumbUrls.set(video.id, null);
+    return;
+  }
+
+  const outcome: ThumbnailOutcome = { reachable: true };
+  const blob = await fetchThumbnail(base, video.id, key, outcome);
+
+  // Removed while this was in flight: the render that revokes departed ids has
+  // already been and gone, so a URL minted now would sit unreachable until some
+  // later re-render — which may never come. Mint nothing and remember nothing;
+  // the id has no row to fill (SPEC §17.3).
+  if (!liveThumbIds.has(video.id)) return;
+
+  if (!blob) {
+    // A 404, a 403 or a block that will not decrypt is a fact about the video
+    // and is remembered; an unreachable bucket is a fact about the moment.
+    if (outcome.reachable) thumbUrls.set(video.id, null);
+    return;
+  }
+
+  // Minted once and cached by id even if every job that asked for it is stale: a
+  // later render of the same row must never refetch, redecrypt or re-mint a URL.
+  thumbUrls.set(video.id, URL.createObjectURL(blob));
+}
+
 function copyButton(entry: LibraryEntry): HTMLButtonElement {
   const copy = document.createElement("button");
   copy.type = "button";
@@ -995,9 +1216,15 @@ interface SummaryJob {
  * library re-renders.
  */
 let summaryGeneration = 0;
-let summaryObserver: IntersectionObserver | null = null;
 const summaryPending: SummaryJob[] = [];
 let summaryInFlight = 0;
+
+/**
+ * The one observer that decides a row is visible. It carries **both** queues'
+ * work — one observer, one `rootMargin`, one per-row record — so a row is never
+ * observed twice and one queue's arrival never drops the other's (SPEC §17.3).
+ */
+let rowObserver: IntersectionObserver | null = null;
 
 function queueSummary(job: SummaryJob): void {
   if (job.generation !== summaryGeneration) return;
@@ -1031,7 +1258,51 @@ function pumpSummaries(): void {
   }
 }
 
-function libraryRow(entry: LibraryEntry, index: number, summaries: boolean): HTMLLIElement {
+/** What one row still has to fetch, if anything. Both halves, one observation. */
+interface RowJobs {
+  summary?: SummaryJob;
+  thumb?: ThumbJob;
+}
+
+function startRow(jobs: RowJobs): void {
+  if (jobs.summary) queueSummary(jobs.summary);
+  if (jobs.thumb) queueThumb(jobs.thumb);
+}
+
+/**
+ * Defers a row's work until the row is visible, on the discipline §17.3 sets for
+ * the summaries and applies to the thumbnails for the same reason: a library of
+ * forty videos must not fire forty of anything the moment the page opens. With
+ * no `IntersectionObserver` at all, the first screenful loads and the rest wait
+ * for the reader to reach for them.
+ */
+function deferRow(item: HTMLLIElement, jobs: RowJobs, index: number): void {
+  if (!jobs.summary && !jobs.thumb) return;
+
+  if (rowObserver) {
+    pendingJobs.set(item, jobs);
+    rowObserver.observe(item);
+    return;
+  }
+  if (index < LIBRARY_SUMMARY_EAGER) {
+    startRow(jobs);
+    return;
+  }
+  const once = (): void => {
+    item.removeEventListener("pointerenter", once);
+    item.removeEventListener("focusin", once);
+    startRow(jobs);
+  };
+  item.addEventListener("pointerenter", once);
+  item.addEventListener("focusin", once);
+}
+
+function libraryRow(
+  entry: LibraryEntry,
+  index: number,
+  summaries: boolean,
+  thumbs: boolean,
+): HTMLLIElement {
   const item = document.createElement("li");
   item.className = "library-item";
 
@@ -1056,7 +1327,21 @@ function libraryRow(entry: LibraryEntry, index: number, summaries: boolean): HTM
   actions.className = "library-actions";
   actions.append(copyButton(entry), overflowMenu(entry));
 
-  item.append(thumbnail(entry, href), details);
+  const frame = thumbnail(entry, href);
+  item.append(frame, details);
+
+  const jobs: RowJobs = {};
+
+  // §3's thumbnail. A URL this document has already minted is applied now and
+  // costs nothing: a re-render must never refetch, redecrypt or re-mint one, and
+  // a remembered miss (null) is not retried either (SPEC §17.3).
+  if (video && thumbBase) {
+    const known = thumbUrls.get(video.id);
+    if (typeof known === "string") applyThumbnailImage(frame, known);
+    else if (known === undefined && thumbs) {
+      jobs.thumb = { generation: thumbGeneration, video, frame };
+    }
+  }
 
   // The space a summary will occupy, and nothing else until it arrives: a list
   // of spinners reads worse than a list that fills in (SPEC §17.3).
@@ -1064,32 +1349,17 @@ function libraryRow(entry: LibraryEntry, index: number, summaries: boolean): HTM
     const slot = document.createElement("div");
     slot.className = "library-summary";
     item.append(slot);
-
-    const job: SummaryJob = { generation: summaryGeneration, video, slot };
-    if (summaryObserver) {
-      pendingJobs.set(item, job);
-      summaryObserver.observe(item);
-    } else if (index < LIBRARY_SUMMARY_EAGER) {
-      queueSummary(job);
-    } else {
-      // No IntersectionObserver: the rows past the first screenful load when the
-      // reader reaches for them, which is the best "visible" this browser can say.
-      const once = (): void => {
-        item.removeEventListener("pointerenter", once);
-        item.removeEventListener("focusin", once);
-        queueSummary(job);
-      };
-      item.addEventListener("pointerenter", once);
-      item.addEventListener("focusin", once);
-    }
+    jobs.summary = { generation: summaryGeneration, video, slot };
   }
+
+  deferRow(item, jobs, index);
 
   item.append(actions);
   return item;
 }
 
 /** Rows waiting for the observer to say they are visible. */
-const pendingJobs = new WeakMap<Element, SummaryJob>();
+const pendingJobs = new WeakMap<Element, RowJobs>();
 
 /** Analytics are on, the gateway said so, and there is a token to list with. */
 function summariesAvailable(): boolean {
@@ -1103,28 +1373,47 @@ function summariesAvailable(): boolean {
  */
 let videosSeen = router.view === "videos";
 
+/** Anything a row would defer — summaries, thumbnails, or both (SPEC §17.3). */
+function librarySources(): { summaries: boolean; thumbs: boolean } {
+  return {
+    summaries: summariesAvailable() && videosSeen,
+    // No sign-in, no gateway, no `analytics: true`: a thumbnail is a §3 public
+    // read, so it loads in legacy mode too.
+    thumbs: thumbBase !== null && videosSeen,
+  };
+}
+
 function renderLibrary(): void {
   closeOpenMenu?.();
-  // Abandons every queued and in-flight summary: their results belong to rows
-  // that are about to stop existing.
+  // Abandons every queued and in-flight job of either kind: their results belong
+  // to rows that are about to stop existing. Two counters, because the two
+  // queues have different lifetimes and only one of them depends on being
+  // signed in (SPEC §17.3).
   summaryGeneration++;
   summaryPending.length = 0;
-  summaryObserver?.disconnect();
-  summaryObserver = null;
+  thumbGeneration++;
+  thumbPending.length = 0;
+  rowObserver?.disconnect();
+  rowObserver = null;
 
   const entries = loadLibrary();
+  // The only place a thumbnail URL is revoked: an id that has left the library
+  // (SPEC §17.3). A re-render on its own revokes nothing.
+  revokeRemovedThumbnails(entries);
   libraryEmpty.classList.toggle("hidden", entries.length > 0);
   libraryCount.textContent = entries.length > 0 ? librarySummaryLine(entries) : "";
 
-  const summaries = summariesAvailable() && videosSeen;
-  if (summaries && typeof IntersectionObserver === "function") {
-    summaryObserver = new IntersectionObserver(
+  const { summaries, thumbs } = librarySources();
+  // Created whenever *either* queue has work — testing only for summaries would
+  // silently cost legacy mode its lazy loading (SPEC §17.3).
+  if ((summaries || thumbs) && typeof IntersectionObserver === "function") {
+    rowObserver = new IntersectionObserver(
       (records, observer) => {
         for (const record of records) {
           if (!record.isIntersecting) continue;
           observer.unobserve(record.target);
-          const job = pendingJobs.get(record.target);
-          if (job) queueSummary(job);
+          const jobs = pendingJobs.get(record.target);
+          if (jobs) startRow(jobs);
         }
       },
       // A little ahead of the fold, so a row is usually filled in by the time it
@@ -1134,15 +1423,18 @@ function renderLibrary(): void {
   }
 
   libraryList.replaceChildren(
-    ...entries.map((entry, index) => libraryRow(entry, index, summaries)),
+    ...entries.map((entry, index) => libraryRow(entry, index, summaries, thumbs)),
   );
 }
 
 router.onChange((view) => {
   if (view !== "videos" || videosSeen) return;
   videosSeen = true;
-  // The first time the library is actually looked at is when its summaries start.
-  if (summariesAvailable()) renderLibrary();
+  // The first time the library is actually looked at is when its deferred work
+  // starts — on the broader test, so a legacy-mode library still gets its
+  // thumbnails (SPEC §17.3).
+  const { summaries, thumbs } = librarySources();
+  if (summaries || thumbs) renderLibrary();
 });
 
 // --- Capture -----------------------------------------------------------------
@@ -1231,6 +1523,82 @@ async function startCapture(useMic: boolean): Promise<Capture> {
   }
 
   return { display, mic, audio, recorded };
+}
+
+// --- Thumbnail capture (SPEC §6) ---------------------------------------------
+
+/**
+ * Arms §6's schedule: one attempt at `THUMB_FIRST_TRY_MS` from engine start
+ * and, only if that one yields nothing, one more at `THUMB_RETRY_MS`. Two
+ * attempts, never a loop — a screen still black at 2.5 s is a screen, not a
+ * race — and both timers off the recording's hot path.
+ *
+ * Every failure is silent (SPEC §6): no stage change, no `#message`, no status
+ * line, nothing the user is asked to do about it. A recording without a
+ * thumbnail is a working recording, and the reader's own fallback (SPEC §3) is
+ * already the whole story.
+ */
+function scheduleThumbnail(stream: MediaStream): void {
+  const attempt = ++thumbAttempt;
+  const armedAt = performance.now();
+  thumbTimer = window.setTimeout(() => {
+    thumbTimer = 0;
+    void tryThumbnail(stream, attempt, armedAt, true);
+  }, THUMB_FIRST_TRY_MS);
+}
+
+async function tryThumbnail(
+  stream: MediaStream,
+  attempt: number,
+  armedAt: number,
+  mayRetry: boolean,
+): Promise<void> {
+  const jpeg = await captureThumbnail(stream);
+  // Stopped, discarded, or superseded by the next recording while this was in
+  // flight: the frame belongs to a recording that is no longer the one here.
+  if (attempt !== thumbAttempt) return;
+
+  if (!jpeg) {
+    if (!mayRetry) return;
+    // Timed from engine start rather than from here: waiting for a frame has
+    // already spent some of the interval §6 measures.
+    thumbTimer = window.setTimeout(
+      () => {
+        thumbTimer = 0;
+        void tryThumbnail(stream, attempt, armedAt, false);
+      },
+      Math.max(0, armedAt + THUMB_RETRY_MS - performance.now()),
+    );
+    return;
+  }
+
+  // The id and the key of the recording this attempt belongs to, read together
+  // and only after the guard above: this is the reason `videoKey` is retained
+  // at all (SPEC §11).
+  const key = videoKey;
+  const id = videoId;
+  if (!key || !id) return;
+
+  try {
+    // Encrypted the moment the JPEG exists: a still frame of the user's screen
+    // spends milliseconds in memory as plaintext rather than the length of the
+    // recording. The ciphertext (~15–50 KB) waits here for Finish.
+    const block = await encryptBlock(key, thumbAad(id), jpeg);
+    if (attempt !== thumbAttempt) return;
+    thumbBlock = block;
+  } catch (err) {
+    console.warn("[videoshare] could not encrypt the thumbnail; the recording is unaffected", err);
+  }
+}
+
+/**
+ * Ends the schedule without dropping a thumbnail already captured — that block
+ * is what Finish uploads. Any attempt still in flight discards its own result.
+ */
+function cancelThumbnail(): void {
+  thumbAttempt++;
+  if (thumbTimer) window.clearTimeout(thumbTimer);
+  thumbTimer = 0;
 }
 
 // --- Streaming assembler -----------------------------------------------------
@@ -1432,8 +1800,12 @@ async function startRecording(): Promise<void> {
   // ten-minute take.
   const id = randomId();
   let opened: UploadSession;
+  // Kept rather than generated inline: §6's thumbnail encrypts with it a second
+  // from now, and it exists from the session's first moment (SPEC §11).
+  let key: CryptoKey;
   try {
-    opened = await createUploadSession(plan.signer, id, await generateKey(), showUploaded);
+    key = await generateKey();
+    opened = await createUploadSession(plan.signer, id, key, showUploaded);
   } catch (err) {
     releaseCapture();
     setStage("idle");
@@ -1454,6 +1826,8 @@ async function startRecording(): Promise<void> {
 
   session = opened;
   videoId = id;
+  videoKey = key;
+  thumbBlock = null;
   // A placeholder so no string from an earlier recording can survive here; the
   // engine's real one replaces it in stopped().
   mimeType = started.mimeType;
@@ -1528,6 +1902,9 @@ async function startRecording(): Promise<void> {
     showError(`Could not start the recorder. ${describe(err)}`);
     return;
   }
+  // Armed from engine start (SPEC §6), and from the recording's own stream: one
+  // code path that works on the MediaRecorder fallback too.
+  scheduleThumbnail(acquired.recorded);
   setStage("recording");
 }
 
@@ -1541,6 +1918,10 @@ function stopRecording(): void {
 async function stopped(active: RecorderEngine): Promise<void> {
   window.clearInterval(timerId);
   timerId = 0;
+  // A recording stopped before the first timer fires simply has no thumbnail,
+  // and an attempt still in flight discards its own result (SPEC §6). Whatever
+  // was already captured and encrypted stays — that is what Finish uploads.
+  cancelThumbnail();
   const durationMs = Math.max(0, Math.round(performance.now() - startedAt));
 
   // Draining a backlog can take a while on a bad network (every queued part
@@ -1692,6 +2073,11 @@ function setDownloadSource(blob: Blob | null): void {
 
 /** Drops the recording and its session. The Blobs live until here (SPEC §6). */
 function resetRecording(): void {
+  // The same reset drops §6's thumbnail state: both timers, the ciphertext and
+  // the key it was sealed with.
+  cancelThumbnail();
+  thumbBlock = null;
+  videoKey = null;
   session = null;
   engine = null;
   stopping = false;
@@ -1751,7 +2137,9 @@ async function runFinish(current: Finished, active: UploadSession): Promise<void
 
   let link: string;
   try {
-    ({ link } = await active.finish(current.tail, meta));
+    // The thumbnail goes with it — already encrypted, uploaded after the video
+    // exists and before meta, and unable to fail this call (SPEC §7).
+    ({ link } = await active.finish(current.tail, meta, thumbBlock));
   } catch (err) {
     // Nothing is lost: the Blobs are still here, and finish() can be retried
     // because it never re-adds the final chunk (SPEC §7).

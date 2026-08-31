@@ -32,6 +32,16 @@ Threat model: the bucket may be publicly readable. Everything stored is AES-GCM
 ciphertext; the key exists only in the share link's URL fragment (never sent over
 the network). Upload auth = whoever holds S3 write credentials. Viewers need nothing.
 
+What an operator of the bucket therefore learns about a video is its id, the size
+and timing of its objects, and nothing else. §3's optional `thumb.bin` adds one
+~15–50 KB ciphertext per video to that list: its existence and its size are
+visible, its contents are not, and it is decrypted by the same key as the video —
+so **a thumbnail is readable by exactly the holders of the share link**, and
+sharing the link shares the thumbnail. Two facts a user should be able to predict
+rather than discover: the image is a frame of whatever was on the shared screen
+about a second into the recording (§6), and a video recorded before this existed
+simply has no thumbnail, forever and correctly (§3).
+
 ## 2. Identifiers, keys, link format
 
 - **Video id**: 16 random bytes (`crypto.getRandomValues`), base64url encoded, no
@@ -46,22 +56,56 @@ Base64url everywhere: RFC 4648 §5, **no padding**.
 
 ## 3. Storage layout (bucket)
 
-Two objects per video, under the id as prefix:
+Two required objects per video and one optional third, under the id as prefix:
 
 | Object key         | Content                                    | Content-Type               |
 |--------------------|--------------------------------------------|----------------------------|
 | `{id}/meta.json`   | encrypted metadata (binary, despite name)  | `application/octet-stream` |
 | `{id}/video.bin`   | concatenated encrypted chunks              | `application/octet-stream` |
+| `{id}/thumb.bin`   | **optional** encrypted thumbnail: one §4 block whose plaintext is a JPEG | `application/octet-stream` |
+
+`thumb.bin` is **one** §4 encrypted block — `IV ‖ ciphertext ‖ tag`, the same
+primitives `meta.json` uses — with AAD `"{id}:thumb"`. Its plaintext is a JPEG
+image, typically 15–50 KB, so the object is typically 15–50 KB + 28 bytes. It is
+decrypted by the same key as everything else: **a thumbnail is readable by
+exactly the holders of the share link**, like the video and the watch data.
+
+Three rules make it optional rather than a fourth format version:
+
+- **Nothing in `meta.json` records whether it exists.** §5's JSON is unchanged,
+  and no reader may be taught to expect a field there.
+- **Every reader fetches and falls back.** A reader that wants a thumbnail GETs
+  `{publicBaseUrl}/{id}/thumb.bin` and, on *any* failure — 404, 403, a network
+  error, a block that will not decrypt, bytes that will not decode as an image —
+  silently keeps the placeholder it already had. There is no error surface for a
+  missing thumbnail, because a video without one is a working video: every
+  recording made before this section, and every recording whose capture or upload
+  did not work out, is in that state permanently and correctly.
+- **A reader bounds its read.** `thumb.bin` is fetched with a
+  `MAX_THUMB_BYTES` (2 MiB) ceiling — a declared `Content-Length` above it is
+  refused without reading, and a body that exceeds it while streaming is
+  abandoned. Nothing this app writes comes close; the cap is there so a reader
+  never buffers an object it did not write, on the same bounded-read principle
+  §16.3 applies to the beacon.
+
+`view.html` does not fetch it (§17: the recipient page is untouched). Only the
+two owner-side surfaces do — a library row (§17.3) and the video page's poster
+(§17.4).
 
 ## 4. Encryption format
 
 - Algorithm: AES-GCM, 256-bit key, 12-byte random IV per encryption, 16-byte tag.
-- **Encrypted block layout** (used for meta and for each video chunk):
-  `IV (12 bytes) ‖ ciphertext ‖ GCM tag (16 bytes)` — i.e. WebCrypto's
-  `encrypt()` output appended after the IV. Overhead = **28 bytes** per block.
+- **Encrypted block layout** (used for meta, for the thumbnail, and for each
+  video chunk): `IV (12 bytes) ‖ ciphertext ‖ GCM tag (16 bytes)` — i.e.
+  WebCrypto's `encrypt()` output appended after the IV. Overhead = **28 bytes**
+  per block.
 - **AAD** (UTF-8 encoded string) binds each block to its role and position:
   - meta: `"{id}:meta"`
   - video chunk i (0-based): `"{id}:video:{i}"` (decimal, no padding)
+  - thumbnail: `"{id}:thumb"` (§3) — one block, no index, so the AAD binds it to
+    one video and to the thumbnail role. A `thumb.bin` copied under another id's
+    prefix fails to decrypt rather than rendering as that video's picture, and a
+    `meta.json` renamed to `thumb.bin` fails for the same reason.
 - **Chunking**: plaintext WebM is split into `CHUNK_SIZE = 8 * 1024 * 1024`
   (8 MiB) plaintext chunks; the last chunk may be shorter. Each chunk is
   encrypted independently as a block above; blocks are concatenated in order
@@ -175,11 +219,59 @@ Two objects per video, under the id as prefix:
   probe (seek to a huge `currentTime`, wait for `durationchange`, seek back to
   0 while paused) so its controls show a real duration. The `fix-webm-duration`
   dependency is removed entirely.
+- **Thumbnail capture** (§3's `thumb.bin`), both engines, entirely off the
+  recording's hot path:
+  - **One frame, from the live display stream.** A hidden `<video>` element
+    plays a `MediaStream` carrying the display **video track only** (`muted`,
+    `playsInline`; never visible and never focusable), and one `drawImage` paints
+    it to a canvas. It is read from the *stream*, never from the WebCodecs frame
+    pipeline: the MediaRecorder fallback engine has no such pipeline, and one
+    code path that works on both is worth more than a frame the primary engine
+    could have handed over for free. The helper **never calls `track.stop()`** —
+    the track it is reading is the recording's own.
+  - **Timing**: a `setTimeout` armed from engine start fires at
+    `THUMB_FIRST_TRY_MS` (~1 s). A capture that yields nothing — the element has
+    no frame yet, `videoWidth`/`videoHeight` is 0, the painted frame is all black
+    (§11's `isBlankFrame`), the canvas or `toBlob` throws — is retried **once**
+    at `THUMB_RETRY_MS` (~2.5 s) from engine start, and then given up on. Two
+    attempts, never a loop: a screen that is still black at 2.5 s is a screen,
+    not a race.
+  - **Scaling**: `thumbSize` (§11) — the **width** capped at `THUMB_MAX_WIDTH`
+    (640), the height following from the frame's own aspect, both dimensions
+    rounded to **even** numbers, and never upscaled. Encoded with
+    `canvas.toBlob(cb, "image/jpeg", THUMB_JPEG_QUALITY)` (0.72). A 4K screen
+    therefore stores 640×360-ish and typically 15–50 KB; a portrait or 4:3
+    capture keeps its own shape and the row's 16:9 frame crops it (§17.3), which
+    is why the aspect is preserved here rather than squashed to fit.
+  - **Encrypted immediately** — `encryptBlock(key, thumbAad(id), jpeg)` — the
+    moment the JPEG exists. The key has existed since the upload session was
+    created, and encrypting now rather than at Finish means a still frame of the
+    user's screen spends milliseconds in memory as plaintext rather than the
+    length of the recording. The ciphertext is held in memory (~15–50 KB) until
+    Finish and is dropped with the rest of the recording's state on discard.
+  - **Uploaded at Finish and never before** (§7): a recording that is discarded
+    writes no `thumb.bin`, so there is no orphan to clean up and no object under
+    an id no link ever names.
+  - **Every failure is silent.** No stage changes, no `#message`, no status line,
+    nothing the user is asked to do about it — at most one `console.warn`. A
+    recording without a thumbnail is a working recording, and the reader's own
+    fallback (§3) is already the whole story.
+  - **Lifecycle**: the retry is armed only if the first attempt returned nothing,
+    so a recording that works costs exactly one attempt. Both timers are cleared
+    by the same reset that drops the recording's other state, and an attempt that
+    is already in flight when the recording stops, is discarded, or is superseded
+    by the next one **discards its own result** — the ciphertext belongs to one
+    recording, and there is no path by which one recording's frame can be
+    uploaded under another's id. A recording that is stopped before the first
+    timer fires simply has no thumbnail.
+  - Cost, stated so it can be checked: one `drawImage` and one `toBlob` per
+    attempt, at most twice per recording, both on a timer callback rather than on
+    the `ondata` path. Capture must not be perceptible in the recording.
 - Recorder page state machine: idle → picking → recording (live timer +
   streamed-upload progress, e.g. "12 MB uploaded") → preview (title input,
   replayable `<video>`, **Finish** button, Discard) → finishing (fast: final
-  part + complete + meta) → done (share link shown + auto-copied, entry added
-  to local library). Recording requires configured settings (the multipart
+  part + complete + thumb + meta) → done (share link shown + auto-copied, entry
+  added to local library). Recording requires configured settings (the multipart
   upload is created at record start); if unconfigured, open the settings panel
   instead of starting capture.
   The machine, its guards and its element ids are **unchanged** by §17; they
@@ -214,20 +306,42 @@ player and storage format are unaffected. `meta.json` remains a single PUT.
      response header is recorded.
   3. Finish → flush the remaining plaintext as the final chunk/part (any size)
      → `CompleteMultipartUpload` (POST XML listing partNumber+ETag in order)
-     → PUT `meta.json` last (a video is "complete" iff meta exists).
-  4. Discard → `AbortMultipartUpload` (DELETE `?uploadId=...`), best-effort.
+     → PUT `thumb.bin` when the recorder produced one (§6) → PUT `meta.json`
+     last (a video is "complete" iff meta exists).
+  4. Discard → `AbortMultipartUpload` (DELETE `?uploadId=...`), best-effort. No
+     `thumb.bin` was written, because nothing is written before step 3.
 - API (`upload.ts`):
   ```ts
   export interface UploadResult { id: string; link: string; }
   export interface UploadSession {
     addChunk(plain: Uint8Array): Promise<void>; // encrypt + UploadPart, sequential
-    finish(finalPlain: Uint8Array | null, meta: VideoMeta): Promise<UploadResult>;
+    /** `thumb` is §3's already-encrypted block, or null for no thumbnail. */
+    finish(finalPlain: Uint8Array | null, meta: VideoMeta,
+      thumb?: Uint8Array | null): Promise<UploadResult>;
     abort(): Promise<void>;
     readonly uploadedBytes: number;             // ciphertext bytes confirmed uploaded
   }
   export function createUploadSession(settings: Settings, id: string,
     key: CryptoKey, onProgress?: (uploadedBytes: number) => void): Promise<UploadSession>;
   ```
+- **The thumbnail's place in `finish()`**, pinned because both halves matter:
+  - **After `CompleteMultipartUpload`, before `meta.json`.** Meta stays the last
+    write and therefore the sole completion marker: a reader that finds meta may
+    or may not find a thumbnail (§3 says it must cope either way), but it never
+    finds a thumbnail for a video that does not exist.
+  - **It cannot fail the finish.** The PUT is attempted once, inside a
+    `try`/`catch` that swallows everything and at most `console.warn`s. Whatever
+    happens to it, `finish()` goes on to PUT meta and returns the share link: the
+    video and the link are the thing the user asked for, and a decorative image
+    must never be able to cost them either. It gets none of the part queue's
+    retry ladder for the same reason.
+  - **`upload.ts` never sees the plaintext.** `thumb` arrives already encrypted
+    under `thumbAad(id)` (§6), is not re-encrypted, and is not inspected. A
+    `finish()` retried after a failure re-sends it — an idempotent PUT of the
+    same bytes to the same key.
+  - `uploadedBytes` counts video parts only, as it does today: it is the
+    recording's upload progress, and a 30 KB image arriving at the end is not
+    progress the user is waiting on.
   Node-compatibility: no `window`/`XMLHttpRequest` requirement — plain `fetch`
   of signed requests is fine for parts (per-part granularity is progress enough).
 - Failure handling: each part attempt retries up to 3 times with exponential
@@ -247,6 +361,10 @@ player and storage format are unaffected. `meta.json` remains a single PUT.
   don't strand storage (AWS/R2: an `AbortIncompleteMultipartUpload` lifecycle
   rule; MinIO: the server-wide `api stale_uploads_expiry` setting — `mc ilm`
   cannot express an abort-only rule).
+  §3's `thumb.bin` adds **nothing** to this list: it is a PUT by the uploader and
+  an anonymous GET by a reader, both of which every existing example config
+  already allows. No new CORS rule, no new IAM action, no new lifecycle rule —
+  and `examples/` therefore does not change for it.
 
 ## 8. Playback
 
@@ -315,6 +433,11 @@ and where the two could be read as disagreeing, §17 wins.
   bucket. When `sizeBytes` is present the UI also shows size and effective bitrate
   (e.g. "14.2 MB · 1.9 Mbps") so compression is observable. Entries without
   `sizeBytes` (older) must render fine. The row itself is §17.3.
+  **No thumbnail field, and no thumbnail bytes in localStorage.** §3's `thumb.bin`
+  is fetched from the bucket and cached only as an object URL for the document's
+  lifetime (§17.3); recording whether one exists would be a second source of
+  truth that goes stale the moment an object is deleted, and the fetch-and-fall-back
+  rule exists precisely so nothing has to know in advance.
 
 ## 10. Viewer configuration of publicBaseUrl
 
@@ -376,6 +499,7 @@ export function encryptBlock(key: CryptoKey, aad: string, plain: Uint8Array): Pr
 export function decryptBlock(key: CryptoKey, aad: string, block: Uint8Array): Promise<Uint8Array>; // throws on tamper
 export function metaAad(id: string): string;              // `${id}:meta`
 export function chunkAad(id: string, index: number): string;
+export function thumbAad(id: string): string;             // `${id}:thumb` (§3)
 export function analyticsAad(id: string, sessionId: string): string;  // `${id}:analytics:${sessionId}` (§16)
 export function decryptChunkRange(index: number, chunkCount: number, meta: VideoMeta):
   { start: number; end: number | null };                  // byte range in video.bin (end exclusive, null = EOF)
@@ -396,9 +520,70 @@ export function publicBaseUrl(): string;                  // from window.VIDEOSH
 `upload.ts` — see §7 for the full streaming API (`createUploadSession`,
 `UploadSession`, `UploadResult`).
 
+`thumbnail.ts` — §3's thumbnail, both ends of it, split on testability the way
+`gap.ts` and `watch.ts` are: the arithmetic and the frame test are pure and are
+tested in Node; the two functions that need a canvas or a network are not.
+
+```ts
+export const THUMB_MAX_WIDTH: number;       // 640 — cap on the stored width
+export const THUMB_JPEG_QUALITY: number;    // 0.72
+export const THUMB_FIRST_TRY_MS: number;    // 1_000 — from engine start (§6)
+export const THUMB_RETRY_MS: number;        // 2_500 — from engine start; the only retry
+export const THUMB_BLANK_LEVEL: number;     // 8 — a channel at or below this counts as black
+export const MAX_THUMB_BYTES: number;       // 2 * 1024 * 1024 — reader's ceiling (§3)
+export const LIBRARY_THUMB_CONCURRENCY: number;  // 4 — library rows fetching at once (§17.3)
+
+/** Structural stand-in for ImageData, so the pure half needs no canvas. */
+export interface FrameData { width: number; height: number;
+  data: Uint8ClampedArray | ArrayLike<number>; }   // RGBA, row-major
+
+/** The even-sided box a frame is drawn into, or null when it has no usable size. */
+export function thumbSize(width: number, height: number, maxWidth?: number):
+  { width: number; height: number } | null;
+/** True when every pixel is at or below THUMB_BLANK_LEVEL in R, G and B. */
+export function isBlankFrame(frame: FrameData): boolean;
+
+/** One attempt: paint a frame of `stream`, scale, JPEG-encode. Null on any failure. */
+export function captureThumbnail(stream: MediaStream): Promise<Uint8Array | null>;
+/** GET + decrypt `{id}/thumb.bin`. Null when there is none, or none that reads (§3). */
+export function fetchThumbnail(publicBaseUrl: string, id: string, key: CryptoKey):
+  Promise<Blob | null>;   // type "image/jpeg"
+```
+
+- `thumbSize` never upscales (a frame narrower than `THUMB_MAX_WIDTH` keeps its
+  own width), preserves aspect, rounds **both** sides down to even numbers, and
+  returns `null` rather than a `0`- or `NaN`-sided box — which is exactly the
+  "zero-sized" give-up condition §6 names.
+- `isBlankFrame` reads R, G and B and ignores alpha: a canvas that was never
+  painted reads as transparent black, and so does a screen that has not started
+  delivering, and §6 treats the two the same because it cannot tell them apart
+  and does not need to.
+- `captureThumbnail` owns the hidden element and the canvas, and tears both down
+  before it resolves — including on the failure paths — without ever stopping a
+  track (§6). It swallows every error and returns `null`; the schedule (first
+  try, one retry, give up) is `record.ts`'s, because the recording's lifecycle
+  and its cancellation live there.
+- `fetchThumbnail` is the whole of §3's fetch-and-fallback rule in one place, so
+  no page re-implements it: bounded read at `MAX_THUMB_BYTES`, `decryptBlock`
+  under `thumbAad(id)`, and `null` — never a throw — for a 404, a 403, a network
+  failure, an oversized body or a block that will not decrypt. It does not
+  sniff the plaintext: anything that decrypts was written by a holder of the
+  key, and an image that will not decode is caught by the element's own `error`
+  event (§17.3, §17.4).
+- The module holds **no module-level state** and touches no DOM at import time,
+  so `video.html`'s bundle tree-shakes the capture half away and keeps only
+  `fetchThumbnail`. The object-URL cache is a page's business, not this
+  module's (§17.3).
+
 `record.ts` — page controller for `index.html`: wires the shell (§17.2), owns the
 state machine in §6 (including the internal Blob→8 MiB-chunk assembler that feeds
-`UploadSession.addChunk`) and renders the library (§17.3). `player.ts` — page
+`UploadSession.addChunk`) and renders the library (§17.3). It additionally
+**retains the recording's `CryptoKey` for the life of the session** — today the
+key is generated inline into `createUploadSession` and kept nowhere, and §6's
+thumbnail has to encrypt with it seconds after the recording starts. It is a
+module variable beside `videoId`, cleared by the same reset (§6's discard path),
+and `UploadSession` grows no key accessor: widening that seam would put the key
+somewhere new for no gain. `player.ts` — page
 controller for `view.html`. `video.ts` — page controller for `video.html` (§17.4).
 Neither `player.ts` nor `video.ts` owns §8's machinery: that is `playback.ts`, the
 shared player core both of them drive (§17.5).
@@ -438,6 +623,10 @@ from `record.css` to `shell.css` because two pages now draw them; their tokens
   or a `stats` chunk in it is a stale local build and `npm run build` on a clean tree
   must produce neither. `public/config.js` copied verbatim to `dist/`.
 - TypeScript `strict: true`. No frameworks, no other runtime deps.
+- §3's thumbnail adds **no** dependency, no external asset and no rollup input:
+  `src/thumbnail.ts` (§11) is one more module in the same graph, JPEG encoding is
+  `canvas.toBlob`, and the fallback that stands in for a missing thumbnail is the
+  CSS pattern that is already there (§17.3).
 
 ## 13. Tests
 
@@ -485,7 +674,53 @@ from `record.css` to `shell.css` because two pages now draw them; their tokens
   block round-trip; tampered byte → throws; wrong AAD (reordered chunk index) →
   throws; chunked encrypt/decrypt round-trip across ≥3 chunks incl. short
   final chunk; offset math matches actual encrypted sizes; base64url round-trip
-  incl. bytes ≥ 0x80.
+  incl. bytes ≥ 0x80. Plus §3's thumbnail binding, which is the whole reason its
+  AAD names a role and an id: `thumbAad` round-trip; a block sealed under
+  `{idA}:thumb` failing to decrypt under `{idB}:thumb` (**a thumb.bin copied to
+  another video's prefix is not that video's picture**) and under `{idA}:meta`;
+  and a `meta.json` block failing under `{idA}:thumb`.
+- `tests/thumbnail.test.ts` (vitest, Node) — the pure half of `thumbnail.ts`
+  (§11), which is where §6's give-up conditions actually live:
+  - `thumbSize`: a 4K 16:9 frame scaled to 640 wide with the height rounded to an
+    even number; a frame narrower than `THUMB_MAX_WIDTH` left at its own size
+    (never upscaled); a non-16:9 aspect (portrait, 4:3, an extreme panorama)
+    preserved; both sides even in every case; and `null` for `0`, negative,
+    `NaN` and `Infinity` in either dimension — the "zero-sized" give-up.
+  - `isBlankFrame`: an all-zero RGBA buffer → true; an all-zero buffer with full
+    alpha → true (a never-painted canvas and a black screen are the same answer);
+    every channel exactly at `THUMB_BLANK_LEVEL` → true and one pixel one step
+    above it → false, so the threshold is pinned rather than implied; a single
+    bright pixel in an otherwise black frame → false; and a frame that is bright
+    in green alone → false, so the test is not accidentally reading luminance.
+  `captureThumbnail` is **not** tested in Node, for the reason §13 already gives
+  for the encoder: there is no canvas, no `MediaStream` and no `<video>`, and a
+  stub of all three would test the stub. What it does that is worth testing —
+  the size arithmetic and the blank test — is pure and is above; what is left is
+  which DOM call happens in which order, and §6's rule that no failure of it
+  reaches the user.
+- `tests/gateway.test.ts` gains a **`put-thumb` suite**, written in the existing
+  style and mirroring the `put-meta` one case for case: no token → 401; a valid
+  token that is not whitelisted → 403; an `id` that is not 22 base64url
+  characters → 400 (and each of the ways it can fail: absent, wrong length, a
+  `/`, a `.`); the happy path returning `{ url, method: "PUT" }` whose presigned
+  URL has the `X-Amz-*` shape and `X-Amz-Expires` every other op has and whose
+  path is exactly `/{bucket}/{id}/thumb.bin` — **not** `video.bin` and **not**
+  `meta.json`; and the key-construction check the suite already makes for
+  `put-meta`, that an `objectKey` (or any other stray field) in the body changes
+  nothing about the key that comes back.
+- `tests/e2e.gateway.test.ts` gains a **thumbnail round trip** in the full-loop
+  test, which the harness supports honestly because none of it needs a browser:
+  encrypt a small JPEG-shaped payload under the video's key with
+  `thumbAad(id)`, ask the running Node adapter for a `put-thumb` URL, PUT the
+  block straight to MinIO through it, then GET `{id}/thumb.bin` **anonymously**
+  and decrypt it byte-for-byte — the same browser↔bucket path a reader takes
+  (§3), and one more object the gateway signed for and never carried. The
+  *capture* half is out of scope for e2e for the same reason it is out of scope
+  for the unit tests: Node has no canvas, and a test that fabricates the JPEG
+  proves nothing about the frame.
+- `tests/util.test.ts` and the rest of the suite are unchanged by §3's
+  thumbnail: it adds cases and deletes none, and the whole existing suite must
+  keep passing untouched.
 - `tests/e2e.minio.test.ts` (vitest, runs only when `E2E=1`): against local
   MinIO (`http://localhost:9000`, bucket `videoshare`, creds from compose file):
   generate synthetic "video" bytes (~20 MB random → 3 parts incl. short final),
@@ -520,7 +755,13 @@ from `record.css` to `shell.css` because two pages now draw them; their tokens
   against), browser support matrix, future work (camera bubble, streaming
   upload-while-recording, multipart). Its description of the product is §1's
   **three** pages — the app shell and its three views, the video page, and the
-  player recipients get (§17.9).
+  player recipients get (§17.9). Where it describes what a recording puts in the
+  bucket, **one factual sentence** covers §3's thumbnail: a third, optional
+  object per video, one encrypted frame of the recording (~15–50 KB), decrypted
+  by the same link key, and absent on anything recorded before it existed. Plain
+  facts in the register the file was just rewritten to — not a feature
+  announcement, no marketing voice, and no promise of a thumbnail on
+  `view.html`, which does not have one (§3).
 
 ## 15. Gateway (optional): server-side credentials, presigned uploads
 
@@ -583,12 +824,26 @@ answers CORS preflights itself and echoes only origins in `ALLOWED_ORIGINS`.
   - `{ op: "abort", id, uploadId }` → `{ url, method: "DELETE" }`
   - `{ op: "put-meta", id }` → presigned PUT for `{id}/meta.json` →
     `{ url, method: "PUT" }`
+  - `{ op: "put-thumb", id }` → presigned PUT for `{id}/thumb.bin` (§3) →
+    `{ url, method: "PUT" }`
   Validation (400 on failure): `id` must match `^[A-Za-z0-9_-]{22}$`; object
   keys are constructed server-side as exactly `{id}/video.bin` /
-  `{id}/meta.json` — the client can never influence any other key; `uploadId`
-  and `partNumbers` are syntax-checked and passed through as query params
-  (URL-encoded). Auth failures: 401 (bad/expired token), 403 (valid token,
-  email not allowed).
+  `{id}/meta.json` / `{id}/thumb.bin` — the client can never influence any other
+  key; `uploadId` and `partNumbers` are syntax-checked and passed through as
+  query params (URL-encoded). Auth failures: 401 (bad/expired token), 403 (valid
+  token, email not allowed).
+
+  **`put-thumb` mirrors `put-meta` exactly** and adds nothing else: same auth,
+  same id validation, same 400s, same `{ url, method: "PUT" }` shape, same
+  `X-Amz-Expires`, one more `thumbKey(id)` beside `metaKey(id)` in `presign.ts`
+  and one more arm in `parseSignRequest` and in the presigner's switch. In
+  particular it is **not** a new route and **not** a new body shape: it is a
+  sixth `op` on `POST /api/sign`. §15's no-proxy invariant is untouched — the
+  gateway signs a URL and the ~15–50 KB of ciphertext goes browser↔bucket, like
+  every other object. This is the **only** change §3's thumbnail makes to the
+  `gateway/` package: `core.ts` routes on paths, not ops, and `worker.ts`,
+  `lambda.ts` and `node.ts` are thin transport translations that enumerate no op,
+  so all four files are untouched.
 
 ### 15.4 Authentication (stateless)
 
@@ -638,6 +893,14 @@ token itself must never be logged.
   `/api/sign`; batches part URLs ahead of need, e.g. 8 at a time, so signing
   never stalls the upload queue). `UploadSession` logic is otherwise
   unchanged; presigned URLs are used exactly like signed requests today.
+  The seam carries **six** ops, not five: `SignOp` gains
+  `{ kind: "put-thumb"; id }`, the method table maps it to `PUT`, and
+  `LocalSigner`'s path-style URL builder maps it to `{endpoint}/{bucket}/{id}/thumb.bin`
+  — the direct SigV4 PUT `meta.json` already gets, against a different key.
+  `GatewaySigner` needs no new code at all beyond the union member: a `put-thumb`
+  is a one-URL op and takes the same unbatched `askForUrl` path `put-meta`,
+  `create`, `complete` and `abort` take. As with every other op, the key is the
+  signer's to derive from `id` and never crosses the seam.
 - On a 401 mid-session, the client re-acquires an ID token silently (GIS
   `prompt()` with auto-select) and retries once; if that fails, the part
   queue's existing retry/degraded path applies and the UI shows a re-sign-in
@@ -660,9 +923,9 @@ exp/unverified email → 401; non-whitelisted → 403; suffix matching), key-sha
 enforcement (op/id/partNumbers validation), presigned URL shape (X-Amz-*
 params, expiry), CORS allowlist. E2E (vitest, `E2E=1`): start the Node adapter
 in-process against local MinIO and drive the full client path — GatewaySigner
-multipart upload (≥3 parts), complete, meta PUT, then anonymous ranged
-download/decrypt byte-compare; plus abort; plus a rejected non-whitelisted
-token. R2's presigned UploadPart support is community-confirmed only, so the
+multipart upload (≥3 parts), complete, thumb PUT, meta PUT, then anonymous
+ranged download/decrypt byte-compare; plus abort; plus a rejected
+non-whitelisted token. R2's presigned UploadPart support is community-confirmed only, so the
 first real-R2 deployment MUST run a smoke upload before rollout (documented).
 
 ### 15.7 Docs & examples
@@ -1335,6 +1598,15 @@ video and nothing else, with an Engagement section that explains itself in one
 sentence and makes no request. §9's settings and §10's "viewers are strangers" are
 otherwise untouched.
 
+What this section is about is **analytics**, and §3's thumbnail is not analytics: a
+`thumb.bin` GET is an anonymous public read of the video bucket, the same kind of
+request §8 already makes for `meta.json`, and it happens in **both** modes on both
+owner-side pages. "Plain rows" above means no summary, no bearer and no gateway
+call — not no picture. The guarantee that does not move: `view.html` gains no
+request of any kind (§3), legacy mode still sends nothing to a gateway, still
+mints no id and still writes no new storage key, and the only new bytes anywhere
+are one public GET per visible library row and one per video page.
+
 ### 16.8 Privacy guarantees
 
 What an operator of the gateway and the analytics bucket **can** learn:
@@ -1362,6 +1634,12 @@ What they **cannot** learn without the share link:
 Said the other way round, which is the sentence the README owes a reader: **watch data
 is readable by exactly the holders of the share link. Sharing the link shares the
 analytics.**
+
+This section is about the analytics bucket and nothing in it changes for §3's
+thumbnail, which lives in the *video* bucket, is written by the uploader rather
+than the gateway, and never passes through this service in either direction — the
+gateway signs a `put-thumb` URL (§15.3) and carries no byte of it. The video
+bucket's own disclosure is §1's, extended there.
 
 ### 16.9 Tests
 
@@ -1538,7 +1816,11 @@ theme then has to be as considered as the dark one: the mockups do not show it, 
 inverts" is not a design.
 
 No new runtime dependency, no external asset, no webfont, no chart library, no canvas:
-everything below is DOM, CSS and inline SVG, the way §16.6's heatmap already was.
+everything below is DOM, CSS and inline SVG, the way §16.6's heatmap already was — plus,
+since §3, one `<img>` per library row and one `poster` attribute on the video page, whose
+bytes come out of the bucket rather than out of the repo. The "no canvas" here is about
+*drawing the interface*: §6 paints one frame to a canvas to make a thumbnail, and nothing
+in §17 draws anything into one.
 Pixel values in the mockups are guidance. This section pins **structure, states and
 behaviour**, and where a mockup and this section disagree, this section is the contract.
 
@@ -1666,12 +1948,52 @@ An empty library keeps today's empty state, unchanged in substance.
 
 One card per entry, newest first (§9's order):
 
-1. **Thumbnail placeholder** — a 16:9 block: a CSS-only pattern, a play glyph and a
-   duration chip reading `formatDuration(entry.durationMs)`. No image is fetched, decoded
-   or stored — real thumbnails are a separate upcoming item, and nothing here anticipates
-   them beyond leaving the block's shape for one. The pattern's variant is **derived from
-   `entry.id`** by a pure function, so a row looks the same on every reload; it is
-   decoration and it is `aria-hidden`.
+1. **Thumbnail** — a 16:9 block: the CSS-only pattern, a play glyph and a duration chip
+   reading `formatDuration(entry.durationMs)`. The pattern's variant is **derived from
+   `entry.id`** by a pure function, so a row looks the same on every reload; the whole
+   block is decoration and it is `aria-hidden`.
+   The pattern is now the **fallback**, not the only state: a row also tries §3's
+   `thumb.bin` and, when it reads, shows it as an `<img>` filling the frame
+   (`object-fit: cover`, `alt=""`, inside the same `aria-hidden` block) with the play
+   glyph and the duration chip still over it. On any failure — including the `<img>`'s own
+   `error` event — the pattern stands and nothing is said (§3). The pattern therefore
+   stays in the DOM of every row and is what the image covers, so the fallback needs no
+   re-render to appear.
+   **What it costs, and how that is bounded** (the discipline is §17.3's own, below, for
+   the summaries — the same rules, a second queue):
+   - the base is `publicBaseUrl()` from `config.js` (§10), in **both** modes. A
+     deployment whose `config.js` is missing or malformed fetches nothing and every row
+     keeps its pattern, exactly as it does today;
+   - `{ id, keyB64 }` comes from `entryVideo(entry)` — the stored link's own fragment,
+     through `parseShareFragment`, never written anywhere but the decrypt (§17.3's rule
+     for the row's `href`). An entry with no parseable fragment fetches nothing;
+   - a row's thumbnail loads **when the row is visible**, on the same
+     `IntersectionObserver` — one observer, one `rootMargin`, one per-row record now
+     carrying *both* a summary job and a thumbnail job, so a row is never observed twice
+     and one queue's arrival never drops the other's — with the same
+     `LIBRARY_SUMMARY_EAGER` "first screenful" fallback for a browser that has no
+     observer. At most `LIBRARY_THUMB_CONCURRENCY` (4) fetches in flight, and the queue is
+     abandoned when the library re-renders: a second generation counter beside the
+     summaries', not a share of theirs, because the two have different lifetimes and only
+     one of them depends on being signed in;
+   - **thumbnails do not depend on sign-in, on a gateway, or on `analytics: true`.** They
+     are a §3 public read, so unlike a summary they load in legacy mode too, and they
+     start when the videos view is first shown for the same reason summaries do. Two
+     conditions today are written as "summaries are available" and must become "anything
+     is deferred", or legacy mode silently loses its lazy loading: the observer is created
+     whenever **either** queue has work, not only when summaries do, and the first
+     transition into the videos view re-renders the library on the same broader test.
+     Nothing else about the render is conditional — a row is built the same way in both
+     modes, and it is what fills it in that differs;
+   - **Object-URL lifecycle**: a decrypted thumbnail is turned into one object URL,
+     cached **by video id for the document's lifetime**, and reused by every later render
+     of that row — a re-render must never refetch, redecrypt or re-mint a URL. A *miss*
+     (404, 403, a block that will not decrypt) is cached too, as "this video has no
+     thumbnail", so a re-render does not retry a fact; a **network or transport failure is
+     not cached**, on §16.6's reasoning that the usual cause has since gone away. A URL is
+     revoked exactly when its id leaves `loadLibrary()` — i.e. on Remove — and **not**
+     when a row's DOM node is replaced by a re-render, which is what "cache for the page,
+     revoke on row removal" has to mean if both halves are to be true at once.
 2. **Title** — `entry.title || "Untitled recording"`, and the row's link.
 3. **Meta line** — today's `librarySubtitle(entry)`, unchanged: created date
    (`toLocaleString()`) · duration · size · effective bitrate, the last two only when
@@ -1709,6 +2031,14 @@ clear on sign-out. A row whose summary has not arrived shows the space it will o
 nothing else: no per-row spinner, because a list of spinners reads worse than a list that
 fills in.
 
+The thumbnail queue above follows the same discipline for the same reason, and is
+deliberately a **separate** queue: a summary is an authenticated gateway listing plus every
+session behind it, a thumbnail is one public GET of ~30 KB, and one blocking the other
+either way would be an accident. They share the observer that decides a row is visible,
+and nothing else — not a counter, not a generation, not a concurrency budget. A thumbnail
+that has not arrived is the pattern, which is a finished state rather than a gap, so it
+needs no placeholder of its own.
+
 ### 17.4 The video page (`video.html`, `src/video.ts`)
 
 The owner's page for one video: the same video a share link plays, and everything the
@@ -1739,6 +2069,21 @@ exactly as `view.html` does, and the rules are the same ones.
   **not built**: there is no second action this page can perform honestly (a video page
   opened from a link in another browser has no library entry to remove), and an empty menu
   is worse than no menu.
+- **Poster** — §3's `thumb.bin`, when it reads, becomes the `<video>`'s `poster` (an
+  object URL) so the hero shows the recording instead of a black rectangle while the first
+  chunk is fetched and decrypted. Same silent fallback as everywhere else: no thumbnail,
+  no poster, no message, and the hero's existing loading treatment stands.
+  - The fetch is started as soon as the key is imported and is **never awaited**: it runs
+    beside `fetchMeta` and `startPlayback`, and nothing about playback waits on a
+    decorative image. It is one `fetchThumbnail` call, not a queue — one video, one
+    document.
+  - The poster is applied whenever it lands. Once a frame has painted the element ignores
+    it, which is the correct outcome and needs no guard; the same object URL lives for the
+    document and is not revoked, because there is exactly one of it and the page owns it
+    until it goes.
+  - This is `video.ts`'s own chrome, not the player core's: `playback.ts` gains nothing
+    for it (§17.5), and `view.html` is untouched — a recipient's page makes no thumbnail
+    request and gets no poster.
 - **Player** — the shared core (§17.5) in a framed 16:9 hero, with the browser's own
   `controls`, as `view.html` uses. `video.css` styles the frame; the mockup's drawn
   control bar is illustrative and is not a request for a custom one. The page **does not
@@ -1887,7 +2232,11 @@ What §17 must not lose, stated so it can be checked:
 - the overflow menu: `aria-haspopup`/`aria-expanded`, Escape closes it, focus returns to
   the trigger;
 - decoration marked `aria-hidden` (the thumbnail pattern, the glyphs), and each heatmap
-  keeping the `role="img"` and real label it has today;
+  keeping the `role="img"` and real label it has today. A row's real thumbnail (§17.3) is
+  decoration on the same terms: it lives inside the `aria-hidden` frame, carries `alt=""`,
+  and adds nothing to the accessibility tree — the row's name is its title, and "a frame
+  of the video" is not information a screen reader can use. Likewise the video page's
+  poster, which is an attribute of the player and never an announced image;
 - messages in live regions, as `#message`, `#settings-status` and `#recording-status`
   already are;
 - `prefers-reduced-motion`: no pulse, no slide, no animated bar growth — every transition
@@ -1902,8 +2251,12 @@ What §17 must not lose, stated so it can be checked:
 `index.html`'s topbar and single-column card stack (`.topbar`, `.page-head`, and the
 `<details>` framing of the settings and recording-options panels); `record.ts`'s
 `recordedCodec` + `CODEC_NAMES` and `upload.ts`'s `shareLink`, **moved** to `util.ts`
-(§11) rather than copied. `view.html`, `player.css`, `gateway/` and everything in §§2–8,
-§15 and §16.1–16.5 are untouched.
+(§11) rather than copied. `view.html` and `player.css` are untouched, and were untouched
+by §17 as written; the claim that `gateway/` and §§2–8, §15 and §16.1–16.5 are untouched
+was §17's own scope statement and is **superseded** by §3's thumbnail, which amends §3,
+§4, §6, §7, §15.3 and §15.5 and adds one op to `gateway/src/presign.ts`. What survives
+that amendment unchanged, and is the part worth stating: **`view.html` and `player.css`,
+still**. A recipient cannot tell that either §17 or §3's thumbnail happened.
 
 ### 17.9 Docs
 

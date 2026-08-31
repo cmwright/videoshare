@@ -35,7 +35,10 @@ The site is three static pages:
   WebCrypto, and sends the ciphertext to your bucket *while you are still
   recording*: every 8 MiB goes up as one part of a SigV4-signed S3 multipart
   upload, so stopping only leaves the tail to flush before the link is ready. One chunk is encrypted at a time, so an hour-long
-  recording costs no more memory than a one-minute one. **Settings** holds the
+  recording costs no more memory than a one-minute one. Beside the video and its
+  metadata, a recording writes one optional third object: a thumbnail — a single
+  frame from its first seconds, ~15–50 KB, encrypted under the same link key, and
+  absent from anything recorded before it existed. **Settings** holds the
   bucket credentials and the encoder choices. All of it — settings and the
   library of your links — lives in `localStorage`, and a recording keeps
   uploading whichever view you are looking at.

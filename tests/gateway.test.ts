@@ -824,6 +824,7 @@ describe("POST /api/sign — presigned URLs", () => {
       { op: "complete", id, uploadId: UPLOAD_ID },
       { op: "abort", id, uploadId: UPLOAD_ID },
       { op: "put-meta", id },
+      { op: "put-thumb", id },
     ]) {
       const answer = await sign(body);
       expect(answer.status, answer.text).toBe(200);
@@ -865,6 +866,90 @@ describe("POST /api/sign — presigned URLs", () => {
     const answer = await sign({ op: "create", id }, { envOverrides: { BUCKET_REGION: undefined } });
     expect(answer.status, answer.text).toBe(200);
     expectPresigned(answer.json.url, videoKey, { region: "auto" });
+  });
+});
+
+// --- put-thumb (SPEC §3, §15.3) ----------------------------------------------
+
+/**
+ * The thumbnail op is `put-meta` with one field of the key changed, and this
+ * suite says so case for case: the same auth, the same id validation, the same
+ * `{ url, method: "PUT" }`, the same expiry — and a path that is `thumb.bin` and
+ * could not be talked into being anything else. It is a sixth `op` on
+ * `POST /api/sign`, not a new route and not a new body shape, so nothing here
+ * exercises `core.ts` differently from the five ops above; that sameness is the
+ * point.
+ */
+describe("POST /api/sign — put-thumb", () => {
+  const id = randomId();
+  const thumbKey = `${id}/thumb.bin`;
+
+  it("presigns a PUT against thumb.bin, not video.bin and not meta.json", async () => {
+    const answer = await sign({ op: "put-thumb", id });
+
+    expect(answer.status, answer.text).toBe(200);
+    expect(answer.json.method).toBe("PUT");
+    const url = expectPresigned(answer.json.url, thumbKey);
+
+    // Stated as a bare path equality too: a thumbnail signed against `meta.json`
+    // would overwrite the metadata of a working video, and one signed against
+    // `video.bin` would destroy the recording itself.
+    expect(url.pathname).toBe(`/${BUCKET}/${thumbKey}`);
+    expect(url.pathname).not.toContain("video.bin");
+    expect(url.pathname).not.toContain("meta.json");
+    // A single-object PUT: none of multipart's query parameters belong on it.
+    expect(url.searchParams.has("uploads")).toBe(false);
+    expect(url.searchParams.has("uploadId")).toBe(false);
+    expect(url.searchParams.has("partNumber")).toBe(false);
+  });
+
+  it("carries the same X-Amz-Expires every other op gets", async () => {
+    const answer = await sign({ op: "put-thumb", id }, { envOverrides: { PRESIGN_EXPIRY_SECONDS: "120" } });
+
+    expect(answer.status, answer.text).toBe(200);
+    expect(new URL(answer.json.url as string).searchParams.get("X-Amz-Expires")).toBe("120");
+  });
+
+  it("rejects a request with no Authorization header", async () => {
+    expectError(await sign({ op: "put-thumb", id }, { token: null }), 401, "put-thumb, no bearer");
+  });
+
+  it("refuses a valid token from an address that is not whitelisted", async () => {
+    // 403, not 401: a real identity that simply may not upload (SPEC §15.3).
+    const token = await mintToken({ email: "carol@example.com", emailVerified: true });
+    expectError(await sign({ op: "put-thumb", id }, { token }), 403, "put-thumb, not whitelisted");
+  });
+
+  const badIds: Array<[string, unknown]> = [
+    ["absent", undefined],
+    ["21 characters", "aaaaaaaaaaaaaaaaaaaaa"],
+    ["23 characters", "aaaaaaaaaaaaaaaaaaaaaaa"],
+    ["a slash", "aaaaaaaaaaa/aaaaaaaaaa"],
+    ["a dot", "aaaaaaaaaaa.aaaaaaaaaa"],
+    ["a traversal attempt", "../../../etc/passwd222"],
+  ];
+
+  it.each(badIds)("rejects an id that is %s with 400", async (_label, badId) => {
+    const body = badId === undefined ? { op: "put-thumb" } : { op: "put-thumb", id: badId };
+    expectError(await sign(body), 400, `put-thumb id=${String(badId)}`);
+  });
+
+  it("builds the object key itself and ignores anything else in the body", async () => {
+    const answer = await sign({
+      op: "put-thumb",
+      id,
+      // The key the caller would love to control — including the two keys of
+      // this very video, which is what makes a thumbnail worth stealing a signature for.
+      key: "../../etc/passwd",
+      objectKey: `${randomId()}/video.bin`,
+      Key: `${id}/meta.json`,
+      bucket: "not-your-bucket",
+      endpoint: "https://attacker.example.net",
+      method: "GET",
+    });
+
+    expect(answer.status, answer.text).toBe(200);
+    expectPresigned(answer.json.url, thumbKey);
   });
 });
 
