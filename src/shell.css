@@ -64,10 +64,16 @@
 /* --- Sidebar -------------------------------------------------------------- */
 
 .sidebar {
+  position: sticky;
+  top: 0;
   display: flex;
   flex: none;
   flex-direction: column;
   width: var(--sidebar-width);
+  /* Its own scroll pane: viewport-height, so the account chip sits at the
+     bottom of the screen, not the bottom of a long video list. */
+  height: 100dvh;
+  overflow-y: auto;
   padding: var(--space-5) var(--space-3) var(--space-4);
   border-right: 1px solid var(--border);
   background: var(--sidebar-bg);
@@ -631,6 +637,8 @@
     align-items: center;
     gap: var(--space-4);
     width: auto;
+    height: auto;
+    overflow-y: visible;
     padding: var(--space-2) var(--space-4);
     border-right: none;
     border-bottom: 1px solid var(--border);
