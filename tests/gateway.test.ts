@@ -1204,7 +1204,7 @@ describe("POST /beacon/{videoId}/{sessionId}", () => {
   it("decodes an enc=b64 body and stores the raw ciphertext", async () => {
     const block = ciphertext();
     const text = Buffer.from(block).toString("base64url");
-    const answer = await beacon(`/sessions/${randomId()}/${randomId()}?enc=b64`, { body: text });
+    const answer = await beacon(`/sessions/${randomId()}/${randomId()}?enc=b64`, { body: new TextEncoder().encode(text) });
     expect(answer.status, answer.text).toBe(204);
     const stored = puts();
     expect(stored).toHaveLength(1);
@@ -1213,7 +1213,7 @@ describe("POST /beacon/{videoId}/{sessionId}", () => {
 
   it("rejects an enc=b64 body that is not base64url with 400", async () => {
     for (const bad of ["not valid ~ base64!", "with=padding", "has\nnewline"]) {
-      const answer = await beacon(`/sessions/${randomId()}/${randomId()}?enc=b64`, { body: bad });
+      const answer = await beacon(`/sessions/${randomId()}/${randomId()}?enc=b64`, { body: new TextEncoder().encode(bad) });
       expect(answer.status, `${JSON.stringify(bad)}: ${answer.text}`).toBe(400);
     }
     expect(puts()).toHaveLength(0);
@@ -1222,8 +1222,8 @@ describe("POST /beacon/{videoId}/{sessionId}", () => {
   it("bounds enc=b64 by the DECODED size: 16384 encoded passes, 16385 does not", async () => {
     const fits = Buffer.alloc(16384, 7).toString("base64url");
     const over = Buffer.alloc(16385, 7).toString("base64url");
-    expect((await beacon(`/sessions/${randomId()}/${randomId()}?enc=b64`, { body: fits })).status).toBe(204);
-    expect((await beacon(`/sessions/${randomId()}/${randomId()}?enc=b64`, { body: over })).status).toBe(413);
+    expect((await beacon(`/sessions/${randomId()}/${randomId()}?enc=b64`, { body: new TextEncoder().encode(fits) })).status).toBe(204);
+    expect((await beacon(`/sessions/${randomId()}/${randomId()}?enc=b64`, { body: new TextEncoder().encode(over) })).status).toBe(413);
   });
 });
 
