@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+  <!-- The brand mark from the topbar wordmark, filled so it reads at 16px.
+       Colors follow the OS theme the way the site's tokens do. -->
+  <style>
+    .frame { fill: #2563eb; }
+    .play { fill: #ffffff; }
+    @media (prefers-color-scheme: dark) {
+      .frame { fill: #60a5fa; }
+      .play { fill: #0b0f14; }
+    }
+  </style>
+  <rect class="frame" x="0.75" y="4.5" width="18.5" height="11" rx="2.5" />
+  <path class="play" d="M8.1 7.1 L13.7 10 L8.1 12.9 Z" />
+</svg>
