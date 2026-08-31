@@ -213,7 +213,25 @@ async function handleBeaconWrite(
   // like an oversized one rather than 400 — the client never sends one either
   // way (an AES-GCM block is at least 28 bytes), so this is purely about
   // matching the stated contract instead of inventing a second status for it.
-  const body = await readBoundedBytes(request, MAX_BEACON_BYTES);
+  //
+  // `enc=b64` (what the client always sends, SPEC §16.3): the body is the
+  // ciphertext as base64url TEXT, because a text/plain body can be decoded to
+  // a UTF-8 string by the transport (AWS API Gateway, Lambda URLs) and raw
+  // ciphertext does not survive that. The size contract stays on the DECODED
+  // bytes; the encoded read is bounded at 4/3 of the cap. No `enc` is the raw
+  // binary form older deployed pages still send.
+  const encoded = new URL(request.url).searchParams.get("enc") === "b64";
+  let body: Uint8Array | null;
+  if (encoded) {
+    const text = await readBoundedBytes(request, Math.ceil(MAX_BEACON_BYTES / 3) * 4 + 4);
+    body = text === null ? null : decodeB64url(text);
+    if (text !== null && body === null) {
+      return jsonResponse({ error: "enc=b64 body must be base64url text." }, 400, cors);
+    }
+    if (body !== null && body.byteLength > MAX_BEACON_BYTES) body = null;
+  } else {
+    body = await readBoundedBytes(request, MAX_BEACON_BYTES);
+  }
   if (body === null || body.byteLength === 0) {
     return jsonResponse({ error: "Beacon body must be 1 to 16384 bytes." }, 413, cors);
   }
@@ -291,6 +309,31 @@ async function readBoundedText(request: Request, limit: number): Promise<string 
 }
 
 /** The same read, left as bytes: a beacon body is ciphertext, not text. */
+/**
+ * Strict, unpadded base64url → bytes, or null. `atob` exists in all three
+ * runtimes (Workers, Node ≥ 16, Lambda's Node). The charset check comes first
+ * so `+`, `/`, `=`, whitespace and everything else base64 variants allow is a
+ * 400, not a silently different decode.
+ */
+function decodeB64url(bytes: Uint8Array): Uint8Array | null {
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    return null;
+  }
+  if (text.length === 0 || !/^[A-Za-z0-9_-]+$/.test(text)) return null;
+  const b64 = text.replace(/-/g, "+").replace(/_/g, "/");
+  try {
+    const raw = atob(b64 + "=".repeat((4 - (b64.length % 4)) % 4));
+    const out = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+    return out;
+  } catch {
+    return null;
+  }
+}
+
 async function readBoundedBytes(request: Request, limit: number): Promise<Uint8Array | null> {
   const declared = Number(request.headers.get("Content-Length"));
   if (Number.isFinite(declared) && declared > limit) return null;

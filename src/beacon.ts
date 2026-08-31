@@ -26,7 +26,7 @@
  */
 
 import { analyticsAad, encryptBlock } from "./crypto";
-import { randomId } from "./util";
+import { b64urlEncode, randomId } from "./util";
 import {
   advance,
   BEACON_INTERVAL_MS,
@@ -126,8 +126,13 @@ export function startWatchBeacon(video: HTMLMediaElement, opts: BeaconOptions): 
   /** One session = one page load = one storage object (SPEC §16.1). */
   const sessionId = randomId();
   // "/sessions", not "/beacon": ad-block filter lists match "/beacon/" on
-  // cross-site requests, killing the send before any HTTP (SPEC §16.3).
-  const url = `${opts.gatewayUrl}/sessions/${opts.videoId}/${sessionId}`;
+  // cross-site requests, killing the send before any HTTP. `enc=b64` says the
+  // body is base64url text, not raw bytes: the body must travel as text/plain
+  // (the one type sendBeacon sends preflight-free), and a text-typed body can
+  // be decoded to a UTF-8 *string* by the transport — AWS API Gateway and
+  // Lambda URLs do — which corrupts raw ciphertext irreparably. Base64 is
+  // valid UTF-8, so the string round-trip is lossless everywhere (SPEC §16.3).
+  const url = `${opts.gatewayUrl}/sessions/${opts.videoId}/${sessionId}?enc=b64`;
   const aad = analyticsAad(opts.videoId, sessionId);
 
   let firstPlayedAt: string | null = null;
@@ -184,7 +189,9 @@ export function startWatchBeacon(video: HTMLMediaElement, opts: BeaconOptions): 
 
   const send = async (json: string): Promise<boolean> => {
     const block = await encryptBlock(opts.key, aad, utf8.encode(json));
-    const blob = new Blob([block as Uint8Array<ArrayBuffer>], { type: BEACON_CONTENT_TYPE });
+    // Base64url, matching `enc=b64` in the URL (SPEC §16.3): the ciphertext as
+    // text that survives any transport's string decode.
+    const blob = new Blob([b64urlEncode(block)], { type: BEACON_CONTENT_TYPE });
     return navigator.sendBeacon(url, blob);
   };
 

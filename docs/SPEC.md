@@ -1046,7 +1046,18 @@ and on a gateway that is cross-site from the pages — a Lambda URL, workers.dev
 — those lists kill the request before any HTTP happens. Clients say
 `/sessions`; the gateway answers both.)
 
-- Sent with `navigator.sendBeacon(url, blob)`, body = the raw ciphertext bytes.
+- Sent with `navigator.sendBeacon(url, blob)`, body = the ciphertext as
+  **unpadded base64url text**, and the URL carries `?enc=b64` to say so. The
+  body must be `text/plain` (the one content type `sendBeacon` sends without a
+  preflight that would strand the `pagehide` flush), and a text-typed body may
+  be decoded to a UTF-8 *string* by the transport — AWS API Gateway and Lambda
+  function URLs do exactly that — which corrupts raw ciphertext irreparably.
+  Base64url is valid UTF-8, so the string round-trip is lossless on every
+  transport. The gateway rejects an `enc=b64` body that is not strict
+  base64url with 400; without `enc` it stores the body as raw bytes, the
+  original wire form, kept only for pages deployed before this paragraph. All
+  size bounds below apply to the **decoded** bytes; the encoded read itself is
+  bounded at ⌈`MAX_BEACON_BYTES`/3⌉·4+4.
   `sendBeacon` cannot set headers, so **all routing lives in the path**. The Blob's
   type is `text/plain;charset=UTF-8`: a CORS-safelisted content type, chosen so that
   no preflight can strand a beacon fired at `pagehide`. The bytes are unaffected by
