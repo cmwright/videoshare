@@ -95,10 +95,12 @@ variable "dns_records" {
     Plain DNS records, keyed by an arbitrary name for the resource address.
     Empty by default.
 
-    This is deliberately NOT where the site, videos and gateway hostnames go:
-    Pages custom domains, Worker custom domains and R2 custom domains each
-    create and own their own proxied CNAME, and a cloudflare_record for the same
-    name fights them on every apply.
+    Worker custom domains and R2 custom domains create and own their own
+    proxied CNAME — do not also list those hostnames here, a cloudflare_record
+    for the same name fights them on every apply. A PAGES custom domain
+    attached through the API does NOT create its record (the dashboard flow
+    does), so the site hostname's CNAME belongs here, proxied, pointing at
+    `{pages_project}.pages.dev`.
 
     It is for records that belong to nothing else — most usefully the two the
     AWS module hands you when the site lives on S3 and CloudFront: the ACM

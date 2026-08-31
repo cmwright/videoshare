@@ -57,6 +57,12 @@ resource "cloudflare_workers_domain" "gateway" {
 # configured once in the dashboard and then redeploys on push, and there is
 # nothing for Terraform to keep in sync.
 #
+# UNLIKE a Worker custom domain, this does NOT create the DNS record — the
+# dashboard flow adds the CNAME for you, the API does not (found on the first
+# greenfield apply: the domain attached, the hostname resolved nowhere). Put
+# the site's CNAME in dns_records, proxied, pointing at
+# `{pages_project}.pages.dev`.
+#
 #   terraform import cloudflare_pages_domain.site[0] <account_id>/<project_name>/<domain>
 resource "cloudflare_pages_domain" "site" {
   count = var.site_hostname != "" && var.pages_project != "" ? 1 : 0
