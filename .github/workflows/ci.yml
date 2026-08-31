@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx vitest run
+      - run: npm run build
+      - name: Gateway typecheck
+        run: |
+          cd gateway
+          npm ci
+          npx tsc --noEmit
+      - name: Terraform formatting
+        run: |
+          if command -v terraform >/dev/null; then
+            terraform fmt -check -recursive examples/terraform
+          else
+            echo "terraform not preinstalled on runner image; skipping fmt check"
+          fi
+
+  e2e:
+    # The full loop against real MinIO: multipart upload, gateway presigns,
+    # analytics round-trip. Slower, so it runs only on main.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: docker compose -f examples/docker-compose.yml up -d
+      - name: Wait for bucket provisioning
+        run: docker compose -f examples/docker-compose.yml wait minio-init
+      - run: E2E=1 npm run test:e2e
+      - if: always()
+        run: docker compose -f examples/docker-compose.yml down -v
