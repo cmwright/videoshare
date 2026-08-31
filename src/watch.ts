@@ -540,6 +540,71 @@ export function groupByViewer(sessions: readonly WatchSession[]): ViewerReport[]
     .sort((a, b) => timeOf(b.lastWatched) - timeOf(a.lastWatched) || compare(a.browserId, b.browserId));
 }
 
+// --- Engagement figures (the video page's stat cards, SPEC §17.6) ------------
+
+/**
+ * Fraction of sessions that reached {@link COMPLETION_THRESHOLD}, 0..1, or null
+ * for an empty list (SPEC §16.5).
+ *
+ * `completed` is the payload's **own flag** (§16.2: coverage ≥ the threshold),
+ * never recomputed here — so the number the video page shows is the number the
+ * viewer's browser decided, which is what makes the two sides agree by
+ * construction. Every session counts on both sides of the ratio: a session is a
+ * view whether or not its duration was known, and one the beacon did not call
+ * complete did not complete.
+ *
+ * Deliberately *not* the denominator rule {@link averageWatchedMs} uses. That
+ * one divides a duration by a count and needs a known duration to mean
+ * anything; this one divides a count by a count, and a flag the beacon already
+ * resolved needs no duration to be read.
+ */
+export function completionRate(payloads: readonly WatchPayload[]): number | null {
+  if (payloads.length === 0) return null;
+  return payloads.filter((p) => p.completed).length / payloads.length;
+}
+
+/**
+ * Mean milliseconds of video seen per session — the union per session (so a
+ * stretch watched three times counts once), averaged over the sessions with a
+ * known duration. Null when none has one.
+ *
+ * Both sides of the division are that subset, and unlike {@link completionRate}
+ * they have to be: an untimed session knows how long it watched but not what
+ * fraction that was, its `watched` is unclamped (§16.5), and counting it in the
+ * denominator alone would report an average lower than any session in it.
+ */
+export function averageWatchedMs(payloads: readonly WatchPayload[]): number | null {
+  const timed = payloads.filter((p) => Number.isFinite(p.durationMs) && p.durationMs > 0);
+  if (timed.length === 0) return null;
+  let total = 0;
+  for (const payload of timed) total += watchedMs(payload.watched);
+  return total / timed.length;
+}
+
+/**
+ * The most replayed bucket: its index and its {@link relativeHeat} value — the
+ * "× against one pass" number, which is what "peak 2.2×" means (SPEC §17.6).
+ *
+ * Null when nothing was watched at all, so the caption is omitted rather than
+ * printed as "peak 0.0× at 0:00". Ties go to the earliest bucket, which is the
+ * one a reader scrubbing to the peak would find first.
+ */
+export function peakBucket(
+  payloads: readonly WatchPayload[],
+  buckets: number = HEAT_BUCKETS,
+): { index: number; times: number } | null {
+  const relative = relativeHeat(payloads, buckets);
+  let index = -1;
+  let times = 0;
+  for (let b = 0; b < relative.length; b++) {
+    if (relative[b] > times) {
+      times = relative[b];
+      index = b;
+    }
+  }
+  return index === -1 ? null : { index, times };
+}
+
 // --- Parsing -----------------------------------------------------------------
 
 /**

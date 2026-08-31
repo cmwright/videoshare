@@ -1,0 +1,439 @@
+/* The video page's own layout (docs/SPEC.md §17.4) — back link, title row, the
+   player as the hero, and the Engagement section's frame.
+
+   The pieces inside Engagement are shell.css's, because both owner pages draw
+   with them; what is here is where they sit and what surrounds them. `view.html`
+   loads none of this: the share page is player.css's, unchanged. */
+
+:root {
+  /* The hero is its own environment and must not re-tint per theme — a
+     light-mode overlay over a near-black frame would be unreadable. These are
+     deliberately absent from the dark block below. */
+  --hero-bg: #08090b;
+  --on-hero-accent: #60a5fa;
+  --on-hero-text: rgb(255 255 255 / 0.82);
+  --on-hero-hairline: rgb(255 255 255 / 0.12);
+  --hero-scrim: rgb(8 9 11 / 0.55);
+
+  /* A ring, not a border: the 16:9 box stays exactly 16:9. */
+  --hero-ring: 0 0 0 1px rgb(16 20 26 / 0.1), var(--shadow-md);
+
+  /* The hero runs the width of the column, as the mockup has it. The cap is for
+     a very wide monitor only, where a full-width 16:9 box would be taller than
+     the window and push every number on this page below the fold — a video page
+     is a video *and* its numbers. */
+  --hero-max-height: 72vh;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --hero-ring: 0 0 0 1px #2a3039, inset 0 1px 0 rgb(255 255 255 / 0.04);
+  }
+}
+
+/* The `[hidden]` restatement every block here relies on — the hero, its status
+   line, the play overlay, the title row and the error panel are all flex, which
+   beats the attribute on specificity — lives in shell.css, which both owner
+   pages load. */
+
+/* --- Main column ---------------------------------------------------------- */
+
+.main {
+  gap: var(--space-4);
+  padding: var(--space-5) var(--space-6) var(--space-7);
+}
+
+@media (max-width: 900px) {
+  .main {
+    padding: var(--space-5) var(--space-4) var(--space-6);
+  }
+}
+
+.back-link {
+  display: inline-flex;
+  align-self: flex-start;
+  align-items: center;
+  gap: var(--space-1);
+  color: var(--text-faint);
+  font-size: 0.8125rem;
+  text-decoration: none;
+}
+
+.back-link:hover {
+  color: var(--accent);
+}
+
+.back-link svg {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* --- Title row ------------------------------------------------------------ */
+
+.video-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-5);
+}
+
+.video-head-text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+#video-title {
+  font-size: 1.3125rem;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+  /* A pasted 200-character title must not shove the player below the fold. */
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+}
+
+.video-meta {
+  color: var(--text-faint);
+  font-size: 0.84375rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.copy-button {
+  flex: none;
+  font-size: 0.84375rem;
+}
+
+.copy-glyph {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+}
+
+/* --- Title skeleton ------------------------------------------------------- */
+
+.title-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.skeleton-bar {
+  display: block;
+  max-width: 100%;
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  /* Opacity, not a sweeping gradient shimmer — wrong register for this product. */
+  animation: skeleton-pulse 1.6s ease-in-out infinite;
+}
+
+.skeleton-bar-title {
+  width: 280px;
+  height: 22px;
+}
+
+.skeleton-bar-meta {
+  width: 190px;
+  height: 12px;
+}
+
+@keyframes skeleton-pulse {
+  50% {
+    opacity: 0.55;
+  }
+}
+
+/* The real title replaces the skeleton; so does an error taking the hero. No JS
+   involved either way. */
+#video-head:not([hidden]) ~ .title-skeleton,
+.main:has(#hero-error:not([hidden])) .title-skeleton {
+  display: none;
+}
+
+.page-status {
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+}
+
+.page-status:empty {
+  display: none;
+}
+
+/* --- The player as the hero ----------------------------------------------- */
+
+.hero {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  width: 100%;
+  /* max-width, not max-height: capping the height of an aspect-ratio box makes
+     it stop being 16:9 and grow letterbox bars instead. Left-aligned when it
+     bites, so the player, the title above it and the cards below it share one
+     edge. */
+  max-width: calc(var(--hero-max-height) * 16 / 9);
+  overflow: hidden;
+  border-radius: var(--radius-md);
+  background: var(--hero-bg);
+  box-shadow: var(--hero-ring);
+}
+
+#video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  /* The hero carries the letterbox colour, so an off-aspect recording
+     letterboxes into the same near-black instead of a second, darker box. */
+  background: transparent;
+}
+
+/* Native controls stay, exactly as on the share page: a hand-rolled skin looks
+   worse than the OS one it replaces, and the mockup's drawn control bar is
+   illustrative (SPEC §17.4). */
+
+.hero-status {
+  position: absolute;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--on-hero-text);
+  font-size: 0.8125rem;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  /* Never intercept a click meant for the video or its controls. */
+  pointer-events: none;
+}
+
+/* Cold: nothing has painted yet, so the status owns the whole hero. */
+.hero:not(.has-frames) .hero-status {
+  inset: 0;
+  flex-direction: column;
+  justify-content: center;
+  gap: var(--space-3);
+  background: var(--hero-bg);
+}
+
+/* Warm: a frame is on screen, so progress shrinks to a corner pill and stays
+   clear of the controls. */
+.hero.has-frames .hero-status {
+  top: var(--space-3);
+  left: var(--space-3);
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: rgb(12 14 18 / 0.72);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+
+.spinner {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  border: 2px solid var(--on-hero-hairline);
+  border-top-color: var(--on-hero-accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+.hero:not(.has-frames) .spinner {
+  width: 26px;
+  height: 26px;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.play-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--hero-scrim);
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
+}
+
+.play-button {
+  width: 68px;
+  height: 68px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: #ffffff;
+  color: #10141a;
+  box-shadow: 0 6px 24px rgb(0 0 0 / 0.45);
+  cursor: pointer;
+}
+
+.play-button:hover:not(:disabled) {
+  background: #ffffff;
+  border-color: transparent;
+  transform: scale(1.04);
+}
+
+.play-button svg {
+  width: 28px;
+  height: 28px;
+}
+
+.play-button:focus-visible {
+  outline: 2px solid #ffffff;
+  outline-offset: 3px;
+}
+
+/* --- The hero's error state ----------------------------------------------- */
+
+.state-panel {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  max-width: calc(var(--hero-max-height) * 16 / 9);
+  min-height: 260px;
+  padding: var(--space-6);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  text-align: center;
+}
+
+.state-icon {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  margin-bottom: var(--space-4);
+  border-radius: var(--radius-md);
+  background: var(--danger-soft);
+}
+
+.state-glyph {
+  display: block;
+  width: 20px;
+  height: 20px;
+}
+
+.state-glyph-ring,
+.state-glyph-bar {
+  fill: none;
+  stroke: var(--danger);
+  stroke-width: 1.6;
+  stroke-linecap: round;
+}
+
+.state-glyph-dot {
+  fill: var(--danger);
+}
+
+.state-panel h2 {
+  font-size: 1rem;
+}
+
+.state-panel p {
+  max-width: 56ch;
+  margin-top: var(--space-2);
+  color: var(--text-muted);
+  font-size: 0.875rem;
+}
+
+/* --- Engagement (SPEC §17.6) ---------------------------------------------- */
+
+.engagement {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin-top: var(--space-4);
+}
+
+.engagement-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-4);
+}
+
+.engagement-head h2 {
+  font-size: 1rem;
+}
+
+/* The standing note (§16.8): the operator stores this and cannot read it. */
+.engagement-note {
+  color: var(--text-faint);
+  font-size: 0.78125rem;
+  text-align: right;
+}
+
+.engagement-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+/* Each of the states that is not "signed in with analytics on" is a designed
+   block in the same footprint, never an absence (SPEC §17.6). */
+.engagement-state {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-2);
+  padding: var(--space-5);
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+
+.engagement-state-title {
+  color: var(--text);
+  font-size: 0.9375rem;
+  font-weight: 600;
+}
+
+.engagement-state-body {
+  max-width: 68ch;
+}
+
+@media (max-width: 700px) {
+  .engagement-head {
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+
+  .engagement-note {
+    text-align: left;
+  }
+
+  .video-head {
+    flex-direction: column;
+    gap: var(--space-3);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skeleton-bar,
+  .spinner {
+    animation: none;
+  }
+
+  .play-button:hover:not(:disabled) {
+    transform: none;
+  }
+}

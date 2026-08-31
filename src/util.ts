@@ -90,6 +90,55 @@ export function parseShareFragment(fragment: string): { id: string; keyB64: stri
   return m ? { id: m[1], keyB64: m[2] } : null;
 }
 
+/**
+ * The share link for a video (SPEC §2) — `{site}/view.html#{id}.{key}`.
+ *
+ * Resolved against the current document, so a deployment under a subpath gets
+ * the right URL, and a link built on `video.html` is byte-identical to the one
+ * the recorder stored from `index.html`. With no `location` at all (Node tests)
+ * it degrades to the relative form rather than throwing.
+ */
+export function shareLink(id: string, keyB64: string): string {
+  return pageLink("view.html", id, keyB64);
+}
+
+/**
+ * The owner's video page for the same video (SPEC §17.3) —
+ * `{site}/video.html#{id}.{key}`, resolved exactly as {@link shareLink} is.
+ *
+ * Never handed to anyone: this is the link a library row points at, built by
+ * re-serialising an entry's parsed fragment. The **share** link is what Copy
+ * link copies.
+ */
+export function videoPageLink(id: string, keyB64: string): string {
+  return pageLink("video.html", id, keyB64);
+}
+
+function pageLink(page: string, id: string, keyB64: string): string {
+  const fragment = `#${id}.${keyB64}`;
+  const here = typeof location === "undefined" ? "" : location.href;
+  return here ? new URL(page, here).href + fragment : `${page}${fragment}`;
+}
+
+/**
+ * Which codec a container's mime type says it holds (SPEC §11), for display.
+ *
+ * The one field guaranteed to describe what was really written, whichever
+ * engine and container produced it. Both registrations appear: `avc1`/`avc3`
+ * for H.264 in MP4, `vp09`/`av01`/`vp08` in WebM, and MediaRecorder's shorter
+ * `vp9`/`vp8` spelling. `null` for a bare `video/webm`, which names nothing —
+ * the last MediaRecorder candidate, where the browser picked for itself and did
+ * not say what.
+ */
+export function codecLabel(mimeType: string): string | null {
+  const type = mimeType.toLowerCase();
+  if (/\b(?:avc1|avc3|h264)\b/.test(type)) return "H.264";
+  if (/\b(?:vp09|vp9)\b/.test(type)) return "VP9";
+  if (/\b(?:av01|av1)\b/.test(type)) return "AV1";
+  if (/\b(?:vp08|vp8)\b/.test(type)) return "VP8";
+  return null;
+}
+
 const BYTE_UNITS = ["B", "KB", "MB", "GB", "TB"];
 
 /** Decimal (SI) units, one decimal place above bytes: "12.3 MB". */

@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="robots" content="noindex" />
+    <title>VideoShare</title>
+    <!-- Deploy config, copied verbatim to dist/. Classic script: runs before the module. -->
+    <script src="/config.js"></script>
+    <!-- JS off: the video is ciphertext and the key is in this page's fragment,
+         so nothing here can ever fill itself in. Hide the parts that would sit
+         empty and let the <noscript> panel be the page's single designed state.
+         The sidebar stays: it is markup, and it says what this is. -->
+    <noscript>
+      <style>
+        #video-head,
+        .title-skeleton,
+        #hero,
+        #engagement,
+        #account-chip {
+          display: none !important;
+        }
+      </style>
+    </noscript>
+  </head>
+
+  <body>
+    <div class="app">
+      <!--
+        The shell (SPEC §17.1). Duplicated literally from index.html, the way the
+        topbar is duplicated in view.html: the page has a sidebar before any
+        module parses, and nothing about it depends on script. The three nav
+        links are ordinary cross-document links here, and Videos is the current
+        one — a video page is a video in the library.
+      -->
+      <nav class="sidebar" aria-label="Primary">
+        <a class="brand" href="index.html#/videos">
+          <svg class="brand-mark" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+            <rect class="brand-mark-frame" x="0.75" y="4.5" width="18.5" height="11" rx="2.5" />
+            <path class="brand-mark-play" d="M8.6 7.4 L13.2 10 L8.6 12.6 Z" />
+          </svg>
+          <span class="brand-name">VideoShare</span>
+        </a>
+
+        <div class="nav">
+          <a class="nav-item" data-route="videos" href="index.html#/videos" aria-current="page">
+            <svg class="nav-glyph" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+              <rect class="nav-glyph-stroke" x="2" y="4.5" width="16" height="11" rx="2" />
+              <path class="nav-glyph-fill" d="M8.6 7.9 L12.2 10 L8.6 12.1 Z" />
+            </svg>
+            <span class="nav-label">Videos</span>
+          </a>
+
+          <a class="nav-item" data-route="record" href="index.html#/record">
+            <svg class="nav-glyph" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+              <circle class="nav-glyph-stroke" cx="10" cy="10" r="7" />
+              <circle class="nav-glyph-fill" cx="10" cy="10" r="2.6" />
+            </svg>
+            <span class="nav-label">New recording</span>
+          </a>
+
+          <a class="nav-item" data-route="settings" href="index.html#/settings">
+            <svg class="nav-glyph" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+              <path class="nav-glyph-stroke" d="M3 6h9M15.5 6h1.5M3 14h2M8.5 14H17" />
+              <circle class="nav-glyph-stroke" cx="13" cy="6" r="2" />
+              <circle class="nav-glyph-stroke" cx="6.5" cy="14" r="2" />
+            </svg>
+            <span class="nav-label">Settings</span>
+          </a>
+        </div>
+
+        <div class="sidebar-foot">
+          <!-- Honest, not a boast: the key came out of this page's own fragment
+               and never leaves this tab. The one sentence of the threat model
+               nobody should have to go looking for, so it sits on every owner
+               page. -->
+          <span class="badge-secure">
+            <svg class="badge-lock" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+              <path class="badge-lock-shackle" d="M5.25 7.25V5.25a2.75 2.75 0 0 1 5.5 0v2" />
+              <rect class="badge-lock-body" x="3" y="7.25" width="10" height="6.5" rx="1.6" />
+            </svg>
+            <span class="badge-label">Encrypted in this browser</span>
+          </span>
+
+          <!--
+            Gateway mode only (SPEC §17.1). shell.ts removes this outright in
+            legacy mode: no account, nothing to sign out of. #auth-button is the
+            one and only mount point for Google's own button in this document.
+          -->
+          <div id="account-chip" class="account" hidden>
+            <div id="account-identity" class="account-identity" hidden>
+              <span id="account-monogram" class="account-monogram" aria-hidden="true"></span>
+              <span class="account-lines">
+                <span id="account-email" class="account-email"></span>
+                <button id="sign-out" type="button" class="account-signout">Sign out</button>
+              </span>
+            </div>
+
+            <p id="account-hint" class="account-hint"></p>
+            <div id="auth-button"></div>
+          </div>
+        </div>
+      </nav>
+
+      <main class="main">
+        <a class="back-link" href="index.html#/videos">
+          <svg viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+            <path d="M12.5 4.5 L7 10 L12.5 15.5" />
+          </svg>
+          All videos
+        </a>
+
+        <header id="video-head" class="video-head" hidden>
+          <div class="video-head-text">
+            <h1 id="video-title"></h1>
+            <p id="video-meta" class="video-meta"></p>
+          </div>
+          <!-- Copies the *share* link, always: this is the button whose output
+               goes to other people, and it must never hand out a video.html URL
+               (SPEC §17.3/§17.4). -->
+          <button id="copy-link" type="button" class="primary copy-button">
+            <svg class="copy-glyph" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+              <path d="M8.5 11.5 L11.5 8.5" />
+              <path d="M9 6.8 L11 4.8 a2.55 2.55 0 0 1 3.6 3.6 L12.6 10.4" />
+              <path d="M11 13.2 L9 15.2 a2.55 2.55 0 0 1 -3.6 -3.6 L7.4 9.6" />
+            </svg>
+            <span id="copy-link-label">Copy link</span>
+          </button>
+        </header>
+
+        <!-- Stands in for the title until meta.json decrypts; CSS removes it the
+             moment #video-head loses `hidden`, or an error takes the hero. -->
+        <div class="title-skeleton" aria-hidden="true">
+          <span class="skeleton-bar skeleton-bar-title"></span>
+          <span class="skeleton-bar skeleton-bar-meta"></span>
+        </div>
+
+        <p id="page-status" class="page-status" role="status" aria-live="polite"></p>
+
+        <div id="hero" class="hero">
+          <video id="video" controls playsinline preload="metadata"></video>
+
+          <p id="status" class="hero-status" role="status">
+            <span class="spinner" aria-hidden="true"></span>
+            <span id="status-text">Loading&hellip;</span>
+          </p>
+
+          <!-- This page does not autoplay (SPEC §17.4): the reader came to look
+               at numbers and should not have audio start underneath them. The
+               same control catches a browser that refuses autoplay elsewhere. -->
+          <div id="play-overlay" class="play-overlay" hidden>
+            <button id="play-button" class="play-button" type="button" aria-label="Play video">
+              <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                <path d="M8 5v14l11-7z" fill="currentColor" />
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        <!-- A playback failure takes the hero's place and leaves Engagement
+             alone: the watch data is still readable, and is often exactly what
+             the reader came for (SPEC §17.4). -->
+        <section id="hero-error" class="state-panel" role="alert" hidden>
+          <span class="state-icon" aria-hidden="true">
+            <svg class="state-glyph" viewBox="0 0 24 24" focusable="false">
+              <circle class="state-glyph-ring" cx="12" cy="12" r="9" />
+              <path class="state-glyph-bar" d="M12 7.5v5" />
+              <circle class="state-glyph-dot" cx="12" cy="16.3" r="1" />
+            </svg>
+          </span>
+          <h2 id="hero-error-title"></h2>
+          <p id="hero-error-detail"></p>
+        </section>
+
+        <section id="engagement" class="engagement" aria-labelledby="engagement-heading">
+          <div class="engagement-head">
+            <h2 id="engagement-heading">Engagement</h2>
+            <span class="engagement-note">
+              Watch data is encrypted &mdash; only holders of this link can read it
+            </span>
+          </div>
+          <div id="engagement-body" class="engagement-body" aria-live="polite"></div>
+        </section>
+
+        <noscript>
+          <section class="state-panel">
+            <span class="state-icon" aria-hidden="true">
+              <svg class="state-glyph" viewBox="0 0 24 24" focusable="false">
+                <circle class="state-glyph-ring" cx="12" cy="12" r="9" />
+                <path class="state-glyph-bar" d="M12 7.5v5" />
+                <circle class="state-glyph-dot" cx="12" cy="16.3" r="1" />
+              </svg>
+            </span>
+            <h2>JavaScript required</h2>
+            <p>
+              This video and everything recorded about who watched it are encrypted with the
+              key in this page's address, so reading either needs JavaScript enabled.
+            </p>
+          </section>
+        </noscript>
+      </main>
+    </div>
+
+    <script type="module" src="/src/video.ts"></script>
+  </body>
+</html>

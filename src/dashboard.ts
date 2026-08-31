@@ -1,34 +1,39 @@
 /**
- * The analytics expander on each library row (docs/SPEC.md §16.6).
+ * The reader half of playback analytics (docs/SPEC.md §16.6, §17.6).
  *
- * There is no stats page. Watch data belongs next to the video it is about, and
- * the recorder already lists every video this browser made (§9), so this is what
- * `record.ts` hangs on a library row when the gateway says `analytics: true` and
- * someone is signed in.
+ * There is no stats page, and as of §17 there is no expander either: watch data
+ * belongs next to the video it is about, and the surface that is about one video
+ * is the **video page** (§17.4). This module fetches, decrypts and aggregates
+ * one video's sessions, and hands its callers DOM — the full Engagement section
+ * for `video.ts`, and two numbers for a library row in `record.ts`.
  *
  * The shape of the thing, and why it is a module of its own rather than more of
- * `record.ts`: the gateway can list a video's analytics objects and hand back
+ * either page: the gateway can list a video's analytics objects and hand back
  * presigned URLs, but it cannot read one — every object is AES-GCM ciphertext
  * under the video's own key. So this fetches the listing (authenticated), then
  * the ciphertext **straight from the bucket** (never through the gateway —
  * §15's no-proxy rule), and decrypts, parses and aggregates all of it here.
  *
  * Which is also the limit of it: **the key never leaves the page.** Only the
- * 22-character video id appears in a request. The entry's share link is parsed
- * in memory and never written to `location`, to `history`, or into a form.
+ * 22-character video id appears in a request. The fragment holding the key is
+ * parsed in memory and never written to `location`, to `history`, or into a form.
  *
- * Nothing here is the page's business. Every failure renders as one quiet muted
- * sentence inside the expander it was asked from: this is a panel about a video,
- * and it must never interrupt a recording or an upload.
+ * Nothing here is the page's business. `loadReport` rejects only with a sentence
+ * meant for a reader, and its callers render that sentence where the content
+ * would have gone: this is a panel about a video, and it must never interrupt a
+ * recording or an upload.
  */
 
 import { analyticsAad, decryptBlock, importKeyB64 } from "./crypto";
-import type { LibraryEntry } from "./types";
-import { parseShareFragment } from "./util";
+import { formatDuration } from "./util";
 import {
+  averageWatchedMs,
+  completionRate,
   groupByViewer,
+  HEAT_BUCKETS,
   normalizeHeat,
   parsePayload,
+  peakBucket,
   relativeHeat,
   sumHeat,
   type ViewerReport,
@@ -36,7 +41,7 @@ import {
   type WatchSession,
 } from "./watch";
 
-/** What the expander needs from the page it lives on. */
+/** What this module needs from the page it renders into. */
 export interface AnalyticsDeps {
   gatewayUrl: string;
   /** The current Google ID token, or null. Read per request, never captured. */
@@ -50,16 +55,39 @@ export interface AnalyticsDeps {
  */
 export const SESSION_CONCURRENCY = 6;
 
+/**
+ * Videos summarized at once on the library page (SPEC §17.3). A row's summary
+ * is a whole listing plus every session behind it, so three rows filling in is
+ * already several dozen requests; more would make scrolling the library cost
+ * more than watching a video.
+ */
+export const LIBRARY_CONCURRENCY = 3;
+
+/**
+ * Rows summarized without an `IntersectionObserver` to say which are visible —
+ * about one screenful. The rest wait until the reader reaches for them.
+ */
+export const LIBRARY_SUMMARY_EAGER = 6;
+
 /** Characters of a browserId shown in a viewer row, then an ellipsis. */
 export const VIEWER_PREFIX = 8;
 
-/** What was made of one video's sessions, once every object had its turn. */
-interface Report {
+/** Viewer rows drawn before "Show all" (SPEC §17.6). */
+export const VIEWER_ROWS = 8;
+
+/** One video's sessions, once every object had its turn. */
+export interface VideoReport {
   sessions: WatchSession[];
   /** Objects that would not decrypt or would not parse — shown, never hidden. */
   unreadable: number;
-  /** The gateway's listing hit its cap; there are more sessions than these. */
+  /** The gateway's listing hit MAX_LISTED_SESSIONS; there are more than these. */
   truncated: boolean;
+}
+
+/** The two numbers a library row carries (SPEC §17.3). */
+export interface VideoSummary {
+  views: number;
+  viewers: number;
 }
 
 /** One row of `GET {gatewayUrl}/beacon/{videoId}` (SPEC §16.3). */
@@ -85,116 +113,83 @@ class AnalyticsError extends Error {
 }
 
 /**
- * Results per video id, for the page's lifetime (SPEC §16.6). Collapsing and
- * re-expanding re-renders what was fetched, and re-rendering the library — which
- * happens on every sign-in and every Remove — does not refetch. A load that
- * *failed* is never cached: reopening retries it, because the usual cause is a
- * token that has since been refreshed.
+ * Results per video id, for the **document's** lifetime (SPEC §16.6).
+ * Re-rendering the library — which happens on every sign-in and every Remove —
+ * does not refetch, and the video page's Reload replaces the entry. A load that
+ * *failed* is never cached: the next attempt retries it, because the usual cause
+ * is a token that has since been refreshed. The cache does not survive
+ * navigation, so opening a row's video page fetches that video once for itself.
+ *
+ * The entry is the **promise**, not the report, so a second ask for a video
+ * already being read joins the first instead of starting a second listing and a
+ * second thousand session fetches. Both owner pages can ask twice before either
+ * answer arrives — the video page on sign-in restore and again when meta lands,
+ * a library row when the queue reaches it while a render is still in flight —
+ * and only one of those renders is kept, but both would have cost the network.
  */
-const cache = new Map<string, Report>();
-
-// --- The two things `record.ts` asks for -------------------------------------
+const cache = new Map<string, Promise<VideoReport>>();
 
 /**
- * The collapsed `<details>` for one entry — analytics on, signed in.
+ * One video's report, from the cache or from the network.
  *
- * Nothing is fetched until it is opened, so a library of forty videos still
- * costs the one `/config` request the recorder already makes.
+ * Rejects only with a sentence a reader should see — anything unexpected is
+ * logged and reported as the one generic line, so every caller can render
+ * `err.message` without deciding what is safe to show.
  */
-export function analyticsExpander(entry: LibraryEntry, deps: AnalyticsDeps): HTMLElement {
-  const details = document.createElement("details");
-  details.className = "analytics";
+export function loadReport(
+  video: { id: string; keyB64: string },
+  deps: AnalyticsDeps,
+  opts?: { refetch?: boolean },
+): Promise<VideoReport> {
+  if (!opts?.refetch) {
+    const cached = cache.get(video.id);
+    if (cached) return cached;
+  }
 
-  const summary = document.createElement("summary");
-  summary.textContent = "Analytics";
-
-  const body = document.createElement("div");
-  body.className = "analytics-body";
-
-  details.append(summary, body);
-
-  let loading = false;
-
-  /** The one affordance for "someone watched it since I opened this". */
-  const reload = (): HTMLElement => {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "link-button";
-    button.textContent = "Reload";
-    button.addEventListener("click", () => load(true));
-    return button;
-  };
-
-  const load = (refetch: boolean): void => {
-    if (loading) return;
-
-    const video = shareLink(entry);
-    if (!video) {
-      body.replaceChildren(
-        note("This entry's share link has no video key, so its analytics can't be read."),
-      );
-      return;
-    }
-
-    const cached = refetch ? undefined : cache.get(video.id);
-    if (cached) {
-      body.replaceChildren(...report(cached, reload));
-      return;
-    }
-
-    loading = true;
-    body.replaceChildren(note("Loading…"));
-    void readVideo(video, deps)
-      .then((fresh) => {
-        cache.set(video.id, fresh);
-        body.replaceChildren(...report(fresh, reload));
-      })
-      .catch((err: unknown) => {
-        // Not cached: the next open tries again.
-        cache.delete(video.id);
-        if (!(err instanceof AnalyticsError)) console.error("[videoshare]", err);
-        body.replaceChildren(note(describe(err)), reload());
-      })
-      .finally(() => {
-        loading = false;
-      });
-  };
-
-  details.addEventListener("toggle", () => {
-    if (details.open) load(false);
+  const pending = read(video, deps);
+  cache.set(video.id, pending);
+  // Evicted the moment it is known to have failed, so the next ask retries.
+  // Only if it is still the entry: a Reload during this one already replaced it,
+  // and dropping that would make the retry the thing that gets refetched.
+  void pending.catch(() => {
+    if (cache.get(video.id) === pending) cache.delete(video.id);
   });
-  return details;
+  return pending;
 }
 
-/** The one-line "Sign in to see analytics." row — analytics on, signed out. */
-export function analyticsHint(): HTMLElement {
-  const hint = document.createElement("p");
-  hint.className = "analytics-hint muted hint";
-  // Not a <details>: the operator turned analytics on and the data exists, so a
-  // blank row would read as "this video has none" — but there is nothing to open
-  // until there is a token to list with (SPEC §16.6).
-  hint.textContent = "Sign in to see analytics.";
-  return hint;
+/** `readVideo`, with every rejection turned into a sentence for a reader. */
+async function read(
+  video: { id: string; keyB64: string },
+  deps: AnalyticsDeps,
+): Promise<VideoReport> {
+  try {
+    return await readVideo(video, deps);
+  } catch (err) {
+    if (err instanceof AnalyticsError) throw err;
+    console.error("[videoshare]", err);
+    throw new AnalyticsError("Could not load analytics for this video.");
+  }
+}
+
+/** Views and unique viewers — all a list row can carry honestly (SPEC §17.3). */
+export function summarize(report: VideoReport): VideoSummary {
+  return {
+    views: report.sessions.length,
+    viewers: groupByViewer(report.sessions).length,
+  };
 }
 
 // --- Reading one video's sessions --------------------------------------------
 
-/** `{ id, keyB64 }` from the entry's stored share link, or null. */
-function shareLink(entry: LibraryEntry): { id: string; keyB64: string } | null {
-  const link = entry.link || "";
-  const hash = link.indexOf("#");
-  return parseShareFragment(hash === -1 ? link.trim() : link.slice(hash + 1).trim());
-}
-
 async function readVideo(
   video: { id: string; keyB64: string },
   deps: AnalyticsDeps,
-): Promise<Report> {
+): Promise<VideoReport> {
   let key: CryptoKey;
   try {
     key = await importKeyB64(video.keyB64);
   } catch {
-    throw new AnalyticsError("The key in this entry's share link is not a valid AES-256 key.");
+    throw new AnalyticsError("The key in this link is not a valid AES-256 key.");
   }
 
   const listing = await listSessions(deps, video.id);
@@ -216,7 +211,7 @@ async function readVideo(
  */
 async function listSessions(deps: AnalyticsDeps, id: string): Promise<SessionListing> {
   const token = deps.token();
-  // The sign-in control is a few centimetres up the same page, so this says so
+  // The sign-in control is in the sidebar of the same page, so this says so
   // plainly rather than silently re-prompting (SPEC §16.6).
   if (!token) throw new AnalyticsError("Sign in again to load analytics.");
 
@@ -310,60 +305,82 @@ async function pool<T, R>(
   return out;
 }
 
-// --- Rendering ---------------------------------------------------------------
+// --- Engagement, block by block (SPEC §17.6) ---------------------------------
 
-/** The whole expander body for a loaded report. */
-function report(loaded: Report, reload: () => HTMLElement): HTMLElement[] {
-  const payloads = loaded.sessions.map((session) => session.payload);
-  const nodes: HTMLElement[] = [];
+/**
+ * The four stat cards, in §17.6's order. Zeros for an empty report rather than
+ * dashes: "0 views" is a fact, while a completion rate with no timed session
+ * behind it is not, and reads "—".
+ */
+export function statCards(report: VideoReport): HTMLElement {
+  const payloads = report.sessions.map((session) => session.payload);
+  const completion = completionRate(payloads);
+  const average = averageWatchedMs(payloads);
 
-  if (loaded.sessions.length === 0) {
-    nodes.push(
-      note(
-        loaded.unreadable > 0
-          ? `${count(loaded.unreadable, "session")} could not be read: written under a different key, or not watch data at all.`
-          : "No views yet.",
-      ),
-      reload(),
-    );
-    return nodes;
-  }
-
-  const header = document.createElement("p");
-  header.className = "analytics-summary";
-  header.append(
-    stat(loaded.sessions.length, "view"),
-    document.createTextNode(" · "),
-    stat(groupByViewer(loaded.sessions).length, "viewer"),
-    document.createTextNode(" · "),
-    stat(payloads.filter((payload) => payload.completed).length, "completion"),
+  const grid = document.createElement("div");
+  grid.className = "stat-cards";
+  grid.append(
+    statCard("Views", String(report.sessions.length)),
+    statCard("Unique viewers", String(groupByViewer(report.sessions).length)),
+    statCard("Completion rate", completion === null ? "—" : `${Math.round(completion * 100)}%`),
+    statCard("Avg watch time", average === null ? "—" : formatDuration(average)),
   );
-  nodes.push(header);
+  return grid;
+}
 
-  const asides: string[] = [];
-  if (loaded.unreadable > 0) asides.push(`${count(loaded.unreadable, "session")} could not be read.`);
-  if (loaded.truncated) asides.push("The gateway's listing hit its cap, so these are not all of them.");
-  if (asides.length > 0) nodes.push(note(asides.join(" ")));
+function statCard(label: string, value: string): HTMLElement {
+  const card = document.createElement("div");
+  card.className = "stat-card";
 
-  nodes.push(heatmap(sumHeat(payloads), relativeHeat(payloads), "Replays across the video"));
+  const name = document.createElement("span");
+  name.className = "stat-label";
+  name.textContent = label;
 
-  const axis = document.createElement("div");
-  axis.className = "heat-axis muted";
-  const start = document.createElement("span");
-  start.textContent = "Start";
-  const end = document.createElement("span");
-  end.textContent = "End";
-  axis.append(start, end);
-  nodes.push(axis);
+  const figure = document.createElement("span");
+  figure.className = "stat-value";
+  figure.textContent = value;
 
-  const viewers = document.createElement("div");
-  viewers.className = "viewers";
-  for (const viewer of groupByViewer(loaded.sessions)) {
-    viewers.append(viewerRow(viewer, payloadsOf(loaded.sessions, viewer.browserId)));
+  card.append(name, figure);
+  return card;
+}
+
+/**
+ * The replay heatmap: `HEAT_BUCKETS` bars, a peak caption and a time axis.
+ *
+ * With no sessions at all this is §17.6's one line — "No views yet." — rather
+ * than fifty hairlines implying data, so a caller can append the three blocks in
+ * order and get the zero state for free.
+ */
+export function replayHeatmap(report: VideoReport, durationMs: number): HTMLElement {
+  if (report.sessions.length === 0) return note("No views yet.");
+
+  const payloads = report.sessions.map((session) => session.payload);
+  const card = document.createElement("section");
+  card.className = "heat-card";
+
+  const head = document.createElement("div");
+  head.className = "heat-head";
+
+  const title = document.createElement("span");
+  title.className = "heat-title";
+  title.textContent = "Replays across the video";
+  head.append(title);
+
+  const peak = peakBucket(payloads);
+  // Omitted entirely rather than printed as zeros: with no duration there is no
+  // position to name, and with no heat there is no peak to name it about.
+  if (peak && durationMs > 0) {
+    const caption = document.createElement("span");
+    caption.className = "heat-peak";
+    caption.textContent =
+      `peak ${peak.times.toFixed(1)}× at ` +
+      formatDuration((peak.index * durationMs) / HEAT_BUCKETS);
+    head.append(caption);
   }
-  nodes.push(viewers, reload());
 
-  return nodes;
+  card.append(head, heatmap(sumHeat(payloads), relativeHeat(payloads), "Replays across the video"));
+  card.append(timeAxis(durationMs));
+  return card;
 }
 
 /**
@@ -398,6 +415,96 @@ function heatmap(heat: readonly number[], relative: readonly number[], label: st
   return wrap;
 }
 
+/**
+ * Five labels under the bars — 0, ¼, ½, ¾ and the full duration — so a peak has
+ * a position a reader can scrub to. A video with no duration keeps the
+ * Start/End pair, which is all it can honestly say.
+ */
+function timeAxis(durationMs: number): HTMLElement {
+  const axis = document.createElement("div");
+  axis.className = "heat-axis muted";
+  const labels =
+    durationMs > 0
+      ? [0, 0.25, 0.5, 0.75, 1].map((at) => formatDuration(durationMs * at))
+      : ["Start", "End"];
+  for (const text of labels) {
+    const span = document.createElement("span");
+    span.textContent = text;
+    axis.append(span);
+  }
+  return axis;
+}
+
+/**
+ * One row per unique viewer, most recent first, truncated at {@link VIEWER_ROWS}
+ * with an honest "Showing N of M viewers" line and a **Show all** that reveals
+ * the rest in place. It fetches nothing: every viewer is already in memory, and
+ * the truncation is about a readable page, not about a request.
+ *
+ * An empty report renders an empty container: with no sessions §17.6 shows no
+ * table at all, and `replayHeatmap` has already said "No views yet."
+ */
+export function viewerTable(report: VideoReport): HTMLElement {
+  if (report.sessions.length === 0) {
+    // Nothing at all rather than an empty frame: with no sessions §17.6 shows no
+    // table, and `replayHeatmap` has already said "No views yet." The element is
+    // plain — no `.viewer-table`, whose own `display` would fight `hidden`.
+    const empty = document.createElement("div");
+    empty.hidden = true;
+    return empty;
+  }
+
+  const table = document.createElement("section");
+  table.className = "viewer-table";
+
+  const head = document.createElement("div");
+  head.className = "viewer-row viewer-head";
+  for (const [label, className] of [
+    ["Viewer", "viewer-id"],
+    ["Plays", "viewer-plays"],
+    ["Attention", "viewer-attention"],
+    ["Watched", "viewer-coverage"],
+    ["Last seen", "viewer-when"],
+  ] as const) {
+    const cell = document.createElement("span");
+    cell.className = className;
+    cell.textContent = label;
+    head.append(cell);
+  }
+  table.append(head);
+
+  const viewers = groupByViewer(report.sessions);
+  const shown = viewers.slice(0, VIEWER_ROWS);
+  const rest = viewers.slice(VIEWER_ROWS);
+  for (const viewer of shown) {
+    table.append(viewerRow(viewer, payloadsOf(report.sessions, viewer.browserId)));
+  }
+
+  if (rest.length === 0) return table;
+
+  const more = document.createElement("div");
+  more.className = "viewer-more";
+
+  const line = document.createElement("span");
+  line.className = "muted hint";
+  line.textContent = `Showing ${shown.length} of ${viewers.length} viewers`;
+
+  const showAll = document.createElement("button");
+  showAll.type = "button";
+  showAll.className = "link-button";
+  showAll.textContent = "Show all";
+  showAll.addEventListener("click", () => {
+    for (const viewer of rest) {
+      more.before(viewerRow(viewer, payloadsOf(report.sessions, viewer.browserId)));
+    }
+    more.remove();
+  });
+
+  more.append(line, showAll);
+  table.append(more);
+  return table;
+}
+
 function viewerRow(viewer: ViewerReport, payloads: readonly WatchPayload[]): HTMLElement {
   const row = document.createElement("div");
   row.className = "viewer-row";
@@ -409,8 +516,14 @@ function viewerRow(viewer: ViewerReport, payloads: readonly WatchPayload[]): HTM
   who.textContent = shortId(viewer.browserId);
 
   const plays = document.createElement("span");
-  plays.className = "viewer-plays muted";
+  plays.className = "viewer-plays";
   plays.textContent = count(viewer.plays, "play");
+
+  const attention = document.createElement("div");
+  attention.className = "viewer-attention";
+  attention.append(
+    heatmap(viewer.heat, relativeHeat(payloads), `Replays by viewer ${shortId(viewer.browserId)}`),
+  );
 
   const seen = document.createElement("span");
   seen.className = "viewer-coverage";
@@ -421,13 +534,7 @@ function viewerRow(viewer: ViewerReport, payloads: readonly WatchPayload[]): HTM
   when.className = "viewer-when muted";
   when.textContent = localTime(viewer.lastWatched);
 
-  row.append(
-    who,
-    plays,
-    heatmap(viewer.heat, relativeHeat(payloads), `Replays by viewer ${shortId(viewer.browserId)}`),
-    seen,
-    when,
-  );
+  row.append(who, plays, attention, seen, when);
   return row;
 }
 
@@ -461,32 +568,19 @@ function payloadsOf(sessions: readonly WatchSession[], browserId: string): Watch
  * of a hovered row, and the reader who needs it has none to do with it — a
  * viewer is a browser, not a person, and there is nothing on the other end of
  * the id to look up (§16.8). 8 base64url characters are 48 bits, which tells
- * these rows apart at any scale a library page is readable at.
+ * these rows apart at any scale a video page is readable at.
  */
 function shortId(browserId: string): string {
   return `${browserId.slice(0, VIEWER_PREFIX)}…`;
 }
 
-/** "3 views", "1 view" — a `<strong>` count and its noun. */
-function stat(n: number, noun: string): DocumentFragment {
-  const fragment = document.createDocumentFragment();
-  const value = document.createElement("strong");
-  value.textContent = String(n);
-  fragment.append(value, document.createTextNode(` ${plural(n, noun)}`));
-  return fragment;
-}
-
 function count(n: number, noun: string): string {
-  return `${n} ${plural(n, noun)}`;
-}
-
-function plural(n: number, noun: string): string {
-  return n === 1 ? noun : `${noun}s`;
+  return `${n} ${n === 1 ? noun : `${noun}s`}`;
 }
 
 function note(text: string): HTMLElement {
   const line = document.createElement("p");
-  line.className = "muted hint";
+  line.className = "analytics-note muted hint";
   line.textContent = text;
   return line;
 }
@@ -494,9 +588,4 @@ function note(text: string): HTMLElement {
 function localTime(iso: string): string {
   const at = Date.parse(iso);
   return Number.isNaN(at) ? "unknown" : new Date(at).toLocaleString();
-}
-
-function describe(err: unknown): string {
-  if (err instanceof AnalyticsError) return err.message;
-  return "Could not load analytics for this video.";
 }

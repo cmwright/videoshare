@@ -33,12 +33,15 @@
 
 import { describe, expect, it } from "vitest";
 import type { TimeRangesLike } from "../src/gap";
+import { formatDuration } from "../src/util";
 import {
   advance,
+  averageWatchedMs,
   BEACON_INTERVAL_MS,
   beginSeek,
   capRanges,
   COMPLETION_THRESHOLD,
+  completionRate,
   coverage,
   createHeatState,
   endSeek,
@@ -53,6 +56,7 @@ import {
   mergeRanges,
   normalizeHeat,
   parsePayload,
+  peakBucket,
   playedRanges,
   type Range,
   reanchor,
@@ -1284,5 +1288,137 @@ describe("parsePayload — nothing from the wire is trusted", () => {
 
     expect(parsed.watched[0][1]).toBe(50_000);
     expect(parsed.heat[0]).toBe(0);
+  });
+});
+
+/**
+ * The engagement figures the video page puts on its stat cards and under its
+ * heatmap (SPEC §17.6). They are arithmetic, so they live in `watch.ts` and are
+ * tested here rather than being discovered by looking at a rendered page.
+ */
+describe("completionRate — the stat card", () => {
+  it("is the fraction of sessions the viewer's own browser called complete", () => {
+    // The payload's own flag, never recomputed here: the number the page shows
+    // is the number the beacon decided, which is what makes the two sides agree.
+    const payloads = [
+      v2({ completed: true }),
+      v2({ completed: true }),
+      v2({ completed: false }),
+      v2({ completed: false }),
+    ];
+    expect(completionRate(payloads)).toBe(0.5);
+  });
+
+  it("reads 1 when every session finished and 0 when none did", () => {
+    expect(completionRate([v2({ completed: true }), v2({ completed: true })])).toBe(1);
+    expect(completionRate([v2({ completed: false })])).toBe(0);
+  });
+
+  it("is null with no sessions at all, so the card reads — rather than 0%", () => {
+    expect(completionRate([])).toBeNull();
+  });
+
+  it("counts a session with no known duration on both sides of the ratio", () => {
+    // The case where the only two defensible readings disagree, pinned to
+    // SPEC §16.5: the denominator is `payloads.length`, not the timed subset.
+    // `completed` is the beacon's own resolved flag, and reading it needs no
+    // duration — so an untimed session the viewer did not finish is a session
+    // that did not complete, not a session to drop from the question.
+    const payloads = [
+      v2({ completed: true, durationMs: DURATION }),
+      v2({ completed: false, durationMs: 0 }),
+    ];
+    expect(completionRate(payloads)).toBe(0.5);
+  });
+
+  it("stays non-null when no session is timed, unlike averageWatchedMs", () => {
+    // The two figures deliberately part company here: a count over a count is
+    // still answerable with no duration anywhere, while a mean of durations is
+    // not (§16.5).
+    const untimed = [v2({ completed: true, durationMs: 0 }), v2({ completed: false, durationMs: 0 })];
+    expect(completionRate(untimed)).toBe(0.5);
+    expect(averageWatchedMs(untimed)).toBeNull();
+  });
+});
+
+describe("averageWatchedMs — the stat card", () => {
+  it("averages the watch union over the sessions with a known duration", () => {
+    const payloads = [
+      v2({ watched: [[0, 50_000]] }),
+      v2({ watched: [[0, 10_000], [20_000, 30_000]] }),
+    ];
+    // 50 000 and 20 000 milliseconds seen: the mean is 35 s, and that is what
+    // formatDuration turns into the card's "0:35".
+    expect(averageWatchedMs(payloads)).toBe(35_000);
+    expect(formatDuration(averageWatchedMs(payloads) as number)).toBe("0:35");
+  });
+
+  it("is a union, so watching the same minute twice contributes one minute", () => {
+    // `watched` is merged and disjoint by contract (§16.2). A session that
+    // played 0–60 s three times still says it saw 60 s of video, which is
+    // exactly what `coverage` means, expressed in time.
+    const replayed = v2({
+      watched: [[0, 60_000]],
+      durationMs: 120_000,
+      heat: flat(3 * (120_000 / HEAT_BUCKETS)),
+    });
+    expect(averageWatchedMs([replayed])).toBe(60_000);
+  });
+
+  it("ignores an untimed session on BOTH sides of the division", () => {
+    const timed = [v2({ watched: [[0, 50_000]] }), v2({ watched: [[0, 20_000]] })];
+    expect(averageWatchedMs(timed)).toBe(35_000);
+
+    // A session that never learned its duration knows how long it watched but
+    // not what fraction that was; counting it in the denominator alone would
+    // report an average lower than any session in the list.
+    const withUntimed = [...timed, v2({ durationMs: 0, watched: [[0, 90_000]] })];
+    expect(averageWatchedMs(withUntimed)).toBe(35_000);
+  });
+
+  it("is null when no payload has a duration", () => {
+    expect(averageWatchedMs([])).toBeNull();
+    expect(averageWatchedMs([v2({ durationMs: 0, watched: [[0, 5_000]] })])).toBeNull();
+  });
+});
+
+describe("peakBucket — the heatmap's caption", () => {
+  it("finds the most replayed bucket and its × against a single pass", () => {
+    // One 100 s session that played every bucket once, and bucket 18 — 36 s in —
+    // 2.2 times.
+    const heat = flat(BUCKET_MS);
+    heat[18] = 2.2 * BUCKET_MS;
+
+    const peak = peakBucket([v2({ heat })]);
+    expect(peak).toEqual({ index: 18, times: 2.2 });
+
+    // What §17.6 writes from it: the bucket's *start*, which is the position a
+    // reader would scrub to.
+    const { index, times } = peak as { index: number; times: number };
+    expect(`peak ${times.toFixed(1)}× at ${formatDuration((index * DURATION) / HEAT_BUCKETS)}`).toBe(
+      "peak 2.2× at 0:36",
+    );
+  });
+
+  it("takes the lowest index on a tie, so the answer is deterministic", () => {
+    const heat = flat(0);
+    heat[7] = 3 * BUCKET_MS;
+    heat[31] = 3 * BUCKET_MS;
+    expect(peakBucket([v2({ heat })])).toEqual({ index: 7, times: 3 });
+  });
+
+  it("reads a v1 session through its derived heat", () => {
+    // No `heat` field at all: the first half of the video, once through, which
+    // makes every bucket up to the halfway point exactly one pass.
+    const peak = peakBucket([v1({ watched: [[0, 50_000]] })]);
+    expect(peak).toEqual({ index: 0, times: 1 });
+  });
+
+  it("is null when nothing was watched, so the caption is omitted", () => {
+    // Not "peak 0.0× at 0:00": with no heat there is no peak to name.
+    expect(peakBucket([])).toBeNull();
+    expect(peakBucket([v2({ heat: flat(0) })])).toBeNull();
+    // And with no duration there is no denominator either.
+    expect(peakBucket([v2({ durationMs: 0, heat: flat(0) })])).toBeNull();
   });
 });

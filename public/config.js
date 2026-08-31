@@ -28,8 +28,9 @@
 // localStorage, no sign-in, no server of any kind. Viewing is identical either
 // way — view.html only ever needs publicBaseUrl.
 //
-// This file is copied verbatim into dist/ and loaded by index.html and
-// view.html, so it can be changed after a build without rebuilding.
+// This file is copied verbatim into dist/ and loaded by all three pages —
+// index.html, video.html and view.html — so it can be changed after a build
+// without rebuilding.
 window.VIDEOSHARE = {
   publicBaseUrl: "http://localhost:9000/videoshare",
   // gatewayUrl: "/api",

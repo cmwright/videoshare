@@ -1,0 +1,242 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <style>
+    :root {
+      --font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif;
+      --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+      --bg: #0b0d10; --surface: #14171c; --sunken: #1a1e24;
+      --border: #262b33; --border-strong: #39414c;
+      --text: #e6eaef; --muted: #9aa4b2; --faint: #7a8492;
+      --accent: #60a5fa; --accent-contrast: #0b0f14; --accent-soft: #172236;
+    }
+    *, *::before, *::after { box-sizing: border-box; }
+    body { margin: 0; font-family: var(--font-sans); background: #0b0d10; color: #e6eaef;
+      font-size: 15px; line-height: 1.55; -webkit-font-smoothing: antialiased; }
+    a { color: #60a5fa; text-decoration: none; } a:hover { color: #93c5fd; }
+  </style>
+</helmet>
+
+<div style="width: 1440px; height: 1420px; display: flex; background: #0b0d10; overflow: hidden">
+
+  <!-- Sidebar (same shell as the library) -->
+  <nav style="width: 232px; flex-shrink: 0; display: flex; flex-direction: column; border-right: 1px solid #262b33; background: #0e1114; padding: 20px 12px 16px 12px">
+    <div style="display: flex; align-items: center; gap: 10px; padding: 4px 10px 0 10px">
+      <svg width="22" height="22" viewBox="0 0 20 20" aria-hidden="true">
+        <rect x="0.75" y="4.5" width="18.5" height="11" rx="2.5" fill="none" stroke="#60a5fa" stroke-width="1.5"></rect>
+        <path d="M8.6 7.4 L13.2 10 L8.6 12.6 Z" fill="#60a5fa"></path>
+      </svg>
+      <span style="font-weight: 600; font-size: 15.5px; letter-spacing: -0.01em">VideoShare</span>
+    </div>
+
+    <div style="display: flex; flex-direction: column; gap: 2px; margin-top: 26px">
+      <a href="#" style="display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 6px; background: #172236; color: #e6eaef; font-weight: 500; font-size: 14px">
+        <svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="#60a5fa" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <rect x="2" y="4.5" width="16" height="11" rx="2"></rect><path d="M8.6 7.9 L12.2 10 L8.6 12.1 Z" fill="#60a5fa" stroke="none"></path>
+        </svg>
+        <span>Videos</span>
+      </a>
+      <a href="#" style="display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 6px; color: #9aa4b2; font-size: 14px">
+        <svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
+          <circle cx="10" cy="10" r="7"></circle><circle cx="10" cy="10" r="2.6" fill="currentColor" stroke="none"></circle>
+        </svg>
+        <span>New recording</span>
+      </a>
+      <a href="#" style="display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 6px; color: #9aa4b2; font-size: 14px">
+        <svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true">
+          <path d="M3 6h9M15.5 6h1.5M3 14h2M8.5 14H17"></path>
+          <circle cx="13" cy="6" r="2"></circle><circle cx="6.5" cy="14" r="2"></circle>
+        </svg>
+        <span>Settings</span>
+      </a>
+    </div>
+
+    <div style="flex-grow: 1"></div>
+
+    <div style="display: flex; align-items: center; gap: 8px; padding: 8px 10px; color: #7a8492; font-size: 12.5px">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
+        <path d="M5.25 7.25V5.25a2.75 2.75 0 0 1 5.5 0v2"></path>
+        <rect x="3" y="7.25" width="10" height="6.5" rx="1.6"></rect>
+      </svg>
+      <span>Encrypted in this browser</span>
+    </div>
+    <div style="display: flex; align-items: center; gap: 10px; padding: 10px 10px 2px 10px; border-top: 1px solid #262b33; margin-top: 8px">
+      <span style="width: 28px; height: 28px; border-radius: 50%; background: #172236; color: #60a5fa; display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 600">C</span>
+      <div style="display: flex; flex-direction: column; min-width: 0">
+        <span style="font-size: 13px; color: #e6eaef; overflow: hidden; text-overflow: ellipsis; white-space: nowrap">cody@hypercomply.com</span>
+        <a href="#" style="font-size: 12px; color: #7a8492">Sign out</a>
+      </div>
+    </div>
+  </nav>
+
+  <!-- Main column -->
+  <main style="flex-grow: 1; display: flex; flex-direction: column; min-width: 0; padding: 24px 40px 36px 40px">
+
+    <a href="#" style="display: inline-flex; align-items: center; gap: 6px; color: #7a8492; font-size: 13px; margin-bottom: 14px; align-self: flex-start">
+      <svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M12.5 4.5 L7 10 L12.5 15.5"></path>
+      </svg>
+      All videos
+    </a>
+
+    <div style="display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; margin-bottom: 18px">
+      <div style="display: flex; flex-direction: column; gap: 3px; min-width: 0">
+        <h1 style="margin: 0; font-size: 21px; font-weight: 600; letter-spacing: -0.015em; line-height: 1.25">Sprint demo — auth gateway</h1>
+        <p style="margin: 0; color: #7a8492; font-size: 13.5px">Aug 31, 2026 &middot; 4:12 &middot; 11.8 MB &middot; H.264 &middot; 3840&times;2160</p>
+      </div>
+      <div style="display: flex; align-items: center; gap: 10px; flex-shrink: 0">
+        <button style="display: inline-flex; align-items: center; gap: 8px; padding: 8px 15px; border: 1px solid #60a5fa; border-radius: 6px; background: #60a5fa; color: #0b0f14; font: inherit; font-size: 13.5px; font-weight: 500; cursor: pointer">
+          <svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true">
+            <path d="M8.5 11.5 L11.5 8.5"></path>
+            <path d="M9 6.8 L11 4.8 a2.55 2.55 0 0 1 3.6 3.6 L12.6 10.4"></path>
+            <path d="M11 13.2 L9 15.2 a2.55 2.55 0 0 1 -3.6 -3.6 L7.4 9.6"></path>
+          </svg>
+          Copy link
+        </button>
+        <button style="display: inline-flex; align-items: center; justify-content: center; width: 34px; height: 34px; border: 1px solid #39414c; border-radius: 6px; background: transparent; color: #9aa4b2; cursor: pointer" aria-label="More">
+          <svg width="16" height="16" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
+            <circle cx="4.5" cy="10" r="1.5"></circle><circle cx="10" cy="10" r="1.5"></circle><circle cx="15.5" cy="10" r="1.5"></circle>
+          </svg>
+        </button>
+      </div>
+    </div>
+
+    <!-- Player -->
+    <div style="position: relative; width: 100%; aspect-ratio: 16 / 9; border-radius: 10px; overflow: hidden; background: linear-gradient(135deg, #0d1118 0%, #101823 100%); border: 1px solid #262b33; box-shadow: 0 16px 40px rgba(0, 0, 0, 0.45)">
+      <div style="position: absolute; inset: 0; display: flex; flex-direction: column; gap: 9px; padding: 44px 56px; opacity: 0.4">
+        <span style="height: 12px; width: 34%; border-radius: 3px; background: #3e5a80"></span>
+        <span style="height: 8px; width: 70%; border-radius: 3px; background: #2a3038"></span>
+        <span style="height: 8px; width: 58%; border-radius: 3px; background: #2a3038"></span>
+        <span style="height: 8px; width: 66%; border-radius: 3px; background: #232930"></span>
+        <span style="height: 8px; width: 45%; border-radius: 3px; background: #232930"></span>
+      </div>
+      <span style="position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); width: 72px; height: 72px; border-radius: 50%; background: rgba(4, 6, 8, 0.65); border: 1px solid rgba(230, 234, 239, 0.14); display: flex; align-items: center; justify-content: center">
+        <svg width="26" height="26" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z" fill="#e6eaef"></path></svg>
+      </span>
+      <!-- control bar -->
+      <div style="position: absolute; left: 0; right: 0; bottom: 0; display: flex; align-items: center; gap: 14px; padding: 12px 16px; background: linear-gradient(transparent, rgba(4, 6, 8, 0.8))">
+        <svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z" fill="#e6eaef"></path></svg>
+        <div style="flex-grow: 1; height: 4px; border-radius: 2px; background: rgba(230, 234, 239, 0.2); position: relative">
+          <span style="position: absolute; left: 0; top: 0; bottom: 0; width: 31%; border-radius: 2px; background: #60a5fa"></span>
+          <span style="position: absolute; left: 31%; top: 50%; transform: translate(-50%, -50%); width: 11px; height: 11px; border-radius: 50%; background: #e6eaef"></span>
+        </div>
+        <span style="font-size: 12px; font-family: var(--font-mono); color: #e6eaef">1:18 / 4:12</span>
+      </div>
+    </div>
+
+    <!-- Engagement -->
+    <div style="display: flex; align-items: baseline; justify-content: space-between; margin: 28px 0 12px 0">
+      <h2 style="margin: 0; font-size: 16px; font-weight: 600; letter-spacing: -0.01em">Engagement</h2>
+      <span style="font-size: 12.5px; color: #7a8492">Watch data is encrypted &mdash; only holders of this link can read it</span>
+    </div>
+
+    <div style="display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 14px">
+      <sc-for list="{{stats}}" as="s" hint-placeholder-count="4">
+        <div style="display: flex; flex-direction: column; gap: 2px; padding: 14px 18px; border: 1px solid #262b33; border-radius: 10px; background: #14171c">
+          <span style="font-size: 12.5px; color: #7a8492">{{s.label}}</span>
+          <span style="font-size: 22px; font-weight: 600; letter-spacing: -0.015em; color: #e6eaef">{{s.value}}</span>
+        </div>
+      </sc-for>
+    </div>
+
+    <!-- Replay heatmap -->
+    <div style="display: flex; flex-direction: column; gap: 10px; padding: 18px; border: 1px solid #262b33; border-radius: 10px; background: #14171c; margin-bottom: 14px">
+      <div style="display: flex; align-items: baseline; justify-content: space-between">
+        <span style="font-size: 13.5px; font-weight: 500; color: #e6eaef">Replays across the video</span>
+        <span style="font-size: 12px; color: #7a8492">peak 2.2&times; at 1:33</span>
+      </div>
+      <div style="display: flex; align-items: flex-end; gap: 3px; height: 84px">
+        <sc-for list="{{heat}}" as="b" hint-placeholder-count="50">
+          <span style="flex-grow: 1; border-radius: 2px 2px 0 0; height: {{b.h}}%; background: {{b.color}}"></span>
+        </sc-for>
+      </div>
+      <div style="display: flex; justify-content: space-between; font-size: 11.5px; color: #7a8492; font-family: var(--font-mono)">
+        <span>0:00</span><span>1:03</span><span>2:06</span><span>3:09</span><span>4:12</span>
+      </div>
+    </div>
+
+    <!-- Viewers -->
+    <div style="border: 1px solid #262b33; border-radius: 10px; background: #14171c; overflow: hidden">
+      <div style="display: grid; grid-template-columns: 170px 90px minmax(0, 1fr) 90px 150px; gap: 16px; align-items: center; padding: 10px 18px; border-bottom: 1px solid #262b33; font-size: 12px; color: #7a8492; font-weight: 500">
+        <span>Viewer</span><span>Plays</span><span>Attention</span><span style="text-align: right">Watched</span><span style="text-align: right">Last seen</span>
+      </div>
+      <sc-for list="{{viewers}}" as="w" hint-placeholder-count="4">
+        <div style="display: grid; grid-template-columns: 170px 90px minmax(0, 1fr) 90px 150px; gap: 16px; align-items: center; padding: 12px 18px; border-bottom: 1px solid #1c2129">
+          <span style="font-family: var(--font-mono); font-size: 13px; color: #9aa4b2">{{w.id}}</span>
+          <span style="font-size: 13.5px; color: #e6eaef">{{w.plays}}</span>
+          <div style="display: flex; align-items: flex-end; gap: 2px; height: 26px">
+            <sc-for list="{{w.heat}}" as="b" hint-placeholder-count="50">
+              <span style="flex-grow: 1; border-radius: 1px; height: {{b.h}}%; background: {{b.color}}"></span>
+            </sc-for>
+          </div>
+          <span style="font-size: 13.5px; color: #e6eaef; text-align: right">{{w.watched}}</span>
+          <span style="font-size: 12.5px; color: #7a8492; text-align: right">{{w.last}}</span>
+        </div>
+      </sc-for>
+      <div style="display: flex; align-items: center; justify-content: space-between; padding: 10px 18px">
+        <span style="font-size: 12.5px; color: #7a8492">Showing 4 of 12 viewers</span>
+        <a href="#" style="font-size: 12.5px">View all</a>
+      </div>
+    </div>
+  </main>
+</div>
+</x-dc>
+<script data-dc-script data-props='{}'>
+class Component extends DCLogic {
+  renderVals() {
+    // Heat ramp matching record.css: cool = accent mixed into surface, hot = --recording.
+    const cool = [75, 111, 166], hot = [248, 113, 113];
+    const color = (t) => {
+      const m = Math.min(1, Math.max(0, t));
+      const c = cool.map((v, i) => Math.round(v + (hot[i] - v) * m));
+      return "rgb(" + c.join(", ") + ")";
+    };
+    // Overall curve: strong open, dip, a 2.3x replay spike around 1:32, quiet tail.
+    const overall = [];
+    for (let i = 0; i < 50; i++) {
+      let v = 1.0 - i * 0.011;
+      if (i < 4) v = 1.0;
+      if (i >= 16 && i <= 21) v = 1.4 + 0.9 * Math.exp(-((i - 18.5) * (i - 18.5)) / 3);
+      if (i > 34) v = 0.34 - (i - 35) * 0.004;
+      overall.push(Math.max(0.05, v));
+    }
+    const peak = Math.max(...overall);
+    const heat = overall.map((v) => ({ h: Math.round((v / peak) * 100), color: color(v / peak) }));
+
+    const band = (from, to, level, spike) => {
+      const xs = [];
+      for (let i = 0; i < 50; i++) {
+        let v = i >= from && i <= to ? level : 0.04;
+        if (spike && i >= spike[0] && i <= spike[1]) v = spike[2];
+        xs.push(v);
+      }
+      const p = Math.max(...xs);
+      return xs.map((v) => ({ h: Math.max(6, Math.round((v / p) * 100)), color: color(v / p) }));
+    };
+
+    return {
+      stats: [
+        { label: "Views", value: "38" },
+        { label: "Unique viewers", value: "12" },
+        { label: "Completion rate", value: "58%" },
+        { label: "Avg watch time", value: "2:41" },
+      ],
+      heat,
+      viewers: [
+        { id: "8f3k2Jd0…", plays: "4", heat: band(0, 49, 0.9, [16, 21, 2.1]), watched: "100%", last: "Aug 31, 2:04 PM" },
+        { id: "qT91mVx2…", plays: "2", heat: band(0, 30, 0.8, [17, 20, 1.6]), watched: "74%", last: "Aug 31, 11:26 AM" },
+        { id: "Lw0pR7aB…", plays: "1", heat: band(0, 18, 0.9, null), watched: "39%", last: "Aug 30, 5:48 PM" },
+        { id: "c2NvE4hK…", plays: "1", heat: band(0, 8, 0.85, null), watched: "18%", last: "Aug 30, 9:12 AM" },
+      ],
+    };
+  }
+}
+</script>
+</body>
+</html>

@@ -9,11 +9,14 @@ export default defineConfig({
   build: {
     target: "es2022",
     rollupOptions: {
-      // §1's two pages, and after §16.6 the only two: watch data is read from
-      // the library expander on index.html, not from a third page.
+      // §1's three pages, and the only three (SPEC §12). `video.html` is not
+      // optional: a deploy that drops it breaks every library row's link, and
+      // there is still no `stats.html` — a `stats` chunk in dist/ is a stale
+      // local build.
       input: {
         index: page("index.html"),
         view: page("view.html"),
+        video: page("video.html"),
       },
     },
   },

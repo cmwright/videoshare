@@ -1,34 +1,32 @@
-/* Recorder page (index.html). Shared tokens and base styles come from app.css,
-   loaded first; everything here is page-local.
+/* Recorder page (index.html) — the three views inside the shell (docs/SPEC.md
+   §17.2): the library's rows, the recorder's stages, and the settings forms.
+   app.css ships the tokens and base styles, shell.css the sidebar and the
+   primitives both owner pages draw with; everything here is page-local.
 
-   Design thesis: the share page is the system, and this page joins it. Same
-   topbar, wordmark, encryption badge and footer; same neutral ramp, 12–20px
-   quiet chrome, hairline-plus-soft-shadow elevation in light and hairline alone
-   in dark; the accent appears in the mark, links, focus rings and the one thing
-   this page exists for — the record button. Red is reserved for two meanings and
-   no others: live capture, and destructive or failed.
+   Design thesis, unchanged by §17: the share page is the system, and this page
+   joins it. Same neutral ramp, same 12–20px quiet chrome, same
+   hairline-plus-soft-shadow elevation in light and hairline alone in dark; the
+   accent appears in the mark, links, focus rings and the one thing this page
+   exists for — the record button. Red is reserved for two meanings and no
+   others: live capture, and destructive or failed.
 
    The recorder's six stages share one footprint, the way every state on the
-   share page occupies the player's, so the card never jumps between them.
-
-   The topbar, brand mark and footer rules below are deliberate copies of
-   player.css's: both pages declare their chrome page-locally (SPEC §11), and
-   player.css is not this pass's to edit. view.html / player.css remain the
-   source of truth — change them there first, then here. */
+   share page occupies the player's, so the card never jumps between them. */
 
 :root {
   /* Page-local radii, matching the share page's. The shared --radius-* scale is
-     left alone; --radius-card is what makes a card here read like a panel there. */
+     left alone; --radius-card is what makes a card here read like a panel
+     there. */
   --radius-card: 12px;
   --radius-stage: 12px;
   --radius-pill: 999px;
 
-  --topbar-height: 56px;
-  --column-width: 920px;
-  --gutter: var(--space-5);
+  /* The main column's own gutter, and a cap so a library row does not run to
+     2000px on a wide display. */
+  --gutter: var(--space-6);
+  --content-width: 1120px;
 
-  /* One number for card padding, so a library row's full-bleed hover band and
-     the card it sits in cannot drift apart. */
+  /* One number for card padding, so nothing inside a card has to guess it. */
   --card-pad: var(--space-5);
 
   /* Every recorder stage stands at least this tall. */
@@ -39,172 +37,87 @@
   --stage-bg: #08090b;
   --stage-ring: 0 0 0 1px rgb(16 20 26 / 0.12), var(--shadow-sm);
 
-  /* Heatmap ramp: cool is a calmed accent so a lightly-watched bucket still
-     reads as data, hot is the same red the live dot uses. Both ends are tokens;
-     dashboard.ts interpolates between them with --heat-mix. */
-  --heat-cool: color-mix(in srgb, var(--accent) 70%, var(--surface));
-  --heat-hot: var(--recording);
+  /* A thumbnail is a media surface, so its scrim and glyph are fixed the way
+     --stage-bg is: a play badge that inverted with the theme would sit dark on
+     dark in one of them. */
+  --thumb-scrim: rgb(4 6 8 / 0.62);
+  --thumb-glyph: #e9edf2;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
     /* No drop shadow on near-black: an inset highlight separates it instead. */
     --stage-ring: 0 0 0 1px #2a3039, inset 0 1px 0 rgb(255 255 255 / 0.04);
-    --heat-cool: color-mix(in srgb, var(--accent) 62%, var(--surface));
   }
 }
 
-/* --- Page frame ----------------------------------------------------------- */
-
-body {
-  display: flex;
-  flex-direction: column;
-  min-height: 100vh;
-  min-height: 100svh;
+/* `hidden` has to win over every display rule in this file. §17.2 hides a view
+   with the attribute rather than a class — so that its controls leave the tab
+   order and the accessibility tree — and a `display: flex` container would
+   otherwise keep painting straight through it. Same for the overflow menu and
+   the account chip. */
+[hidden] {
+  display: none !important;
 }
 
-.page {
-  flex: 1;
+/* --- The three views ------------------------------------------------------- */
+
+/* One view is showing at a time; the other two carry `hidden`, which app.css's
+   reset does not override. Nothing here animates between them — a route change
+   is a state change, not a transition. */
+.view {
   display: flex;
   flex-direction: column;
   gap: var(--space-4);
   width: 100%;
-  max-width: var(--column-width);
-  margin: 0 auto;
+  max-width: var(--content-width);
   padding: var(--space-6) var(--gutter) var(--space-7);
 }
 
-/* --- Topbar (mirrors player.css) ------------------------------------------ */
-
-.topbar {
-  flex: none;
-  border-bottom: 1px solid var(--border);
-  background: var(--surface);
-}
-
-.topbar-inner {
+.view-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: var(--space-4);
-  height: var(--topbar-height);
-  max-width: var(--column-width);
-  margin: 0 auto;
-  padding: 0 var(--gutter);
-}
-
-.brand {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-2);
-  color: var(--text);
-  font-size: 14px;
-  font-weight: 600;
-  line-height: 1.2;
-  letter-spacing: -0.006em;
-  text-decoration: none;
-}
-
-.brand:hover {
-  color: var(--accent);
-}
-
-.brand:focus-visible {
-  text-decoration: underline;
-  text-underline-offset: 3px;
-}
-
-.brand-mark {
-  flex: none;
-  width: 18px;
-  height: 18px;
-  display: block;
-}
-
-.brand-mark-frame {
-  fill: var(--accent);
-}
-
-.brand-mark-play {
-  fill: var(--accent-contrast);
-  stroke-linejoin: round;
-}
-
-.badge-secure {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 4px 10px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-pill);
-  background: var(--surface-sunken);
-  color: var(--text-muted);
-  font-size: 12px;
-  font-weight: 500;
-  line-height: 1.2;
-  white-space: nowrap;
-}
-
-.badge-lock {
-  flex: none;
-  width: 12px;
-  height: 12px;
-  display: block;
-}
-
-.badge-lock-body {
-  fill: var(--text-faint);
-}
-
-.badge-lock-shackle {
-  fill: none;
-  stroke: var(--text-faint);
-  stroke-width: 1.5;
-  stroke-linecap: round;
-}
-
-/* --- Page head ------------------------------------------------------------ */
-
-/* Deliberately the same weight as the share page's title block: 20px heading,
-   13px meta line. The hero on this page is the record button, not a banner. */
-.page-head {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
   margin-bottom: var(--space-1);
 }
 
-.page-head h1 {
-  font-size: 20px;
-  font-weight: 600;
-  line-height: 1.3;
-  letter-spacing: -0.015em;
+.view-head-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
 }
 
-.page-lede {
+.view-head h1 {
+  font-size: 1.375rem;
+}
+
+.view-sub {
   max-width: 62ch;
-  color: var(--text-muted);
-  font-size: 13px;
+  color: var(--text-faint);
+  font-size: 0.84375rem;
   line-height: 1.55;
   text-wrap: pretty;
+}
+
+.view-sub:empty {
+  display: none;
+}
+
+.view-head > button {
+  flex: none;
 }
 
 /* --- Footer (mirrors player.css) ------------------------------------------ */
 
 .site-footer {
-  flex: none;
+  margin-top: auto;
+  padding: var(--space-5) var(--gutter);
   border-top: 1px solid var(--border);
-  background: transparent;
   color: var(--text-faint);
   font-size: 12px;
   line-height: 1.5;
-}
-
-.footer-inner {
-  max-width: var(--column-width);
-  margin: 0 auto;
-  padding: var(--space-5) var(--gutter);
-  text-align: center;
 }
 
 .site-footer a {
@@ -218,7 +131,7 @@ body {
   text-decoration: underline;
 }
 
-/* --- Cards ---------------------------------------------------------------- */
+/* --- Cards and blocks ----------------------------------------------------- */
 
 /* app.css ships the primitive; these two lines are what make it read as a
    sibling of the share page's state panel rather than a rounder, softer box. */
@@ -233,24 +146,27 @@ body {
   }
 }
 
-.card-head {
+/* A settings block. No <details>, no disclosure widget: §17 took the panels off
+   these — the settings view's blocks are simply there. */
+.block {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.block-head {
   display: flex;
   flex-direction: column;
   gap: var(--space-1);
 }
 
-.card-head h2 {
-  font-size: 16px;
+.block-head h2 {
+  font-size: 1rem;
 }
 
-.card-sub {
+.block-sub {
   color: var(--text-muted);
-  font-size: 12.5px;
-  line-height: 1.5;
-}
-
-.hint {
-  font-size: 0.8125rem;
+  font-size: 0.78125rem;
   line-height: 1.5;
 }
 
@@ -293,17 +209,11 @@ code {
   }
 }
 
-/* --- Sign-in (gateway mode, SPEC §15.5) ----------------------------------- */
-
-.auth {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-3);
-}
+/* --- Account block (gateway mode, SPEC §17.1) ----------------------------- */
 
 /* Both status lines start empty and stay out of the layout until they say
    something. */
-.auth > :empty {
+#account-panel > :empty {
   display: none;
 }
 
@@ -322,9 +232,7 @@ code {
   gap: var(--space-3) var(--space-4);
 }
 
-/* The explanation sits above Google's button; the signed-in line shares its row. */
 .auth-lead {
-  flex-basis: 100%;
   max-width: 64ch;
   color: var(--text-muted);
   font-size: 0.8125rem;
@@ -335,11 +243,6 @@ code {
 .auth-lead strong {
   color: var(--text);
   font-weight: 600;
-}
-
-/* Google renders its own button here; it must not be stretched by the row. */
-#auth-button {
-  flex: none;
 }
 
 .auth-identity {
@@ -394,91 +297,12 @@ code {
   text-wrap: pretty;
 }
 
-/* --- Disclosure panels ---------------------------------------------------- */
+/* --- Form fields ---------------------------------------------------------- */
 
-.panel {
-  padding: 0;
-  /* Keeps the summary's hover band inside the card's rounded corners. */
-  overflow: hidden;
-}
-
-.panel-summary {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-4);
-  padding: var(--space-4) var(--card-pad);
-  cursor: pointer;
-  list-style: none;
-  transition: background-color 0.12s ease;
-}
-
-/* Safari still paints the default triangle without this. */
-.panel-summary::-webkit-details-marker {
-  display: none;
-}
-
-.panel-summary:hover {
-  background: var(--surface-sunken);
-}
-
-/* The card clips its corners, so the ring goes inside rather than around. */
-.panel-summary:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: -2px;
-}
-
-.panel-summary-text {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-  min-width: 0;
-}
-
-.panel-title {
-  color: var(--text);
-  font-size: 15px;
-  font-weight: 600;
-  line-height: 1.35;
-  letter-spacing: -0.01em;
-}
-
-.panel-sub {
-  color: var(--text-muted);
-  font-size: 12.5px;
-  line-height: 1.4;
-}
-
-/* A drawn chevron, not a "▾": the glyph's size and baseline differ per font,
-   and the analytics expander (built in JS, no room for an SVG) needs the same
-   mark as these two. */
-.panel-summary::after,
-.analytics > summary::after {
-  content: "";
-  flex: none;
-  width: 7px;
-  height: 7px;
-  border-right: 1.6px solid currentColor;
-  border-bottom: 1.6px solid currentColor;
-  opacity: 0.6;
-  transform: translateY(-2px) rotate(45deg);
-  transition: transform 0.15s ease;
-}
-
-.panel[open] > .panel-summary::after,
-.analytics[open] > summary::after {
-  transform: translateY(1px) rotate(225deg);
-}
-
-.panel[open] > .panel-summary {
-  border-bottom: 1px solid var(--border);
-}
-
-.panel-body {
+#settings-form {
   display: flex;
   flex-direction: column;
   gap: var(--space-4);
-  padding: var(--card-pad);
 }
 
 .panel-note {
@@ -488,8 +312,6 @@ code {
   line-height: 1.55;
   text-wrap: pretty;
 }
-
-/* --- Form fields ---------------------------------------------------------- */
 
 .field-group {
   min-width: 0;
@@ -543,8 +365,9 @@ code {
   border-top: 1px solid var(--border);
 }
 
-/* The recording panel saves on change, so its confirmation is a line of its own
-   rather than a row beside a button — and nothing at all until there is one. */
+/* The recording options block saves on change, so its confirmation is a line of
+   its own rather than a row beside a button — and nothing at all until there is
+   one. */
 #recording-status:empty,
 #settings-status:empty {
   display: none;
@@ -629,7 +452,7 @@ code {
   border-radius: 50%;
   background: currentColor;
   /* A ring around the dot, so it reads as a record indicator rather than a
-     bullet — the shape survives at the button's one size. */
+     bullet — the shape survives at either size it is drawn at. */
   box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 22%, transparent);
   margin-right: 2px;
 }
@@ -895,6 +718,7 @@ code {
   align-items: center;
   justify-content: center;
   min-height: 280px;
+  margin: var(--space-6) var(--gutter);
   padding: var(--space-6);
   border: 1px solid var(--border);
   border-radius: var(--radius-card);
@@ -926,16 +750,15 @@ code {
   text-wrap: pretty;
 }
 
-/* --- Page message --------------------------------------------------------- */
+/* --- Messages ------------------------------------------------------------- */
 
-/* One line for everything the recorder has to say about itself: a note in
+/* One line per view for everything that view has to say about itself: a note in
    neutral, an error in danger. The dot is drawn, never a character, so a
    role="status" region announces the text and nothing else. */
 .message {
   display: flex;
   align-items: flex-start;
   gap: var(--space-3);
-  margin-top: var(--space-5);
   padding: var(--space-3) var(--space-4);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
@@ -944,6 +767,10 @@ code {
   font-size: 0.875rem;
   line-height: 1.55;
   text-wrap: pretty;
+}
+
+.recorder .message {
+  margin-top: var(--space-5);
 }
 
 .message::before {
@@ -970,22 +797,16 @@ code {
   background: var(--danger);
 }
 
-/* --- Library -------------------------------------------------------------- */
-
-.library {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-4);
-}
+/* --- Library (SPEC §17.3) ------------------------------------------------- */
 
 .library-empty {
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: var(--space-3);
-  padding: var(--space-6) var(--space-4);
+  padding: var(--space-7) var(--space-4);
   border: 1px dashed var(--border-strong);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-card);
   color: var(--text-muted);
   font-size: 0.875rem;
   line-height: 1.55;
@@ -1014,46 +835,155 @@ code {
 }
 
 .library-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
   margin: 0;
   padding: 0;
   list-style: none;
 }
 
-/* The row's hover band bleeds to the card's edge, which is why --card-pad is a
-   single number rather than two that have to be kept equal. */
+/* A row is a card, not a list line: the thumbnail gives it a height a hairline
+   divider could not carry. */
 .library-item {
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
-  gap: var(--space-2) var(--space-3);
-  margin-inline: calc(var(--card-pad) * -1);
-  padding: var(--space-3) var(--card-pad);
-  border-top: 1px solid var(--border);
+  gap: var(--space-4);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  background: var(--surface);
+  transition: background-color 0.12s ease, border-color 0.12s ease;
 }
 
 .library-item:hover {
-  background: color-mix(in srgb, var(--surface-sunken) 55%, transparent);
+  border-color: var(--border-strong);
+  background: color-mix(in srgb, var(--surface-sunken) 45%, var(--surface));
+}
+
+/* Thumbnail placeholder: a CSS pattern, a play glyph and a duration chip. No
+   image is fetched, decoded or stored — real thumbnails are a separate item,
+   and nothing here anticipates them beyond leaving the block's shape for one
+   (SPEC §17.3). */
+.thumb {
+  position: relative;
+  flex: none;
+  width: 172px;
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--thumb-tint, var(--accent)) 12%, var(--surface-sunken)),
+    color-mix(in srgb, var(--thumb-tint, var(--accent)) 4%, var(--surface-sunken))
+  );
+  text-decoration: none;
+}
+
+/* Five variants, chosen from the entry's id by a pure function so a row looks
+   the same on every reload. Decoration, and marked aria-hidden as such. */
+.thumb[data-variant="0"] {
+  --thumb-tint: var(--accent);
+}
+
+.thumb[data-variant="1"] {
+  --thumb-tint: var(--text-muted);
+}
+
+.thumb[data-variant="2"] {
+  --thumb-tint: color-mix(in srgb, var(--accent) 55%, var(--success));
+}
+
+.thumb[data-variant="3"] {
+  --thumb-tint: var(--text-faint);
+}
+
+.thumb[data-variant="4"] {
+  --thumb-tint: color-mix(in srgb, var(--accent) 35%, var(--text-muted));
+}
+
+/* Four lines of "content", drawn entirely with background layers: a heading in
+   the row's own tint and three neutral ones under it. */
+.thumb-pattern {
+  position: absolute;
+  inset: 0;
+  background-repeat: no-repeat;
+  background-image: linear-gradient(
+      color-mix(in srgb, var(--thumb-tint, var(--accent)) 60%, transparent),
+      color-mix(in srgb, var(--thumb-tint, var(--accent)) 60%, transparent)
+    ),
+    linear-gradient(
+      color-mix(in srgb, var(--text-faint) 34%, transparent),
+      color-mix(in srgb, var(--text-faint) 34%, transparent)
+    ),
+    linear-gradient(
+      color-mix(in srgb, var(--text-faint) 28%, transparent),
+      color-mix(in srgb, var(--text-faint) 28%, transparent)
+    ),
+    linear-gradient(
+      color-mix(in srgb, var(--text-faint) 22%, transparent),
+      color-mix(in srgb, var(--text-faint) 22%, transparent)
+    );
+  background-size: 46% 7%, 78% 5%, 64% 5%, 71% 5%;
+  background-position: 8% 18%, 8% 38%, 8% 55%, 8% 72%;
+}
+
+.thumb-play {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  background: var(--thumb-scrim);
+  transform: translate(-50%, -50%);
+}
+
+.thumb-play-glyph {
+  width: 14px;
+  height: 14px;
+  fill: var(--thumb-glyph);
+}
+
+.thumb-duration {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--thumb-scrim);
+  color: var(--thumb-glyph);
+  font-family: var(--font-mono);
+  font-size: 0.71875rem;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.5;
 }
 
 .library-details {
+  display: flex;
   flex: 1;
+  flex-direction: column;
+  gap: 3px;
   min-width: 0;
 }
 
 .library-title {
-  display: block;
   overflow: hidden;
   color: var(--text);
-  font-size: 0.9375rem;
-  font-weight: 500;
-  letter-spacing: -0.006em;
+  font-size: 0.96875rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
   text-decoration: none;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.library-title:hover,
-.library-title:focus-visible {
+a.library-title:hover,
+a.library-title:focus-visible {
   color: var(--accent);
   text-decoration: underline;
   text-underline-offset: 2px;
@@ -1062,257 +992,180 @@ code {
 /* Date · duration · size · bitrate — four numbers that should line up between
    rows. */
 .library-sub {
-  font-size: 12.5px;
-  font-variant-numeric: tabular-nums;
-}
-
-.library-item > button {
-  flex: none;
-  font-size: 0.8125rem;
-}
-
-/* record.ts appends copy then remove, both .ghost with nothing to tell them
-   apart; :nth-of-type is that difference, and it only colours a hover. */
-.library-item > button:nth-of-type(2):hover:not(:disabled) {
-  color: var(--danger);
-}
-
-/* --- Analytics expander (SPEC §16.6) --------------------------------------
-
-   Watch data lives on the row of the video it is about, so this is a panel
-   inside a library item rather than a page of its own. The heatmap is plain CSS
-   bars: no chart library, no canvas, no external asset — this decrypts private
-   watch data, and nothing about drawing fifty rectangles is worth a third-party
-   script. */
-
-.analytics,
-.analytics-hint {
-  flex-basis: 100%;
-  margin-top: var(--space-1);
-}
-
-.analytics > summary {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-2);
-  color: var(--text-muted);
-  cursor: pointer;
-  font-size: 0.8125rem;
-  font-weight: 600;
-  list-style: none;
-}
-
-.analytics > summary::-webkit-details-marker {
-  display: none;
-}
-
-.analytics > summary:hover {
-  color: var(--accent);
-}
-
-.analytics > summary:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 3px;
-  border-radius: 3px;
-}
-
-.analytics-body {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-3);
-  margin-top: var(--space-3);
-  padding: var(--space-4);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface-sunken);
-}
-
-.analytics-summary {
-  color: var(--text-muted);
-  font-size: 0.875rem;
-}
-
-.analytics-summary strong {
-  color: var(--text);
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
-}
-
-/* Errors and notes inside the expander are quiet by contract: none of them is
-   the page's business (SPEC §16.6). */
-.analytics-body .hint:empty {
-  display: none;
-}
-
-/* The "reload" affordance — a link, not a button, because it is an aside. */
-.link-button {
-  align-self: flex-start;
-  padding: 0;
-  border: none;
-  background: none;
-  color: var(--text-faint);
-  font-size: 0.75rem;
-  font-weight: 400;
-  text-decoration: underline;
-  text-underline-offset: 2px;
-  cursor: pointer;
-}
-
-.link-button:hover:not(:disabled) {
-  color: var(--accent);
-  background: none;
-  border-color: transparent;
-}
-
-/* --- Heatmap -------------------------------------------------------------- */
-
-.heatmap {
-  display: flex;
-  align-items: flex-end;
-  gap: 1px;
-  height: 76px;
-  padding: 3px;
-  border-radius: var(--radius-sm);
-  background: var(--surface);
-  box-shadow: inset 0 0 0 1px var(--border);
-}
-
-.heat-bar {
-  flex: 1;
-  min-width: 0;
-  /* A bucket nobody watched still shows a hairline, so fifty bars stay fifty
-     bars and the axis reads as a timeline rather than as missing data. */
-  min-height: 2px;
-  border-radius: 2px 2px 0 0;
-  /* Height is shape within this video; colour is intensity against a single
-     pass. Below 1x the bar warms with the ratio. The fallback has to be a plain
-     colour: --heat-cool is itself a color-mix(), so where color-mix is
-     unavailable it would fail alongside the line below and leave the bar
-     transparent. Flat accent is the un-warmed end of the same ramp. */
-  background: var(--accent);
-  background: color-mix(in srgb, var(--heat-hot) var(--heat-mix, 0%), var(--heat-cool));
-}
-
-/* At or above one full pass — the threshold the whole heat number exists for,
-   and it has to be legible at a glance (SPEC §16.6). */
-.heat-bar.hot {
-  background: var(--heat-hot);
-}
-
-.heat-axis {
-  display: flex;
-  justify-content: space-between;
-  color: var(--text-faint);
-  font-size: 11px;
-}
-
-/* The axis belongs to the heatmap above it, not to the gap between siblings. */
-.heatmap + .heat-axis {
-  margin-top: calc(var(--space-3) * -1 + 4px);
-}
-
-/* --- Per-viewer rows ------------------------------------------------------ */
-
-.viewers {
-  display: flex;
-  flex-direction: column;
-}
-
-.viewer-row {
-  display: grid;
-  grid-template-columns: 9ch 5.5rem minmax(0, 1fr) 3.5rem auto;
-  align-items: center;
-  gap: var(--space-3);
-  padding: var(--space-2) 0;
-  border-top: 1px solid var(--border);
-  font-size: 0.8125rem;
-}
-
-.viewer-row:first-child {
-  border-top: none;
-  padding-top: 0;
-}
-
-.viewer-row .heatmap {
-  height: 34px;
-}
-
-.viewer-id {
   overflow: hidden;
-  color: var(--text-muted);
-  font-family: var(--font-mono);
-  font-size: 0.75rem;
+  font-size: 0.8125rem;
+  font-variant-numeric: tabular-nums;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.viewer-plays {
-  white-space: nowrap;
+/* The space a summary will occupy, held from the first paint so a row does not
+   reflow when its two numbers arrive (SPEC §17.3). */
+.library-summary {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 1px;
+  min-width: 92px;
 }
 
-.viewer-coverage {
+.summary-value {
   color: var(--text);
+  font-size: 0.9375rem;
+  font-weight: 600;
   font-variant-numeric: tabular-nums;
-  text-align: right;
 }
 
-.viewer-when {
+.summary-label,
+.summary-empty {
+  color: var(--text-faint);
   font-size: 0.75rem;
-  font-variant-numeric: tabular-nums;
   white-space: nowrap;
+}
+
+.library-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.row-copy {
+  padding: var(--space-2) var(--space-3);
+  font-size: 0.84375rem;
+}
+
+.icon-link {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+}
+
+/* The overflow menu. Escape closes it, focus returns to the trigger, and the
+   whole thing works from the keyboard (SPEC §17.3). */
+.row-menu {
+  position: relative;
+}
+
+.row-menu-trigger {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 1rem;
+  line-height: 1;
+}
+
+.row-menu-trigger:hover:not(:disabled),
+.row-menu-trigger[aria-expanded="true"] {
+  background: var(--surface-sunken);
+  border-color: var(--border);
+  color: var(--text);
+}
+
+.row-menu-popup {
+  position: absolute;
+  top: calc(100% + var(--space-1));
+  right: 0;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  width: 17rem;
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  box-shadow: var(--shadow-md);
+}
+
+.row-menu-item {
+  justify-content: flex-start;
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border-color: transparent;
+  background: transparent;
+  font-size: 0.875rem;
+}
+
+.row-menu-item:hover:not(:disabled) {
+  border-color: transparent;
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+  color: var(--danger);
+}
+
+/* §9's warning, kept where it can be read rather than in a tooltip: the entry
+   goes, the video stays in the bucket. */
+.row-menu-note {
+  padding: 0 var(--space-3) var(--space-1);
+  color: var(--text-faint);
+  font-size: 0.75rem;
+  line-height: 1.45;
+  text-wrap: pretty;
 }
 
 /* --- Responsive ----------------------------------------------------------- */
 
-/* The five-column viewer row needs about 380px for its labels before the
-   heatmap gets anything; below that the labels wrap around it instead. */
-@media (max-width: 700px) {
-  .viewer-row {
-    grid-template-columns: minmax(0, 1fr) auto;
-    grid-template-areas:
-      "who   seen"
-      "map   map"
-      "plays when";
-    gap: var(--space-2) var(--space-3);
+@media (max-width: 900px) {
+  :root {
+    --gutter: var(--space-5);
   }
 
-  .viewer-id {
-    grid-area: who;
+  .view {
+    padding: var(--space-5) var(--gutter) var(--space-6);
+  }
+}
+
+/* The row's four columns stop fitting: the summary and the actions drop under
+   the title, and the thumbnail shrinks rather than the words. */
+@media (max-width: 720px) {
+  .library-item {
+    flex-wrap: wrap;
+    gap: var(--space-3);
   }
 
-  .viewer-coverage {
-    grid-area: seen;
+  .thumb {
+    width: 124px;
   }
 
-  .viewer-row .heatmap {
-    grid-area: map;
+  .library-details {
+    flex-basis: calc(100% - 124px - var(--space-3));
   }
 
-  .viewer-plays {
-    grid-area: plays;
+  .library-summary {
+    align-items: flex-start;
+    min-width: 0;
+    flex-direction: row;
+    gap: var(--space-2);
   }
 
-  .viewer-when {
-    grid-area: when;
-    text-align: right;
+  .library-actions {
+    margin-left: auto;
   }
 }
 
 @media (max-width: 600px) {
   :root {
-    --topbar-height: 52px;
     --gutter: var(--space-4);
     --card-pad: var(--space-4);
     --radius-card: 10px;
     --radius-stage: 10px;
   }
 
-  .page {
-    padding: var(--space-5) var(--gutter) var(--space-6);
+  .view-head {
+    flex-direction: column;
+    align-items: stretch;
   }
 
-  .page-head h1 {
-    font-size: 18px;
+  .view-head h1 {
+    font-size: 1.25rem;
   }
 
   .fields {
@@ -1340,33 +1193,16 @@ code {
     width: 100%;
   }
 
+  .thumb {
+    width: 100%;
+  }
+
   .library-details {
     flex-basis: 100%;
   }
 
-  .analytics-body {
-    padding: var(--space-3);
-  }
-
-  .footer-inner {
-    padding: var(--space-4) var(--gutter);
-  }
-
-  /* The badge collapses to the lock alone; the label stays in the accessibility
-     tree rather than being replaced by an aria-label on a non-focusable span. */
-  .badge-secure {
-    padding: 5px;
-  }
-
-  .badge-label {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    padding: 0;
-    margin: -1px;
-    overflow: hidden;
-    clip-path: inset(50%);
-    white-space: nowrap;
+  .row-menu-popup {
+    width: min(17rem, calc(100vw - var(--space-6)));
   }
 }
 
@@ -1375,9 +1211,7 @@ code {
 @media (prefers-reduced-motion: reduce) {
   .record-button,
   .button-link,
-  .panel-summary,
-  .panel-summary::after,
-  .analytics > summary::after,
+  .library-item,
   .progress-fill {
     transition: none;
   }

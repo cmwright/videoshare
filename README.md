@@ -21,18 +21,30 @@ serve. Browsers have done all four natively for years.
 
 So VideoShare is the smallest thing that works:
 
-- **`index.html`** — the recorder. Captures screen + mic, encodes with WebCodecs
-  — on the machine's hardware H.264 encoder where there is one, in software
-  otherwise — encrypts with WebCrypto, and sends the ciphertext to
-  your bucket *while you are still recording*: every 8 MiB goes up as one part of a
-  SigV4-signed S3 multipart upload, so stopping only leaves the tail to flush and
-  the link lands about as fast as you can read it. One chunk is encrypted at a
-  time, so an hour-long recording costs no more memory than a one-minute one.
-  Settings and a local library of your links live in `localStorage`.
-- **`view.html`** — the player. Holds no credentials at all. Reads the id and key
-  from the URL fragment, fetches ciphertext from the bucket's public URL,
-  decrypts it, and plays — streaming through Media Source Extensions where the
-  browser supports it, whole-file otherwise.
+- **`index.html`** — the app you use: a sidebar and three views behind one hash
+  route. **Videos** is the library — one row per recording this browser made,
+  with its date, duration, size, a Copy link button and, with a gateway and
+  analytics on, how many times it was watched. **New recording** is the recorder:
+  it captures screen + mic, encodes with WebCodecs — on the machine's hardware
+  H.264 encoder where there is one, in software otherwise — encrypts with
+  WebCrypto, and sends the ciphertext to your bucket *while you are still
+  recording*: every 8 MiB goes up as one part of a SigV4-signed S3 multipart
+  upload, so stopping only leaves the tail to flush and the link lands about as
+  fast as you can read it. One chunk is encrypted at a time, so an hour-long
+  recording costs no more memory than a one-minute one. **Settings** holds the
+  bucket credentials and the encoder choices. All of it — settings and the
+  library of your links — lives in `localStorage`, and a recording keeps
+  uploading whichever view you are looking at.
+- **`video.html`** — your page for one video. Same link format as a share link
+  (`#{id}.{key}`), so it plays the same bytes the same way, with everything the
+  watch data says about it underneath: views, unique viewers, completion rate,
+  average watch time, a replay heatmap and a row per viewer. Nobody else is sent
+  this URL; it is what a library row opens.
+- **`view.html`** — the player, and the only page a recipient sees. Holds no
+  credentials at all. Reads the id and key from the URL fragment, fetches
+  ciphertext from the bucket's public URL, decrypts it, and plays — streaming
+  through Media Source Extensions where the browser supports it, whole-file
+  otherwise.
 
 The output is a `dist/` folder of static files. Host it on GitHub Pages,
 Cloudflare Pages, S3, or a Raspberry Pi. Anything that speaks the S3 API can be
@@ -54,7 +66,7 @@ npm run build
 docker compose -f examples/docker-compose.yml up -d
 ```
 
-Open **http://localhost:8080** and fill in the settings panel:
+Open **http://localhost:8080**, go to **Settings**, and fill in the storage form:
 
 | Field | Value |
 | --- | --- |
@@ -107,7 +119,10 @@ Two things move: the bucket, and where the static site lives.
    This is the value the *player* uses, so it has to be correct before you
    deploy. It is copied verbatim into `dist/`, so you can also edit it in a built
    site without rebuilding.
-3. **Publish `dist/`** anywhere static. Share links are
+3. **Publish `dist/`** — all of it, anywhere static. It is three pages
+   (`index.html`, `video.html`, `view.html`) plus assets; a deploy that drops
+   `video.html` still records and still plays shared links, but every row in
+   **Videos** then opens a 404. Share links are
    `{wherever you published}/view.html#{id}.{key}`, so the site needs a stable
    home — a moved site breaks every link you have already sent.
 
@@ -150,10 +165,10 @@ and answers with **presigned URLs**. The browser then uploads to those URLs
 directly. The gateway signs; it never carries a byte of video, by design and by
 test, so it stays cheap and small no matter how much you record.
 
-Turning it on is one line in `public/config.js`. The recorder drops its storage
-settings panel and asks you to sign in instead, keeping a small **Recording
-options** panel for the quality, codec and fallback-bitrate choices — those are
-yours, not the bucket's. Everything else — browser-side encryption, the key in
+Turning it on is one line in `public/config.js`. Settings drops its storage form
+and the sidebar grows an account chip that asks you to sign in instead, keeping
+the **Recording options** block for the quality, codec and fallback-bitrate
+choices — those are yours, not the bucket's. Everything else — browser-side encryption, the key in
 the fragment, existing share links — is untouched, and the player stays
 anonymous: it holds no credentials and never asks a viewer to sign in. Exactly
 one thing does change for viewers, it is off unless you switch it on, and it is
@@ -171,12 +186,12 @@ A gateway can also collect **playback analytics**, and this is the one feature
 that changes what `view.html` does. Point the gateway's `ANALYTICS_BUCKET` at a
 second, **private** bucket and the player starts reporting: every 30 seconds
 while a video plays, on pause, and once more when the tab goes away, it sends what
-has been watched so far to the gateway, which writes it to that bucket. There is no third
-page: every entry in **My videos** grows an **Analytics** expander once you are
-signed in, and opening one reads that video's data back — views, unique viewers,
-completions, and a **replay heatmap** of which 2% of the video got watched twice
-and which got skipped, overall and per viewer. Watch data lives on the row of the
-video it is about, which is also the row that already holds its share link.
+has been watched so far to the gateway, which writes it to that bucket. There is no
+stats page: watch data lives with the video it is about. Signed in, each row in
+**Videos** carries its two headline numbers ("38 views · 12 viewers"), and
+opening a row reads the rest back on that video's own page — completion rate,
+average watch time, a **replay heatmap** of which 2% of the video got watched
+twice and which got skipped, and the same heatmap per viewer.
 
 The heatmap is time actually spent, not coverage: a section played through twice
 reads about 2×, and scrubbing across the video adds nothing at all. Videos

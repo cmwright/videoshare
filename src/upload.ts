@@ -20,6 +20,9 @@
 import { AwsClient } from "aws4fetch";
 import { chunkAad, encryptBlock, exportKeyB64, metaAad } from "./crypto";
 import type { Settings, VideoMeta } from "./types";
+// SPEC §11: the link format lives in util.ts, where the video page can reach it
+// without pulling this module's signing machinery in behind it.
+import { shareLink } from "./util";
 
 export interface UploadResult {
   id: string;
@@ -1010,12 +1013,6 @@ async function sha256Hex(bytes: Uint8Array<ArrayBuffer>): Promise<string> {
   let hex = "";
   for (const byte of digest) hex += byte.toString(16).padStart(2, "0");
   return hex;
-}
-
-function shareLink(id: string, keyB64: string): string {
-  const fragment = `#${id}.${keyB64}`;
-  const here = typeof location === "undefined" ? "" : location.href;
-  return here ? new URL("view.html", here).href + fragment : `view.html${fragment}`;
 }
 
 function originLabel(): string {

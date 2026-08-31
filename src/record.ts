@@ -1,18 +1,38 @@
 /**
- * Recorder page controller (docs/SPEC.md §6).
+ * Recorder page controller (docs/SPEC.md §6, §17.2, §17.3).
  *
- * State machine: idle → picking → recording → preview → finishing → done.
- * The multipart upload is created at record start and fed 8 MiB chunks while
- * the capture is still running, so Finish only has to send the tail. Everything
- * leaves this page encrypted; the key only ever lands in the share link's fragment.
+ * Two subjects share this module, the way they share the page:
+ *
+ * - the **shell** — three hash-routed views around one sidebar (§17.2), the
+ *   settings view's two modes (§15.5) and the library (§17.3);
+ * - the **recorder** — idle → picking → recording → preview → finishing → done,
+ *   unchanged by §17 down to its element ids. The multipart upload is created at
+ *   record start and fed 8 MiB chunks while the capture is still running, so
+ *   Finish only has to send the tail.
+ *
+ * Routing never touches the recorder: a recording, its timer, its assembler and
+ * its upload run on while the reader is in another view. The pull the other way
+ * is §6's rule — a transition into `preview`, `finishing` or `done` shows the
+ * record view, because those stages are asking the reader for something.
+ *
+ * Everything leaves this page encrypted; the key only ever lands in the share
+ * link's fragment.
  */
 
 import "./app.css";
+import "./shell.css";
 import "./record.css";
 
 import { type Auth, type AuthState, createAuth } from "./auth";
 import { CHUNK_OVERHEAD, CHUNK_SIZE, generateKey } from "./crypto";
-import { type AnalyticsDeps, analyticsExpander, analyticsHint } from "./dashboard";
+import {
+  type AnalyticsDeps,
+  LIBRARY_CONCURRENCY,
+  LIBRARY_SUMMARY_EAGER,
+  loadReport,
+  summarize,
+  type VideoSummary,
+} from "./dashboard";
 import {
   createEngine,
   type RecorderEngine,
@@ -36,6 +56,7 @@ import {
   saveRecordingPrefs,
   saveSettings,
 } from "./settings";
+import { type AccountChip, demand, initAccountChip, startRouter, type ViewName } from "./shell";
 import type {
   CodecChoice,
   GatewayConfig,
@@ -52,7 +73,14 @@ import {
   type Signer,
   type UploadSession,
 } from "./upload";
-import { formatBytes, formatDuration, randomId } from "./util";
+import {
+  codecLabel,
+  formatBytes,
+  formatDuration,
+  parseShareFragment,
+  randomId,
+  videoPageLink,
+} from "./util";
 
 /** Capture target (SPEC §6): `ideal` pulls Chrome up to native PHYSICAL pixels
  * (its default for screen capture is the logical/CSS size — half density on
@@ -69,6 +97,9 @@ const HIGH_RES_PIXELS = 2560 * 1440;
 /** Cap on waiting for the preview element during the duration probe. */
 const ELEMENT_TIMEOUT_MS = 5000;
 
+/** Thumbnail placeholder variants (SPEC §17.3) — CSS-only, keyed off the id. */
+const THUMB_VARIANTS = 5;
+
 // --- DOM ---------------------------------------------------------------------
 
 function el<T extends Element>(selector: string): T {
@@ -79,9 +110,10 @@ function el<T extends Element>(selector: string): T {
 
 const stages = Array.from(document.querySelectorAll<HTMLElement>("[data-stage]"));
 
-const settingsPanel = el<HTMLDetailsElement>("#settings-panel");
+const settingsPanel = el<HTMLElement>("#settings-panel");
 const settingsForm = el<HTMLFormElement>("#settings-form");
 const settingsStatus = el<HTMLElement>("#settings-status");
+const settingsLive = el<HTMLElement>("#settings-live");
 
 const recordingPanel = el<HTMLElement>("#recording-panel");
 const recordingQuality = el<HTMLSelectElement>("#rec-quality");
@@ -89,15 +121,19 @@ const recordingCodec = el<HTMLSelectElement>("#rec-codec");
 const recordingBitrate = el<HTMLInputElement>("#rec-videoBitsPerSecond");
 const recordingStatus = el<HTMLElement>("#recording-status");
 
-const authPanel = el<HTMLElement>("#auth-panel");
+const accountPanel = el<HTMLElement>("#account-panel");
+const accountChipBox = el<HTMLElement>("#account-chip");
+const accountHint = el<HTMLElement>("#account-hint");
 const authLoading = el<HTMLElement>("#auth-loading");
 const authSignedOut = el<HTMLElement>("#auth-signed-out");
 const authSignedIn = el<HTMLElement>("#auth-signed-in");
-const authButton = el<HTMLElement>("#auth-button");
 const authEmail = el<HTMLElement>("#auth-email");
 const authStatus = el<HTMLElement>("#auth-status");
 const authWarning = el<HTMLElement>("#auth-warning");
-const signOutButton = el<HTMLButtonElement>("#sign-out");
+const accountSignOut = el<HTMLButtonElement>("#account-sign-out");
+
+const navLiveDot = el<HTMLElement>("#nav-live-dot");
+const navLiveLabel = el<HTMLElement>("#nav-live-label");
 
 const micToggle = el<HTMLInputElement>("#mic");
 const startButton = el<HTMLButtonElement>("#start");
@@ -125,6 +161,9 @@ const againButton = el<HTMLButtonElement>("#again");
 const messageLine = el<HTMLElement>("#message");
 const libraryList = el<HTMLUListElement>("#library-list");
 const libraryEmpty = el<HTMLElement>("#library-empty");
+const libraryCount = el<HTMLElement>("#library-count");
+const libraryStatus = el<HTMLElement>("#library-status");
+const newRecordingButton = el<HTMLButtonElement>("#new-recording");
 
 // --- State -------------------------------------------------------------------
 
@@ -150,8 +189,17 @@ interface Finished {
 
 let stage: Stage = "idle";
 
+/** The three views and the hash between them (SPEC §17.2). */
+const router = startRouter();
+
 /** Set once config.js names a gateway (SPEC §15.5); stays null in legacy mode. */
 let gateway: { auth: Auth; signer: Signer } | null = null;
+/**
+ * The sidebar's chip, once the mode is known. Until then it is a stub: calling
+ * `initAccountChip(null)` here would remove the chip before gateway mode had a
+ * chance to claim it (SPEC §17.1).
+ */
+let accountChip: AccountChip = { render: () => undefined, highlight: () => undefined };
 /**
  * Gateway mode's encoder choices (SPEC §15.5), and this session's source of
  * truth for them: a browser that refuses to store a choice still has to record
@@ -169,10 +217,10 @@ let captureSupported = true;
 /** Gateway mode with no usable ID token: recording must not start. */
 let signInRequired = false;
 /**
- * What the library rows need to offer analytics (SPEC §16.6): the gateway must
- * have said `analytics: true`, and there must be a token to list with. Null deps
- * or `analytics: false` means a plain row — no expander, no hint, no request,
- * which is also exactly what legacy mode gets.
+ * What a library row needs before it can carry a views summary (SPEC §16.6):
+ * the gateway must have said `analytics: true`, and there must be a token to
+ * list with. Null deps or `analytics: false` means a plain row — no summary, no
+ * request, which is also exactly what legacy mode gets.
  */
 let analyticsDeps: AnalyticsDeps | null = null;
 let analyticsEnabled = false;
@@ -216,6 +264,16 @@ let downloadUrl: string | null = null;
 function setStage(next: Stage): void {
   stage = next;
   for (const node of stages) node.classList.toggle("hidden", node.dataset.stage !== next);
+
+  // Preview, finishing and done are asking the reader for something — a title, a
+  // retry, a link to copy — so they must not happen behind a hidden section
+  // (SPEC §6). Anything earlier leaves the reader wherever they are.
+  if (next === "preview" || next === "finishing" || next === "done") router.go("record");
+
+  // Leaving the record view must never hide a running capture (SPEC §17.2).
+  const live = next === "recording";
+  navLiveDot.classList.toggle("hidden", !live);
+  navLiveLabel.textContent = live ? "Recording in progress" : "";
 }
 
 // --- Small helpers -----------------------------------------------------------
@@ -239,6 +297,44 @@ function showError(text: string): void {
   messageLine.classList.add("error");
 }
 
+/**
+ * The live region of whichever view the reader is actually in.
+ *
+ * A demand ("sign in first", "add your storage settings") has to be *heard*, and
+ * a message announced in a hidden section reaches nobody. The recorder's own
+ * running commentary stays on `#message`, which lives with the stages it is
+ * about.
+ */
+function announce(text: string, isError: boolean): void {
+  const region =
+    router.view === "videos" ? libraryStatus : router.view === "settings" ? settingsLive : messageLine;
+  region.textContent = text;
+  region.classList.toggle("error", isError);
+}
+
+/**
+ * Runs `then` once `view` is actually the view on screen.
+ *
+ * Navigation is asynchronous: assigning the hash queues a `hashchange`, and
+ * until that task runs the target section still carries `hidden` — so focusing
+ * into it, scrolling to it or animating a ring on it would all be no-ops. The
+ * router registered its own listener when this module first ran, and event
+ * listeners fire in registration order, so by the time this one is called the
+ * section is visible and `router.view` has caught up.
+ */
+function whenRouted(view: ViewName, then: () => void): void {
+  if (router.view === view) {
+    then();
+    return;
+  }
+  const once = (): void => {
+    window.removeEventListener("hashchange", once);
+    then();
+  };
+  window.addEventListener("hashchange", once);
+  router.go(view);
+}
+
 /** Zero-padded mm:ss (h:mm:ss past an hour) for the live recording clock. */
 function formatClock(ms: number): string {
   const total = Math.max(0, Math.floor(ms / 1000));
@@ -258,19 +354,44 @@ async function copyToClipboard(text: string): Promise<boolean> {
 }
 
 function flash(button: HTMLButtonElement, text: string): void {
-  const original = button.textContent;
-  button.textContent = text;
+  const label = button.querySelector<HTMLElement>(".button-label") ?? button;
+  const original = label.textContent;
+  label.textContent = text;
   window.setTimeout(() => {
-    button.textContent = original;
+    label.textContent = original;
   }, 1200);
 }
 
 async function copyLink(text: string, button: HTMLButtonElement): Promise<void> {
   if (await copyToClipboard(text)) flash(button, "Copied");
-  else showError("The clipboard was blocked — select the link and copy it manually.");
+  else announce("The clipboard was blocked — open the video and copy the link from there.", true);
 }
 
-// --- Settings panel ----------------------------------------------------------
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+/** An inline glyph. No sprite sheet, no icon font, no external asset (SPEC §17). */
+function icon(className: string, viewBox: string, paths: readonly string[]): SVGSVGElement {
+  const svg = document.createElementNS(SVG_NS, "svg");
+  svg.setAttribute("class", className);
+  svg.setAttribute("viewBox", viewBox);
+  svg.setAttribute("aria-hidden", "true");
+  svg.setAttribute("focusable", "false");
+  for (const d of paths) {
+    const path = document.createElementNS(SVG_NS, "path");
+    path.setAttribute("d", d);
+    svg.append(path);
+  }
+  return svg;
+}
+
+function span(className: string, text?: string): HTMLSpanElement {
+  const node = document.createElement("span");
+  node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+// --- Settings view -----------------------------------------------------------
 
 function control<T extends Element>(name: string, type: new () => T): T {
   const node = settingsForm.elements.namedItem(name);
@@ -312,11 +433,31 @@ function showSettingsStatus(text: string, isError: boolean): void {
   settingsStatus.classList.toggle("error", isError);
 }
 
-/** Opens the panel and points the user at it — recording cannot start without settings. */
+/**
+ * Routes to the settings view, points at the form and says why (SPEC §17.2).
+ *
+ * Three signals, not one: the message goes in the view's live region, focus
+ * moves into the first field that still needs filling in, and the block takes
+ * the shared attention ring — because neither a colour nor a pulse reaches a
+ * screen reader.
+ */
 function demandSettings(text: string): void {
-  settingsPanel.open = true;
-  settingsPanel.scrollIntoView({ block: "nearest" });
-  showError(text);
+  whenRouted("settings", () => {
+    // Written here rather than before the navigation, and straight to this
+    // view's own region rather than through `announce`: until the route is
+    // applied the settings section still carries `hidden`, and a live region
+    // that changes while it is out of the accessibility tree announces nothing
+    // — unhiding it afterwards is not a change. §17.2's rule is that the
+    // highlight is never the only signal, so this one has to be heard.
+    settingsLive.textContent = text;
+    settingsLive.classList.add("error");
+    demand(settingsPanel);
+    const first = Array.from(
+      settingsForm.querySelectorAll<HTMLInputElement>("input[required]"),
+    ).find((input) => !input.value.trim());
+    (first ?? settingsForm.querySelector<HTMLInputElement>("input"))?.focus({ preventScroll: true });
+    settingsPanel.scrollIntoView({ block: "nearest" });
+  });
 }
 
 /**
@@ -340,23 +481,24 @@ function publicBaseUrlWarning(saved: Settings): string | null {
 }
 
 function initSettings(): void {
+  // Legacy mode: no account, nothing to sign out of, no Google script — so the
+  // Account block and the sidebar's chip both go (SPEC §16.7, §17.1).
+  accountPanel.remove();
+  accountChip = initAccountChip(null);
   const saved = loadSettings();
   if (saved) {
     fillSettingsForm(saved);
     const warning = publicBaseUrlWarning(saved);
-    if (warning) {
-      settingsPanel.open = true;
-      showSettingsStatus(warning, true);
-    }
+    if (warning) showSettingsStatus(warning, true);
     return;
   }
 
-  settingsPanel.open = true;
   try {
     field("publicBaseUrl").value = publicBaseUrl();
   } catch {
     // config.js is missing or malformed; the placeholder stands in.
   }
+  showSettingsStatus("Not configured yet — recording needs a bucket to upload to.", false);
 }
 
 settingsForm.addEventListener("submit", (event) => {
@@ -389,7 +531,8 @@ settingsForm.addEventListener("submit", (event) => {
   }
 
   showSettingsStatus("Saved.", false);
-  settingsPanel.open = false;
+  // The demand that sent the reader here, if there was one, has been answered.
+  settingsLive.textContent = "";
   window.setTimeout(() => {
     settingsStatus.textContent = "";
   }, 2000);
@@ -400,7 +543,7 @@ settingsForm.addEventListener("submit", (event) => {
 /**
  * The floor the field itself declares, read from the input so the two can never
  * drift. The legacy form carries the identical `min`, and the browser enforces
- * it there by refusing the submit; this panel has no form and saves on change,
+ * it there by refusing the submit; this block has no form and saves on change,
  * so no constraint validation ever runs and the same rule has to be applied
  * here — otherwise a typed `500` reaches MediaRecorder as 500 bits/s and
  * uploads an unwatchable file.
@@ -436,7 +579,7 @@ function showRecordingStatus(text: string, isError: boolean): void {
 }
 
 /**
- * There is no Save button: the panel writes on change and says so. Storage that
+ * There is no Save button: the block writes on change and says so. Storage that
  * refuses the write is a note, never a failure — `recordingPrefs` is what the
  * next recording encodes with either way (SPEC §15.5).
  */
@@ -494,8 +637,26 @@ function showAuthStatus(text: string, isError: boolean): void {
   authStatus.classList.toggle("muted", !isError);
 }
 
+/** What the 232px chip can say for itself while it is not an identity. */
+const CHIP_HINTS: Record<AuthState["status"], string> = {
+  loading: "Loading sign-in…",
+  "signed-out": "Sign in to record",
+  "signed-in": "",
+  error: "Sign-in unavailable — see Settings",
+};
+
+/**
+ * The chip shows state; the Account block in Settings carries the words
+ * (SPEC §17.1) — the loading line, the status line and the mismatch warning are
+ * sentences, and sentences do not fit in a sidebar.
+ */
 function renderAuth(state: AuthState): void {
   const signedIn = state.status === "signed-in";
+
+  accountChip.render(state);
+  accountHint.textContent = CHIP_HINTS[state.status];
+  accountHint.hidden = signedIn;
+
   authLoading.classList.toggle("hidden", state.status !== "loading");
   // "error" means Google's script never became usable, so offering its button
   // would be a lie: only the message is left.
@@ -511,11 +672,11 @@ function renderAuth(state: AuthState): void {
 function onAuthChange(state: AuthState): void {
   const wasSignedOut = signInRequired;
   renderAuth(state);
-  // Signing in turns each library row's "Sign in to see analytics." hint into an
-  // expander, and signing out turns it back (SPEC §16.6) — the whole coupling
-  // between sign-in and the library. Only on an actual change: a silent token
-  // refresh emits "signed-in" again, and rebuilding the rows for it would shut
-  // an expander somebody was reading.
+  // Signing in gives every library row its views summary, and signing out takes
+  // them away again (SPEC §16.6) — the whole coupling between sign-in and the
+  // library. Only on an actual change: a silent token refresh emits "signed-in"
+  // again, and rebuilding the rows for it would throw away summaries already
+  // fetched and start the queue over.
   if (wasSignedOut !== signInRequired) renderLibrary();
 
   if (state.status === "signed-in") {
@@ -529,18 +690,20 @@ function onAuthChange(state: AuthState): void {
   // still in this tab, and the parts held up are re-sent by finish() (SPEC §15.5).
   if (stage === "recording" || stage === "preview" || stage === "finishing") {
     reauthAnnounced = true;
-    showError(
-      "Your Google sign-in expired. Sign in again above to keep uploading — the recording is " +
-        "still going and nothing has been lost.",
+    demandSignIn(
+      "Your Google sign-in expired. Sign in again to keep uploading — the recording is still " +
+        "going and nothing has been lost.",
     );
-    authPanel.scrollIntoView({ block: "nearest" });
   }
 }
 
-/** Points at the sign-in panel — recording cannot start without a token. */
+/**
+ * Points at the sidebar's chip — sign-in lives in the shell chrome, visible from
+ * every view, so there is no view to navigate to (SPEC §17.2).
+ */
 function demandSignIn(text: string): void {
-  authPanel.scrollIntoView({ block: "nearest" });
-  showError(text);
+  announce(text, true);
+  accountChip.highlight();
 }
 
 /**
@@ -562,13 +725,14 @@ function gatewayBaseUrlWarning(config: GatewayConfig): string | null {
 }
 
 /**
- * Gateway mode: the storage settings panel is removed outright (there are no
+ * Gateway mode: the storage settings block is removed outright (there are no
  * credentials for it to hold), the recording options it used to carry get a
- * panel of their own, Google's script is loaded, and recording waits for a token.
+ * block of their own, the Account block appears, Google's script is loaded, and
+ * recording waits for a token.
  */
 async function initGateway(base: string): Promise<void> {
   settingsPanel.remove();
-  authPanel.classList.remove("hidden");
+  accountPanel.classList.remove("hidden");
   signInRequired = true;
   updateStartButton();
 
@@ -578,6 +742,12 @@ async function initGateway(base: string): Promise<void> {
   } catch (err) {
     authLoading.classList.add("hidden");
     showAuthStatus(describe(err), true);
+    // There is no client id, so there will be no Google button — but an empty
+    // corner of the sidebar would read as "no account here", which is legacy
+    // mode's answer and not this one. The chip says what it can and points at
+    // the block that carries the sentence.
+    accountChipBox.hidden = false;
+    accountHint.textContent = CHIP_HINTS.error;
     return;
   }
 
@@ -594,7 +764,7 @@ async function initGateway(base: string): Promise<void> {
   }
 
   const auth = createAuth(config.googleClientId);
-  auth.mount(authButton);
+  accountChip = initAccountChip(auth);
   auth.onChange(onAuthChange);
   gateway = {
     auth,
@@ -604,14 +774,14 @@ async function initGateway(base: string): Promise<void> {
       refreshToken: () => auth.refresh(),
     }),
   };
-  // Read per request, never captured: the expander asks for a token when it is
-  // about to list, not when the row was drawn (SPEC §16.6).
+  // Read per request, never captured: a row asks for a token when it is about to
+  // list, not when it was drawn (SPEC §16.6).
   analyticsDeps = { gatewayUrl: base, token: () => auth.getToken() };
   renderAuth(auth.state);
   renderLibrary();
 }
 
-// --- Library -----------------------------------------------------------------
+// --- Library (SPEC §17.3) ----------------------------------------------------
 
 /**
  * Delivered bytes over wall-clock duration — what a viewer actually has to
@@ -634,69 +804,346 @@ function librarySubtitle(entry: LibraryEntry): string {
   return parts.join(" · ");
 }
 
-function libraryRow(entry: LibraryEntry): HTMLLIElement {
-  const item = document.createElement("li");
-  item.className = "library-item";
+/**
+ * The header's sub-line, and it counts only what this browser knows.
+ *
+ * Not "in your bucket": removing an entry leaves the object exactly where it was
+ * (SPEC §9), so the local library cannot describe a bucket and does not pretend
+ * to.
+ */
+function librarySummaryLine(entries: readonly LibraryEntry[]): string {
+  const recordings = `${entries.length} ${entries.length === 1 ? "recording" : "recordings"}`;
+  let bytes = 0;
+  let sized = 0;
+  for (const entry of entries) {
+    if (entry.sizeBytes === undefined) continue;
+    bytes += entry.sizeBytes;
+    sized++;
+  }
+  if (sized === 0) return recordings;
+  return `${recordings} · ${formatBytes(bytes)} uploaded from this browser`;
+}
 
-  const details = document.createElement("div");
-  details.className = "library-details";
+/** `{ id, keyB64 }` from an entry's stored share link, or null (SPEC §17.3). */
+function entryVideo(entry: LibraryEntry): { id: string; keyB64: string } | null {
+  const link = entry.link || "";
+  const hash = link.indexOf("#");
+  return parseShareFragment(hash === -1 ? link.trim() : link.slice(hash + 1).trim());
+}
 
-  const title = document.createElement("a");
-  title.className = "library-title";
-  title.href = entry.link;
-  title.target = "_blank";
-  title.rel = "noopener";
-  title.textContent = entry.title || "Untitled recording";
+/**
+ * Which of the placeholder patterns a row draws (SPEC §17.3). Pure and keyed off
+ * the id, so a row looks the same on every reload. It is decoration: no image is
+ * fetched, decoded or stored, and real thumbnails are a separate item.
+ */
+function thumbVariant(id: string): number {
+  let hash = 0;
+  for (let i = 0; i < id.length; i++) hash = (hash * 31 + id.charCodeAt(i)) >>> 0;
+  return hash % THUMB_VARIANTS;
+}
 
-  const sub = document.createElement("div");
-  sub.className = "library-sub muted";
-  sub.textContent = librarySubtitle(entry);
+function thumbnail(entry: LibraryEntry, href: string | null): HTMLElement {
+  const frame = document.createElement(href ? "a" : "span");
+  frame.className = "thumb";
+  frame.dataset.variant = String(thumbVariant(entry.id));
+  // Decoration: a pattern, a glyph and a duration the meta line already carries
+  // (SPEC §17.3). The title beside it is the row's real link; this is the same
+  // target for a pointer and nothing at all for the keyboard or a screen reader.
+  frame.setAttribute("aria-hidden", "true");
+  if (frame instanceof HTMLAnchorElement && href) {
+    frame.href = href;
+    frame.tabIndex = -1;
+  }
 
-  details.append(title, sub);
+  const play = span("thumb-play");
+  play.append(icon("thumb-play-glyph", "0 0 24 24", ["M8 5v14l11-7z"]));
 
+  frame.append(span("thumb-pattern"), play, span("thumb-duration", formatDuration(entry.durationMs)));
+  return frame;
+}
+
+function copyButton(entry: LibraryEntry): HTMLButtonElement {
   const copy = document.createElement("button");
   copy.type = "button";
-  copy.className = "ghost";
-  copy.textContent = "Copy link";
+  copy.className = "row-copy";
+  copy.append(
+    icon("icon-link", "0 0 20 20", [
+      "M8.5 11.5 L11.5 8.5",
+      "M9 6.8 L11 4.8 a2.55 2.55 0 0 1 3.6 3.6 L12.6 10.4",
+      "M11 13.2 L9 15.2 a2.55 2.55 0 0 1 -3.6 -3.6 L7.4 9.6",
+    ]),
+    span("button-label", "Copy link"),
+  );
+  // Always the share link — this is the button whose output goes to other
+  // people, and it must never hand out a video.html URL (SPEC §17.3).
   copy.addEventListener("click", () => void copyLink(entry.link, copy));
+  return copy;
+}
+
+/** The one menu open right now, if any: a second one opening closes it. */
+let closeOpenMenu: (() => void) | null = null;
+
+/**
+ * The row's `⋯` menu. One item, Remove, with §9's warning kept visible rather
+ * than hidden in a tooltip — the entry goes, the video stays in the bucket.
+ */
+function overflowMenu(entry: LibraryEntry): HTMLElement {
+  const wrap = document.createElement("div");
+  wrap.className = "row-menu";
+
+  const trigger = document.createElement("button");
+  trigger.type = "button";
+  trigger.className = "row-menu-trigger";
+  trigger.setAttribute("aria-haspopup", "menu");
+  trigger.setAttribute("aria-expanded", "false");
+  trigger.setAttribute("aria-label", "More actions");
+  trigger.textContent = "⋯";
+
+  const menu = document.createElement("div");
+  menu.className = "row-menu-popup";
+  menu.setAttribute("role", "menu");
+  menu.hidden = true;
 
   const remove = document.createElement("button");
   remove.type = "button";
-  remove.className = "ghost";
+  remove.className = "row-menu-item";
+  remove.setAttribute("role", "menuitem");
   remove.textContent = "Remove";
-  remove.title = "Removes this entry from the local list only. The video stays in the bucket.";
+
+  const note = document.createElement("p");
+  note.className = "row-menu-note";
+  note.textContent = "Removes this entry from this browser only. The video stays in the bucket.";
+
+  menu.append(remove, note);
+  wrap.append(trigger, menu);
+
+  function close(returnFocus: boolean): void {
+    if (menu.hidden) return;
+    menu.hidden = true;
+    trigger.setAttribute("aria-expanded", "false");
+    document.removeEventListener("pointerdown", onOutside, true);
+    document.removeEventListener("keydown", onKey, true);
+    if (closeOpenMenu === closeThis) closeOpenMenu = null;
+    if (returnFocus) trigger.focus();
+  }
+
+  function closeThis(): void {
+    close(false);
+  }
+
+  function onOutside(event: Event): void {
+    if (!(event.target instanceof Node) || !wrap.contains(event.target)) close(false);
+  }
+
+  function onKey(event: KeyboardEvent): void {
+    if (event.key !== "Escape") return;
+    event.stopPropagation();
+    close(true);
+  }
+
+  function open(): void {
+    closeOpenMenu?.();
+    menu.hidden = false;
+    trigger.setAttribute("aria-expanded", "true");
+    document.addEventListener("pointerdown", onOutside, true);
+    document.addEventListener("keydown", onKey, true);
+    closeOpenMenu = closeThis;
+    remove.focus();
+  }
+
+  trigger.addEventListener("click", () => {
+    if (menu.hidden) open();
+    else close(true);
+  });
+
   remove.addEventListener("click", () => {
+    close(false);
     removeFromLibrary(entry.id);
     renderLibrary();
   });
 
-  item.append(details, copy, remove);
-  const analytics = analyticsPanel(entry);
-  // Its own line under the row's controls, because a heatmap is not a button.
-  if (analytics) item.append(analytics);
-  return item;
+  return wrap;
+}
+
+/** The two numbers, once they arrive (SPEC §17.3). */
+function renderSummary(slot: HTMLElement, summary: VideoSummary): void {
+  if (summary.views === 0) {
+    slot.replaceChildren(span("summary-empty", "No views yet."));
+    return;
+  }
+  slot.replaceChildren(
+    span("summary-value", String(summary.views)),
+    span(
+      "summary-label",
+      `${summary.views === 1 ? "view" : "views"} · ${summary.viewers} ` +
+        `${summary.viewers === 1 ? "viewer" : "viewers"}`,
+    ),
+  );
+}
+
+interface SummaryJob {
+  generation: number;
+  video: { id: string; keyB64: string };
+  slot: HTMLElement;
 }
 
 /**
- * The row's analytics affordance, or null when there is none (SPEC §16.6).
- *
- * Legacy mode and a gateway with `analytics: false` get nothing at all — no
- * expander, no hint, no request. With analytics on, a signed-out recorder gets
- * one muted line rather than a blank space: the operator turned this on and the
- * data exists, so an absence would read as "this video has none".
+ * Summaries are queued, not fired (SPEC §17.3): a library of forty videos would
+ * otherwise cost forty listings and every session fetch behind them the moment
+ * the page opened. A row loads when it is visible, at most
+ * `LIBRARY_CONCURRENCY` at a time, and the queue is abandoned the moment the
+ * library re-renders.
  */
-function analyticsPanel(entry: LibraryEntry): HTMLElement | null {
-  if (!analyticsEnabled || !analyticsDeps) return null;
-  // `signInRequired` is exactly "there is no usable ID token right now", which
-  // is what listing a video's sessions needs (SPEC §15.4).
-  return signInRequired ? analyticsHint() : analyticsExpander(entry, analyticsDeps);
+let summaryGeneration = 0;
+let summaryObserver: IntersectionObserver | null = null;
+const summaryPending: SummaryJob[] = [];
+let summaryInFlight = 0;
+
+function queueSummary(job: SummaryJob): void {
+  if (job.generation !== summaryGeneration) return;
+  summaryPending.push(job);
+  pumpSummaries();
 }
 
+function pumpSummaries(): void {
+  const deps = analyticsDeps;
+  if (!deps) return;
+
+  while (summaryInFlight < LIBRARY_CONCURRENCY) {
+    const job = summaryPending.shift();
+    if (!job) return;
+    if (job.generation !== summaryGeneration) continue;
+
+    summaryInFlight++;
+    void loadReport(job.video, deps)
+      .then((report) => {
+        if (job.generation === summaryGeneration) renderSummary(job.slot, summarize(report));
+      })
+      .catch(() => {
+        // A failed summary renders as nothing at all: a row is a list item, and
+        // an error sentence per row is noise for something nobody asked for
+        // (SPEC §16.6).
+      })
+      .finally(() => {
+        summaryInFlight--;
+        pumpSummaries();
+      });
+  }
+}
+
+function libraryRow(entry: LibraryEntry, index: number, summaries: boolean): HTMLLIElement {
+  const item = document.createElement("li");
+  item.className = "library-item";
+
+  // Built from the stored share link's own fragment, and written nowhere but
+  // this href — never appended to the stored link, never stored a second time
+  // (SPEC §17.3). An entry whose link has no fragment still renders; it just has
+  // nothing to link to.
+  const video = entryVideo(entry);
+  const href = video ? videoPageLink(video.id, video.keyB64) : null;
+
+  const details = document.createElement("div");
+  details.className = "library-details";
+
+  const title = document.createElement(href ? "a" : "span");
+  title.className = "library-title";
+  if (title instanceof HTMLAnchorElement && href) title.href = href;
+  title.textContent = entry.title || "Untitled recording";
+
+  details.append(title, span("library-sub muted", librarySubtitle(entry)));
+
+  const actions = document.createElement("div");
+  actions.className = "library-actions";
+  actions.append(copyButton(entry), overflowMenu(entry));
+
+  item.append(thumbnail(entry, href), details);
+
+  // The space a summary will occupy, and nothing else until it arrives: a list
+  // of spinners reads worse than a list that fills in (SPEC §17.3).
+  if (summaries && video) {
+    const slot = document.createElement("div");
+    slot.className = "library-summary";
+    item.append(slot);
+
+    const job: SummaryJob = { generation: summaryGeneration, video, slot };
+    if (summaryObserver) {
+      pendingJobs.set(item, job);
+      summaryObserver.observe(item);
+    } else if (index < LIBRARY_SUMMARY_EAGER) {
+      queueSummary(job);
+    } else {
+      // No IntersectionObserver: the rows past the first screenful load when the
+      // reader reaches for them, which is the best "visible" this browser can say.
+      const once = (): void => {
+        item.removeEventListener("pointerenter", once);
+        item.removeEventListener("focusin", once);
+        queueSummary(job);
+      };
+      item.addEventListener("pointerenter", once);
+      item.addEventListener("focusin", once);
+    }
+  }
+
+  item.append(actions);
+  return item;
+}
+
+/** Rows waiting for the observer to say they are visible. */
+const pendingJobs = new WeakMap<Element, SummaryJob>();
+
+/** Analytics are on, the gateway said so, and there is a token to list with. */
+function summariesAvailable(): boolean {
+  return analyticsEnabled && analyticsDeps !== null && !signInRequired;
+}
+
+/**
+ * True once the videos view has actually been shown. A load that lands on
+ * `#/record` summarizes nothing until the reader goes looking for the library
+ * (SPEC §17.3).
+ */
+let videosSeen = router.view === "videos";
+
 function renderLibrary(): void {
+  closeOpenMenu?.();
+  // Abandons every queued and in-flight summary: their results belong to rows
+  // that are about to stop existing.
+  summaryGeneration++;
+  summaryPending.length = 0;
+  summaryObserver?.disconnect();
+  summaryObserver = null;
+
   const entries = loadLibrary();
   libraryEmpty.classList.toggle("hidden", entries.length > 0);
-  libraryList.replaceChildren(...entries.map(libraryRow));
+  libraryCount.textContent = entries.length > 0 ? librarySummaryLine(entries) : "";
+
+  const summaries = summariesAvailable() && videosSeen;
+  if (summaries && typeof IntersectionObserver === "function") {
+    summaryObserver = new IntersectionObserver(
+      (records, observer) => {
+        for (const record of records) {
+          if (!record.isIntersecting) continue;
+          observer.unobserve(record.target);
+          const job = pendingJobs.get(record.target);
+          if (job) queueSummary(job);
+        }
+      },
+      // A little ahead of the fold, so a row is usually filled in by the time it
+      // is read rather than after.
+      { rootMargin: "200px" },
+    );
+  }
+
+  libraryList.replaceChildren(
+    ...entries.map((entry, index) => libraryRow(entry, index, summaries)),
+  );
 }
+
+router.onChange((view) => {
+  if (view !== "videos" || videosSeen) return;
+  videosSeen = true;
+  // The first time the library is actually looked at is when its summaries start.
+  if (summariesAvailable()) renderLibrary();
+});
 
 // --- Capture -----------------------------------------------------------------
 
@@ -842,31 +1289,14 @@ function showUploaded(uploadedBytes: number): void {
 
 // --- Codec fallback note (SPEC §6) -------------------------------------------
 
-/** The codecs a recording can come back as, including the fallback engine's VP8. */
-type RecordedCodec = "h264" | "vp9" | "av1" | "vp8";
-
-const CODEC_NAMES: Record<RecordedCodec, string> = {
+/** What a requested codec is called on screen. `codecLabel` names what was
+ * actually written; this names what was asked for, which is a `CodecChoice`
+ * rather than a mime type. */
+const CHOICE_LABELS: Record<Exclude<CodecChoice, "auto">, string> = {
   h264: "H.264",
   vp9: "VP9",
   av1: "AV1",
-  vp8: "VP8",
 };
-
-/**
- * Which codec the engine's own mime type says it settled on — the one field
- * that is guaranteed to describe what was really written (SPEC §6), whichever
- * engine and container produced it. Both registrations appear: `avc1`/`avc3`
- * for H.264 in MP4, `vp09`/`av01`/`vp08` in WebM, and MediaRecorder's shorter
- * `vp9`/`vp8` spelling. `null` for a bare `video/webm`, which names nothing.
- */
-function recordedCodec(mimeType: string): RecordedCodec | null {
-  const type = mimeType.toLowerCase();
-  if (/\b(?:avc1|avc3|h264)\b/.test(type)) return "h264";
-  if (/\b(?:vp09|vp9)\b/.test(type)) return "vp9";
-  if (/\b(?:av01|av1)\b/.test(type)) return "av1";
-  if (/\b(?:vp08|vp8)\b/.test(type)) return "vp8";
-  return null;
-}
 
 /**
  * A codec the user picked outright is still only a request: one this browser
@@ -876,15 +1306,18 @@ function recordedCodec(mimeType: string): RecordedCodec | null {
  */
 function noteCodecFallback(actualMimeType: string, requested: CodecChoice): void {
   if (requested === "auto") return;
-  const actual = recordedCodec(actualMimeType);
-  if (actual === requested) return;
+  const wanted = CHOICE_LABELS[requested];
+  // The engine's own mime type is the one field guaranteed to describe what was
+  // really written, whichever engine and container produced it.
+  const actual = codecLabel(actualMimeType);
+  if (actual === wanted) return;
   showNote(
-    `This browser can't encode ${CODEC_NAMES[requested]} — the recording uses ` +
+    `This browser can't encode ${wanted} — the recording uses ` +
       // A bare `video/webm` names no codec at all: the last MediaRecorder
       // candidate, where the browser picked for itself and did not say what.
       // Saying so is still the note SPEC §6 asks for; pretending the request
       // was honoured is not.
-      (actual === null ? "the browser's own WebM codec instead." : `${CODEC_NAMES[actual]} instead.`),
+      (actual === null ? "the browser's own WebM codec instead." : `${actual} instead.`),
   );
 }
 
@@ -904,15 +1337,16 @@ interface UploadPlan {
 function uploadPlan(): UploadPlan | null {
   if (gatewayBase) {
     if (!gateway) {
-      demandSignIn("The upload gateway is not ready yet — see the sign-in panel above.");
+      demandSignIn("The upload gateway is not ready yet — see Settings → Account.");
       return null;
     }
     if (!gateway.auth.getToken()) {
       demandSignIn("Sign in with Google before recording — the upload starts as you record.");
       return null;
     }
-    // The recording panel, not the (removed) settings form, holds the encoder
-    // choices here — from memory, so an unstorable change still counts (SPEC §15.5).
+    // The recording options block, not the (removed) settings form, holds the
+    // encoder choices here — from memory, so an unstorable change still counts
+    // (SPEC §15.5).
     return {
       signer: gateway.signer,
       quality: recordingPrefs.quality,
@@ -1173,7 +1607,9 @@ async function stopped(active: RecorderEngine): Promise<void> {
   previewInfo.textContent = `${formatDuration(durationMs)} · ${formatBytes(blob.size)} · ${mimeType}`;
   titleInput.value = "";
   setStage("preview");
-  titleInput.focus();
+  // The record view may still be arriving (§17.2's rule pulled the reader back
+  // here); focus lands once it has.
+  whenRouted("record", () => titleInput.focus());
   void ensureDuration();
 }
 
@@ -1342,7 +1778,7 @@ async function runFinish(current: Finished, active: UploadSession): Promise<void
   setDownloadSource(null);
   resetRecording();
   setStage("done");
-  linkInput.select();
+  whenRouted("record", () => linkInput.select());
 
   if (await copyToClipboard(link)) showNote("Link copied to your clipboard.");
   else showNote("Copy the link below — the browser blocked the automatic copy.");
@@ -1363,7 +1799,7 @@ function discard(): void {
 
 startButton.addEventListener("click", () => void startRecording());
 stopButton.addEventListener("click", () => stopRecording());
-signOutButton.addEventListener("click", () => gateway?.auth.signOut());
+accountSignOut.addEventListener("click", () => gateway?.auth.signOut());
 finishButton.addEventListener("click", () => void finishUpload());
 retryButton.addEventListener("click", () => void finishUpload());
 discardButton.addEventListener("click", discard);
@@ -1372,6 +1808,10 @@ againButton.addEventListener("click", () => {
   clearMessage();
   setStage("idle");
 });
+// Starting a recording from anywhere is a navigation, and nothing more: capture
+// begins at the record view's own button, which is where `getDisplayMedia` gets
+// the direct user activation it needs (SPEC §17.2).
+newRecordingButton.addEventListener("click", () => router.go("record"));
 
 window.addEventListener("beforeunload", (event) => {
   if (stage === "recording" || stage === "preview" || stage === "finishing") event.preventDefault();
@@ -1403,7 +1843,8 @@ function checkSupport(): void {
 
 setStage("idle");
 // One or the other, never both: a gateway means credentials live server-side, so
-// the storage settings panel is not just hidden but removed (SPEC §15.5).
+// the storage settings block is not just hidden but removed (SPEC §15.5), and
+// legacy mode has no account chip at all (SPEC §17.1).
 if (gatewayBase) void initGateway(gatewayBase);
 else initSettings();
 renderLibrary();

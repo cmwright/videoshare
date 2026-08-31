@@ -7,16 +7,26 @@ if something here is impossible, flag it rather than silently changing the contr
 ## 1. Product summary
 
 Serverless, open-source Loom replacement. A static site (TypeScript + Vite, output
-is plain `dist/`) with two pages:
+is plain `dist/`) with three pages — two owner-side, one for recipients:
 
-- `index.html` — recorder: capture screen + mic in-browser, compress live via
-  MediaRecorder, encrypt client-side, upload directly to any S3-compatible bucket
-  with SigV4-signed PUTs (via `aws4fetch`). Also hosts the settings panel and a
-  local "My videos" library (localStorage).
-- `view.html` — player: no credentials; reads video id + AES key from the URL
-  fragment, fetches ciphertext from the bucket's public base URL, decrypts in the
-  browser, plays. Progressive playback via MSE where supported, whole-file blob
-  fallback otherwise.
+- `index.html` — the **app shell** (§17): a left sidebar and three hash-routed
+  views. `#/videos` is the library, `#/record` is the recorder (capture screen +
+  mic in-browser, compress live, encrypt client-side, upload directly to any
+  S3-compatible bucket with SigV4-signed PUTs via `aws4fetch`), `#/settings` holds
+  recording options and — in legacy mode — the storage settings form.
+- `video.html` — the **video page** (§17.4): owner-side, one video. Same fragment
+  format as the share link, the player as its hero, and the full engagement
+  reading (views, unique viewers, completion rate, average watch time, the replay
+  heatmap and the per-viewer table) below it.
+- `view.html` — the **player** recipients get: no credentials; reads video id +
+  AES key from the URL fragment, fetches ciphertext from the bucket's public base
+  URL, decrypts in the browser, plays. Progressive playback via MSE where
+  supported, whole-file blob fallback otherwise.
+
+`view.html` is the only page a recipient ever loads, and **its behaviour and its
+visual design are fixed**: §17 changes owner-side surfaces only. The playback
+machinery is shared with `video.html` (§17.5), which is a refactor with no
+viewer-visible delta.
 
 Threat model: the bucket may be publicly readable. Everything stored is AES-GCM
 ciphertext; the key exists only in the share link's URL fragment (never sent over
@@ -172,6 +182,14 @@ Two objects per video, under the id as prefix:
   to local library). Recording requires configured settings (the multipart
   upload is created at record start); if unconfigured, open the settings panel
   instead of starting capture.
+  The machine, its guards and its element ids are **unchanged** by §17; they
+  simply live inside the `#/record` view of the shell. Two rules bind the two
+  together and nothing else does: routing never tears the machine down (a
+  recording, its timer and its upload run on while the reader is in another
+  view), and any transition into `preview`, `finishing` or `done` **forces the
+  record view to be shown** — those stages are asking the reader for something,
+  so they must not happen behind a hidden section. "Open the settings panel"
+  above is §17.2's `demandSettings`.
 - The emitted container bytes are retained in memory (as Blob parts, not
   ArrayBuffers) until the share link exists, so a mid-recording upload failure
   can never lose the recording (see §7 failure handling); the same Blob backs
@@ -232,6 +250,13 @@ player and storage format are unaffected. `meta.json` remains a single PUT.
 
 ## 8. Playback
 
+Everything in this section is implemented once, in `playback.ts` (§17.5), and used
+by both `view.html` and `video.html`. This section describes what a **viewer** on
+`view.html` gets, and that is the fixed one: the extraction is a refactor with no
+viewer-visible delta — same requests in the same order, same status and error
+strings, same event wiring, same `player.css`. `video.html` differs only in its
+chrome and in not autoplaying (§17.4); it makes the same requests otherwise.
+
 - Parse fragment → `{ id, key }`; malformed fragment → friendly error.
 - GET `{publicBaseUrl}/{id}/meta.json` (publicBaseUrl configurable per
   deployment — see §10; **no credentials**), decrypt, show title/duration.
@@ -259,7 +284,11 @@ player and storage format are unaffected. `meta.json` remains a single PUT.
 - Errors: decrypt failure → "wrong key or corrupted video"; 404 → "video not
   found"; network/CORS → actionable message.
 
-## 9. Settings & local library (localStorage, recorder page only)
+## 9. Settings & local library (localStorage, owner-side pages only)
+
+This section owns the **storage keys and their shapes**. Where those values are
+rendered — which view a form lives in, what a library row looks like — is §17's,
+and where the two could be read as disagreeing, §17 wins.
 
 - `videoshare.settings` (JSON): `endpoint` (e.g. `https://s3.amazonaws.com` or
   `http://localhost:9000`), `region` (default `us-east-1`), `bucket`,
@@ -279,18 +308,21 @@ player and storage format are unaffected. `meta.json` remains a single PUT.
   mode, which has no storage settings panel to keep them in (§15.5). Legacy mode
   neither reads nor writes it.
 - `videoshare.library` (JSON array of): `{ id, title, createdAt, durationMs,
-  link, sizeBytes? }` — newest first; list in UI with copy-link and
-  delete-from-list (delete only removes the local entry in v1, it does not
-  delete from bucket). When `sizeBytes` is present the UI also shows size and
-  effective bitrate (e.g. "14.2 MB · 1.9 Mbps") so compression is observable.
-  Entries without `sizeBytes` (older) must render fine.
+  link, sizeBytes? }` — newest first. `link` is the **full share link** including
+  its `#{id}.{key}` fragment, and it is the only place this browser keeps a video's
+  key; §17.3 builds the video page's URL out of it and never stores a second copy.
+  Removing an entry removes the local entry only — it does not delete from the
+  bucket. When `sizeBytes` is present the UI also shows size and effective bitrate
+  (e.g. "14.2 MB · 1.9 Mbps") so compression is observable. Entries without
+  `sizeBytes` (older) must render fine. The row itself is §17.3.
 
 ## 10. Viewer configuration of publicBaseUrl
 
 `view.html` has no localStorage settings (viewers are strangers). The public
 base URL is baked at deploy time via a tiny config: `dist/config.js`
-(`window.VIDEOSHARE = { publicBaseUrl: "..." }`), loaded by both pages with a
-sensible error if missing. The repo ships `public/config.js` with a placeholder
+(`window.VIDEOSHARE = { publicBaseUrl: "..." }`), loaded by all three pages
+(`video.html` reads it exactly as `view.html` does) with a sensible error if
+missing. The repo ships `public/config.js` with a placeholder
 and the docs tell deployers to edit one line. The recorder's settings panel
 uses its own localStorage value for uploads but generates share links pointing
 at the deployed site + this config's publicBaseUrl.
@@ -307,7 +339,7 @@ export interface Settings { endpoint: string; region: string; bucket: string;
 export interface RecordingPrefs { quality: Quality; codec: CodecChoice;
   videoBitsPerSecond: number; }                           // §15.5, gateway mode
 export interface LibraryEntry { id: string; title: string; createdAt: string;
-  durationMs: number; link: string; }
+  durationMs: number; link: string; sizeBytes?: number; }   // §9; absent on older entries
 ```
 
 `util.ts`
@@ -319,7 +351,19 @@ export function formatDuration(ms: number): string;       // "m:ss" / "h:mm:ss"
 export function formatBytes(n: number): string;           // "12.3 MB"
 export function parseShareFragment(fragment: string):     // "#{id}.{key}" per §2, or null
   { id: string; keyB64: string } | null;
+export function shareLink(id: string, keyB64: string): string;   // §2 link at "view.html"
+export function videoPageLink(id: string, keyB64: string): string;  // "video.html#{id}.{key}" (§17.3)
+export function codecLabel(mimeType: string): string | null;     // "H.264" / "VP9" / "AV1" / "VP8"; null names none
 ```
+
+The last three are §2's format and its labels, in the one module that already owns
+them. `shareLink` moves out of `upload.ts` unchanged (same `new URL("view.html",
+location.href)` resolution, so a link built on `video.html` is byte-identical to the
+one the recorder stored); `videoPageLink` is its sibling and resolves the same way,
+which is what keeps both correct under a subpath deploy. `codecLabel` moves out of
+`record.ts` (its `recordedCodec` + `CODEC_NAMES` pair, one function now): §17.4's
+meta line needs it, and it must not reach for `encoder.ts` to get it — that would
+pull `mp4-muxer` and `webm-muxer` into the video page's bundle for a string.
 
 `crypto.ts`  (pure WebCrypto — must run in both browser and Node ≥20 for tests)
 ```ts
@@ -352,19 +396,34 @@ export function publicBaseUrl(): string;                  // from window.VIDEOSH
 `upload.ts` — see §7 for the full streaming API (`createUploadSession`,
 `UploadSession`, `UploadResult`).
 
-`record.ts` — page controller for `index.html` (wires everything; owns the state
-machine in §6, including the internal Blob→8 MiB-chunk assembler that feeds
-`UploadSession.addChunk`). `player.ts` — page controller for `view.html` (owns §8).
+`record.ts` — page controller for `index.html`: wires the shell (§17.2), owns the
+state machine in §6 (including the internal Blob→8 MiB-chunk assembler that feeds
+`UploadSession.addChunk`) and renders the library (§17.3). `player.ts` — page
+controller for `view.html`. `video.ts` — page controller for `video.html` (§17.4).
+Neither `player.ts` nor `video.ts` owns §8's machinery: that is `playback.ts`, the
+shared player core both of them drive (§17.5).
+
+`shell.ts` — the sidebar and the hash router (§17.1/§17.2), shared by `index.html`
+and `video.html`. Its route arithmetic is pure and is the one new thing here Node can
+test.
 
 `watch.ts` / `beacon.ts` / `dashboard.ts` — playback analytics (§16), split the way
 §8's arithmetic is: `watch.ts` is pure watch-range, heat and aggregation math (no DOM,
-so Node tests and both halves of §16 import it), `beacon.ts` is the browser-side
-tracker and flush on `view.html`, and `dashboard.ts` is the analytics expander
-`record.ts` hangs on each library row (§16.6). Full signatures in §16.5/§16.6.
+so Node tests and both halves of §16 import it — including the engagement figures of
+§17.6, which are arithmetic and therefore live here), `beacon.ts` is the browser-side
+tracker and flush on `view.html`, and `dashboard.ts` is the reader half: fetch,
+decrypt, aggregate and render one video's engagement, used by `video.ts` for the full
+section and by `record.ts` for a library row's two-number summary (§16.6, §17.6).
+Full signatures in §16.5/§16.6.
 
-Page-specific styles live in `src/record.css` / `src/player.css`; shared design tokens
-and base styles in `src/app.css`. The dashboard's heatmap styles are `record.css`'s —
-it renders into the recorder's library.
+Styles: shared design tokens and base styles in `src/app.css`; the owner-side shell
+and the primitives both owner pages draw with — sidebar, account chip, responsive top
+bar, stat cards, heat bars, viewer table — in `src/shell.css`; the recorder's stages,
+forms and library rows in `src/record.css`; the video page's own layout in
+`src/video.css`; the share page's in `src/player.css`. `player.css` is **unchanged**
+by §17, and nothing `view.html` loads may change with it. The heat-bar styles move
+from `record.css` to `shell.css` because two pages now draw them; their tokens
+(`--heat-cool` / `--heat-hot`) move with them.
 
 ## 12. Build & tooling
 
@@ -372,10 +431,12 @@ it renders into the recorder's library.
   `vite`, `vitest`. Scripts: `dev` (vite), `build` (`tsc --noEmit && vite build`),
   `preview`, `test` (`vitest run`), `test:e2e` (`vitest run --config vitest.e2e.config.ts`,
   only meaningful with MinIO up).
-- Vite multi-page: rollup inputs `index.html` + `view.html` — §1's two pages, and
-  after §16.6 the only two. `dist/` is not committed, so a `stats.html` or a `stats`
-  chunk in it is a stale local build and `npm run build` on a clean tree must produce
-  neither. `public/config.js` copied verbatim to `dist/`.
+- Vite multi-page: rollup inputs `index.html` + `view.html` + `video.html` — §1's
+  three pages, and the only three. A clean `npm run build` **must** emit all three
+  HTML files into `dist/`; a deploy missing `video.html` breaks every library row's
+  link. There is still no `stats.html`: `dist/` is not committed, so a `stats.html`
+  or a `stats` chunk in it is a stale local build and `npm run build` on a clean tree
+  must produce neither. `public/config.js` copied verbatim to `dist/`.
 - TypeScript `strict: true`. No frameworks, no other runtime deps.
 
 ## 13. Tests
@@ -397,8 +458,29 @@ it renders into the recorder's library.
   accumulation (normal steps, discarded seeks in both directions, re-anchoring,
   bucket boundaries, unknown duration); the v1→heat derivation; per-viewer
   grouping, summing and the two normalizations; strict payload parsing of both
-  versions. §16.9 has the detail, plus what §16 adds to `tests/beacon.test.ts`,
-  `tests/crypto.test.ts`, `tests/gateway.test.ts` and `tests/e2e.gateway.test.ts`.
+  versions; and §17.6's engagement figures — `completionRate`, `averageWatchedMs`
+  and `peakBucket`. §16.9 has the detail, plus what §16 adds to
+  `tests/beacon.test.ts`, `tests/crypto.test.ts`, `tests/gateway.test.ts` and
+  `tests/e2e.gateway.test.ts`.
+- `tests/shell.test.ts` (vitest, Node) — `parseRoute` and `routeHash` (§17.2), the
+  only new pure logic §17 introduces: each of the three hashes; a trailing slash;
+  `""`, `"#"`, `"#/"`, an unknown route and a nonsense one all resolving to
+  `"videos"`; round-tripping `routeHash` through `parseRoute`; and that no input
+  throws. The router's DOM half — `hashchange`, `hidden`, `aria-current`, focus —
+  is not tested in Node, for the reason `record.ts` and `player.ts` are not:
+  §17.2 exists to make sure the part worth testing is separable from the part
+  that needs a browser.
+- `tests/util.test.ts` (vitest, Node) — `codecLabel` over the strings the engines
+  actually emit (`avc1`/`avc3`, `vp09`, `av01`, `vp08`, MediaRecorder's shorter
+  `vp9`/`vp8`, a bare `video/webm` → `null`), and `shareLink` / `videoPageLink`
+  producing §2's fragment with no `location` to resolve against. These moved out of
+  `record.ts` and `upload.ts` in §11; the point of the move is that they are now
+  testable, so they are tested.
+- §17 retires the analytics expander (§16.6). **No existing test pins it**: the
+  suites are Node-only and none of them imports `dashboard.ts` or asserts on its
+  DOM, so the whole existing suite must keep passing unchanged — the work adds
+  cases, it deletes none. (What §17 does delete is `analyticsExpander` and
+  `analyticsHint`, which nothing tested.)
 - `tests/crypto.test.ts` (vitest, Node WebCrypto): key export/import round-trip;
   block round-trip; tampered byte → throws; wrong AAD (reordered chunk index) →
   throws; chunked encrypt/decrypt round-trip across ≥3 chunks incl. short
@@ -436,7 +518,9 @@ it renders into the recorder's library.
 - `README.md`: what/why, 5-minute quickstart (local compose, then real bucket),
   security model (fragment key, write-only creds, what it does NOT protect
   against), browser support matrix, future work (camera bubble, streaming
-  upload-while-recording, multipart).
+  upload-while-recording, multipart). Its description of the product is §1's
+  **three** pages — the app shell and its three views, the video page, and the
+  player recipients get (§17.9).
 
 ## 15. Gateway (optional): server-side credentials, presigned uploads
 
@@ -517,24 +601,31 @@ then `email` checked against `ALLOWED_EMAILS`. No sessions, no cookies, no
 refresh logic server-side. The verified email MAY be logged for audit; the
 token itself must never be logged.
 
-### 15.5 Client behavior (recorder page)
+### 15.5 Client behavior (owner-side pages)
 
 - `public/config.js` gains optional `gatewayUrl` (absolute, or relative like
   `"/api"` for same-origin deployments). Present → **gateway mode**: the
-  **storage** settings panel is not rendered (credentials never live in this
+  **storage** settings form is not rendered (credentials never live in this
   browser); client fetches `{gatewayUrl}/config`; recording requires Google
   sign-in (Google Identity Services script, ID token kept in memory only —
   never localStorage). Absent → **legacy mode**, §9 unchanged.
-- What gateway mode does keep is the encoder half of §9, in a **Recording
-  options** panel of its own: `quality`, `codec` and `videoBitsPerSecond` with
+- What gateway mode does keep is the encoder half of §9, as a **Recording
+  options** block of its own: `quality`, `codec` and `videoBitsPerSecond` with
   the same values, defaults and normalization, persisted at
   `videoshare.recording` (a key newer than `preferAv1`, so nothing to migrate).
   It appears once `/config` answers, before and independently of sign-in — which
   codec this machine can encode is the operator's business, not the gateway's —
   and saves on change, with no Save button. A browser that refuses localStorage
   keeps the choice in memory for the session and says so; it never blocks a
-  recording. Legacy mode leaves these three fields where they are, inside the
-  storage settings form.
+  recording. Legacy mode leaves these three fields where they are, **inside the
+  storage settings form**, read from and written to `videoshare.settings`, and
+  still never so much as reads `videoshare.recording` (§9).
+- §17 moves all of this into the `#/settings` view and takes the `<details>` off
+  it: gateway mode's settings view is **Recording options** plus the **Account**
+  block (§17.1's auth text), legacy mode's is the **Storage settings** form whose
+  second fieldset is its own Recording options. Which storage key each mode reads
+  is unchanged by that move — the two modes still never touch each other's key —
+  and `demandSettings` (§17.2) routes to this view instead of opening a panel.
 - `upload.ts` grows a `Signer` seam: `LocalSigner` (aws4fetch with settings
   creds — legacy mode, current behavior) and `GatewaySigner` (calls
   `/api/sign`; batches part URLs ahead of need, e.g. 8 at a time, so signing
@@ -548,7 +639,9 @@ token itself must never be logged.
   single exception of §16. In gateway mode `view.html` reads `{gatewayUrl}/config`
   once per page load, to learn whether analytics is on (§16.4), and sends §16.3's
   beacon only when it is; those two are the only requests it ever makes to the
-  gateway. In legacy mode it makes neither (§16.7).
+  gateway. In legacy mode it makes neither (§16.7). `video.html` (§17.4) reads the
+  same `/config` in gateway mode and lists sessions when signed in, but **never
+  sends a beacon**: it is an owner-side page (§16.5).
 
 ### 15.6 Tests
 
@@ -604,7 +697,7 @@ about the viewer:
 
 - **`browserId`** — persisted in the *viewer's* localStorage under
   `videoshare.viewer` (a bare string, not JSON). Minted on first use and reused
-  afterwards, so the library dashboard (§16.6) can collapse repeat viewings by one
+  afterwards, so the reader (§16.6) can collapse repeat viewings by one
   browser into one "viewer". When storage is unavailable or refuses (§9's rules), an ephemeral
   in-memory id is used **silently** — a viewer is never asked to fix their browser.
   It is written only when a beacon will actually be sent, so a legacy deployment
@@ -726,8 +819,8 @@ under prefix `{videoId}/` with `ListObjectsV2`, server-side, and answers:
   (§15.2). The browser fetches the ciphertext **straight from the bucket** — the
   gateway never streams a stored byte back (§15).
 - Pagination is followed to `MAX_LISTED_SESSIONS` (1000). Stopping early sets
-  `truncated: true` rather than silently trimming, and the dashboard says so in the
-  expander it was asked from.
+  `truncated: true` rather than silently trimming, and the video page says so beside
+  the numbers it affects (§17.6).
 - Keys that do not match `{videoId}/{22 base64url}.bin` are skipped: nothing else
   belongs in that prefix, and if something is there it is not a session.
 - Malformed `videoId` → **400**; analytics disabled → **404**; any method but
@@ -761,8 +854,8 @@ under prefix `{videoId}/` with `ListObjectsV2`, server-side, and answers:
   accepted.
 - The analytics bucket MUST be **private**: no public domain attached, no anonymous
   read policy. It needs no CORS for writes (the gateway writes it) but DOES need
-  `GET` CORS from the site origin, because the library dashboard fetches presigned
-  URLs from it directly (§16.10).
+  `GET` CORS from the site origin, because the owner-side pages fetch presigned
+  URLs from it directly (§16.6, §16.10).
 - Logging: the beacon handler writes **no per-request log line** — not the session id,
   not a size, not an origin. A failed write logs the video id and the storage status
   and nothing else. No IP-bearing header (`CF-Connecting-IP`, `X-Forwarded-For`,
@@ -795,8 +888,8 @@ declared separately: the gateway is its own package and imports nothing from `sr
 
 Two modules, split on testability the same way §8's arithmetic lives in `gap.ts`.
 
-`watch.ts` — pure, no DOM, no clock, imported by Node tests, by `beacon.ts` and by the
-library dashboard:
+`watch.ts` — pure, no DOM, no clock, imported by Node tests, by `beacon.ts` and by
+`dashboard.ts` (§16.6), which is what both owner-side surfaces read through:
 
 ```ts
 export type Range = [startMs: number, endMs: number];
@@ -841,6 +934,12 @@ export function sumHeat(payloads: readonly WatchPayload[], buckets?: number): nu
 export function relativeHeat(payloads: readonly WatchPayload[], buckets?: number): number[];
 export function normalizeHeat(heat: readonly number[]): number[];   // 0..1 against the largest bucket
 export function groupByViewer(sessions: readonly WatchSession[]): ViewerReport[];
+
+// The video page's engagement figures (§17.6) — arithmetic, so they live here.
+export function completionRate(payloads: readonly WatchPayload[]): number | null;   // 0..1
+export function averageWatchedMs(payloads: readonly WatchPayload[]): number | null;
+export function peakBucket(payloads: readonly WatchPayload[], buckets?: number):
+  { index: number; times: number } | null;
 
 export function parsePayload(value: unknown): WatchPayload | null;   // strict; null, never throws
 ```
@@ -1006,6 +1105,22 @@ a picture that lies is worse than no picture:
   `browserId` that is not 22 base64url characters is **never collapsed with anything**:
   each such session becomes its own single-play viewer (keyed internally by its
   `sessionId`) and reports that `browserId` verbatim.
+- `completionRate(payloads)` — `payloads.filter(p => p.completed).length /
+  payloads.length`, `0..1`, and `null` for an empty list. `completed` is the payload's
+  own flag (§16.2: coverage ≥ `COMPLETION_THRESHOLD`), not something recomputed here,
+  so the number the video page shows is the number the viewer's browser decided —
+  which is what makes the two sides agree by construction.
+- `averageWatchedMs(payloads)` — the **mean of `watchedMs(p.watched)` over the payloads
+  with `p.durationMs > 0`**, and `null` when none has one. Both sides of the division
+  are that subset: a session with an unknown duration knows how long it watched but not
+  what fraction that was, and counting it in the denominator alone would report an
+  average lower than any session in it. It is a union ("seen at least once", §16.2), so
+  a viewer who watches a minute twice contributes one minute — the same thing
+  `coverage` means, expressed in time.
+- `peakBucket(payloads)` — the bucket with the largest `relativeHeat`, as
+  `{ index, times }`, the **lowest index** winning a tie so the answer is deterministic
+  in a test; `null` when every bucket is zero (no heat, or no sessions). §17.6 turns it
+  into "peak 2.2× at 1:33"; a `null` means there is no caption to write.
 - `ATTENTION_BUCKETS` and `attentionCurve` are **removed**, replaced by `HEAT_BUCKETS`
   (the same 50) and the aggregates above. The curve counted *how many sessions touched
   a bucket* — the binary question heat answers with more resolution, and the one
@@ -1064,115 +1179,105 @@ export function viewerId(): string;              // `videoshare.viewer`; in-memo
   timeout (there is no honest duration for one; a slow drag is unbounded).
 - **No beacon at all** when: `config.js` sets no `gatewayUrl`; `/config` did not
   answer `analytics: true`; nothing has been played yet (`watched` is empty); or the
-  page is the recorder. Beacons come from `view.html` only — `record.ts` never calls
-  this and the recorder's preview element is not tracked.
+  page is an owner-side one. Beacons come from `view.html` only — neither `record.ts`
+  nor `video.ts` calls this, the recorder's preview element is not tracked, and
+  **`video.html` does not report on itself**. An owner watching their own video is
+  not a view: the page exists to read the numbers, and a page that moved them by
+  being opened would be lying about the thing it is for. It follows that `video.html`
+  writes no `videoshare.viewer` key either (§16.1) — `view.html` remains the only
+  page that ever does.
 - **Every failure is silent**: a `sendBeacon` that returns false, a 4xx, an encrypt
   that throws. Nothing reaches the viewer, nothing retries in a loop; the next
   scheduled flush carries the same cumulative state anyway.
 - `player.ts` starts it after `meta` is loaded and the gateway config has resolved,
-  and does nothing else differently. Both `player.ts` and the library dashboard
-  (§16.6) parse `#{id}.{key}` through one exported `parseShareFragment()` in `util.ts`
-  (§11) so the §2 format lives in one place — a pure refactor, playback behaviour
-  unchanged.
+  and does nothing else differently. Every page that handles a fragment — `player.ts`,
+  `video.ts`, and `record.ts`'s library rows — parses `#{id}.{key}` through the one
+  exported `parseShareFragment()` in `util.ts` (§11) so the §2 format lives in one
+  place, and builds links back through `shareLink` / `videoPageLink` for the same
+  reason.
 
-### 16.6 Library dashboard (`index.html`, `src/dashboard.ts`)
+### 16.6 Reading watch data (`src/dashboard.ts`)
 
-**There is no stats page.** Watch data belongs next to the video it is about, and the
-recorder already lists every video this browser made (§9's library). So each library
-entry grows an **Analytics expander**, and `stats.html`, `src/stats.ts` and
-`src/stats.css` are **deleted** — along with the rollup input that built them (§12).
+**There is no stats page**, and as of §17 there is no expander either. Watch data
+belongs next to the video it is about — and the surface that is about one video is now
+the **video page** (§17.4), which is where all of it is read. `stats.html`,
+`src/stats.ts` and `src/stats.css` stay deleted, along with the rollup input that
+built them (§12).
 
-When the expander exists at all:
+The expander was the right shape for a page that was a stack of cards and is the wrong
+shape for a page that has a video page to link to: a heatmap and a viewer table do not
+fit in a list row, and hiding them behind a disclosure meant the data existed but was
+never looked at. So:
 
-| `config.js` | `/config` | signed in | library entry shows |
-| --- | --- | --- | --- |
-| no `gatewayUrl` (legacy) | — | — | nothing — no expander, no hint, no request |
-| `gatewayUrl` | `analytics: false` | — | nothing, same as legacy |
-| `gatewayUrl` | `analytics: true` | no | one muted line: **"Sign in to see analytics."** |
-| `gatewayUrl` | `analytics: true` | yes | the expander, collapsed |
+- **Retired**: `analyticsExpander()`, `analyticsHint()`, the `<details>`/`<summary>`
+  "Analytics" widget on each library row, its per-row reload affordance, and the
+  `record.css` rules that styled it. Nothing in the test suite pins any of it (§13), so
+  it is deleted rather than deprecated, and the deletion is complete: no dead export,
+  no orphan CSS block, no "Sign in to see analytics." string left in the bundle.
+- **Kept, unchanged in meaning**: the pipeline — list, fetch presigned, decrypt, parse,
+  aggregate — with its concurrency bound, its caching rule, its skip-and-count rule for
+  unreadable sessions, its truncation honesty and the quiet muted sentence every
+  failure renders as. All of it now sits behind `loadReport()`.
+- **Relocated**: the rendering. The header counts, the overall heatmap and the
+  per-viewer rows become the video page's **Engagement** section (§17.6), which adds
+  what a row had no width for — the stat cards, the peak caption, the time axis and the
+  viewer table's columns. A library row keeps only the two numbers a list can carry
+  honestly: views and unique viewers (§17.3).
 
-The signed-out case is a **hint, not an absence**: the operator turned analytics on,
-the data exists, and a blank row would read as "this video has none". It is one line
-of muted text in the row, it makes no network call, and it is not a `<details>` —
-there is nothing to open. Signing in re-renders the library and the hints become
-expanders; signing out turns them back — which means `record.ts`'s auth-change handler
-gains a `renderLibrary()` call it does not have today, and that is the whole coupling
-between the two.
+Where analytics appears at all, in both places:
 
-The expander itself, matching what `index.html` already does with `<details>` /
-`<summary>` for its two panels:
+| `config.js` | `/config` | signed in | library row (§17.3) | video page (§17.6) |
+| --- | --- | --- | --- | --- |
+| no `gatewayUrl` (legacy) | — | — | no summary, no request | Engagement explains that watch data needs a gateway |
+| `gatewayUrl` | `analytics: false` | — | no summary, no request | Engagement says this deployment stores none |
+| `gatewayUrl` | `analytics: true` | no | no summary, no request | the designed sign-in hint (§17.6) |
+| `gatewayUrl` | `analytics: true` | yes | `38 views · 12 viewers` | the full section |
 
-- `<details>` with a `<summary>` reading **"Analytics"**, collapsed by default. Nothing
-  is fetched until one is opened, so a library of forty videos still costs the one
-  `/config` request the recorder already makes.
-- On **first open**: read the entry's stored `link` (§9's `LibraryEntry.link`) through
-  `parseShareFragment` for `{ id, keyB64 }` → `importKeyB64` →
+Signing in and out re-renders both — `record.ts`'s auth-change handler keeps the
+`renderLibrary()` call §16.6 gave it, and `video.ts` re-renders its Engagement section
+on the same event. That is still the whole coupling between sign-in and analytics.
+
+The pipeline, once per video id:
+
+- Take `{ id, keyB64 }` (from `parseShareFragment` — the library entry's stored `link`
+  on `index.html`, the page's own fragment on `video.html`) → `importKeyB64` →
   `GET {gatewayUrl}/beacon/{id}` with the Google bearer (§15.4, the same token the
   uploader holds, from `src/auth.ts` in memory) → fetch each session's ciphertext
   **directly from its presigned url**, at most `SESSION_CONCURRENCY` (6) at a time →
   `decryptBlock(key, analyticsAad(id, sessionId), block)` → `parsePayload` (v1 and v2,
-  §16.2) → render. Each kept session is a `WatchSession`: the payload plus the
-  listing's `lastModified`.
+  §16.2). Each kept session is a `WatchSession`: the payload plus the listing's
+  `lastModified`.
 - A session that fails to decrypt or to parse is **skipped and counted**, never hidden:
   the write endpoint is unauthenticated, so junk is possible, and so is a video
   re-uploaded under a new key.
-- **Result caching** is per video id and lasts the page's lifetime: collapsing and
-  re-expanding re-renders what was fetched, and re-rendering the library does not
-  refetch. A small **"reload"** link inside the expander refetches and replaces the
-  cached result — the one affordance for "someone watched it since I opened this". A
-  load that *failed* is not cached: reopening retries it, because the usual cause is a
-  token that has since been refreshed.
-- **The key never leaves the page.** Only the 22-character id appears in a request
-  path; the fragment is parsed in memory and never written to `location`, to `history`,
-  or into a form. This is the same rule §16 opens with, and it is the reason the
-  dashboard lives on the page that already holds the share links.
+- **Result caching** is per video id and lasts the **document's** lifetime. Re-rendering
+  the library does not refetch, and the video page's "Reload" refetches and replaces the
+  cached entry — the one affordance for "someone watched it since I opened this". A load
+  that *failed* is not cached: the next attempt retries it, because the usual cause is a
+  token that has since been refreshed. The cache does **not** survive navigation:
+  `video.html` is a separate document, so opening a row's video page fetches that video
+  once for itself. That is one listing, and the honest cost of a page that is worth
+  loading.
+- **The key never leaves the page.** Only the 22-character id appears in a request path;
+  the fragment is parsed in memory and never written to `location`, to `history`, or
+  into a form. This is the rule §16 opens with, and §17.4 restates it because the video
+  page carries a key in its own address bar.
 
-What it renders, all computed in the browser from decrypted payloads (`watch.ts`,
-§16.5):
-
-- **Header line** — total views (kept sessions, one per viewing instance) · unique
-  viewers (`groupByViewer(...).length`) · completions (`completed === true`, i.e.
-  coverage ≥ 90%, §16.2); then, **only when they are not zero/false**, "N sessions
-  could not be read" and a note that the listing was `truncated` at
-  `MAX_LISTED_SESSIONS`. Zero sessions is its own line — "No views yet." — not an
-  empty heatmap.
-- **Overall heatmap** — `HEAT_BUCKETS` (50) bars, one per 2% of the video, rendered as
-  plain CSS bars: **no chart library, no canvas, no external asset, no inline SVG
-  sprite**. Two channels, and they are different numbers on purpose:
-  - **height** = `normalizeHeat(sumHeat(payloads))[b]`, so the tallest bucket is full
-    height and the shape of attention within *this* video is legible whatever the
-    absolute numbers are. An empty bucket keeps a hairline so 50 bars stay 50 bars.
-  - **intensity** = `relativeHeat(payloads)[b]`, the ×-against-one-pass number. A
-    bucket at or above `1.0` must read **visibly hotter** than one below it — that is
-    the whole point of the heat data, and a rendering where 0.4 and 2.4 look the same
-    fails this section. The threshold is a class or a custom property on the bar; the
-    exact palette is `record.css`'s business.
-  - **tooltip** = each bar's `title`, exactly `~N.Nx` — `relativeHeat[b].toFixed(1)`,
-    e.g. `~2.4x`. Nothing else in the attribute.
-- **One row per unique viewer**, in `groupByViewer` order (most recent activity first):
-  the `browserId` truncated to its **first 8 characters** followed by an ellipsis; the
-  play count as "N plays" ("1 play" in the singular); that viewer's own heatmap, summed
-  over their sessions and rendered exactly like the overall one (its own
-  `normalizeHeat`, its own `relativeHeat` over that viewer's payloads); their best
-  session's coverage as a percentage, or "—" when no session of theirs has a known
-  duration; and the last-watched date from `lastModified`, formatted with
-  `toLocaleString()` like the rest of the library. No IP column, because no IP exists
-  to put in one.
-
-**Errors stay inside the expander.** A 401 (token expired), a 403, a 404, a 502, a
-network failure, a listing that returns nothing readable, an entry whose `link` has no
-parseable fragment — each renders as one quiet muted sentence where the content would
-have gone, and the expander stays open so the reader can hit "reload". None of them
-touches the page-level status area, none blocks a recording or an upload, and none is
-thrown: this is a panel about a video, not the page's business. A 401 says so plainly
-("Sign in again to load analytics.") rather than silently re-prompting, because the
-sign-in control is a few centimetres up the same page.
+**Errors stay where they were asked for.** A 401 (token expired), a 403, a 404, a 502,
+a network failure, a listing that returns nothing readable, an entry whose `link` has no
+parseable fragment — on the video page each renders as one quiet muted sentence where
+the content would have gone, with a "Reload" beside it; on a library row a failed
+summary renders as **nothing at all**, because a row is a list item and an error
+sentence per row is noise for something the reader did not ask for. Neither touches a
+page-level status area, neither blocks a recording or an upload, and neither is thrown.
+A 401 says so plainly ("Sign in again to load analytics.") rather than silently
+re-prompting, because the sign-in control is in the sidebar of the same page.
 
 `src/dashboard.ts` is the reader half, and it is its own module rather than more of
-`record.ts` (1,300 lines before this) for the reason `gap.ts`, `watch.ts` and
-`beacon.ts` are their own: fetch-decrypt-aggregate-render is a subject, and `record.ts`
-is the recorder's state machine. It owns no page state beyond its cache and hands
-`record.ts` DOM:
+`record.ts` or `video.ts` for the reason `gap.ts`, `watch.ts` and `beacon.ts` are their
+own: fetch-decrypt-aggregate-render is a subject. It owns no page state beyond its
+cache, does no arithmetic of its own (that is `watch.ts`, §16.5/§17.6) and hands its
+callers DOM:
 
 ```ts
 export interface AnalyticsDeps {
@@ -1180,26 +1285,48 @@ export interface AnalyticsDeps {
   /** The current Google ID token, or null. Read per request, never captured. */
   token: () => string | null;
 }
-export const SESSION_CONCURRENCY: number;      // 6
+export const SESSION_CONCURRENCY: number;      // 6 — presigned session fetches at once
+export const LIBRARY_CONCURRENCY: number;      // 3 — videos summarized at once (§17.3)
+export const LIBRARY_SUMMARY_EAGER: number;    // rows summarized without IntersectionObserver (§17.3)
 export const VIEWER_PREFIX: number;            // 8 characters, then an ellipsis
-/** The collapsed <details> for one entry — analytics on, signed in. */
-export function analyticsExpander(entry: LibraryEntry, deps: AnalyticsDeps): HTMLElement;
-/** The one-line "Sign in to see analytics." row — analytics on, signed out. */
-export function analyticsHint(): HTMLElement;
+export const VIEWER_ROWS: number;              // rows before "Show all" (§17.6)
+
+/** One video's sessions, once every object had its turn. */
+export interface VideoReport {
+  sessions: WatchSession[];
+  /** Objects that would not decrypt or would not parse — shown, never hidden. */
+  unreadable: number;
+  /** The gateway's listing hit MAX_LISTED_SESSIONS; there are more than these. */
+  truncated: boolean;
+}
+/** The two numbers a library row carries (§17.3). */
+export interface VideoSummary { views: number; viewers: number; }
+
+/** Cached per id for this document's lifetime; `refetch` replaces the entry. */
+export function loadReport(video: { id: string; keyB64: string }, deps: AnalyticsDeps,
+  opts?: { refetch?: boolean }): Promise<VideoReport>;
+export function summarize(report: VideoReport): VideoSummary;
+
+/** The three blocks of §17.6, in render order. `durationMs` is meta's (§5). */
+export function statCards(report: VideoReport): HTMLElement;
+export function replayHeatmap(report: VideoReport, durationMs: number): HTMLElement;
+export function viewerTable(report: VideoReport): HTMLElement;
 ```
 
-`record.ts` decides which of the two (or neither) a row gets, from the gateway config
-and the auth state it already tracks. Styles go in `record.css` beside the library's;
-`stats.css` is deleted, not moved.
+`record.ts` and `video.ts` decide, from the gateway config and the auth state they
+already track, whether to call any of this at all. Styles go in `shell.css` (§11), which
+both owner pages load; `stats.css` is deleted, not moved.
 
 ### 16.7 Legacy mode
 
 Zero behaviour change, and stated so it can be tested rather than hoped for: with no
 `gatewayUrl`, `view.html` makes exactly the requests §8 already makes, writes no
-localStorage key, mints no ids, loads no Google script, and contains no timer; and
-`index.html`'s library renders plain rows — no expander, no hint, no bearer, no
-listing call (§16.6). §9's settings and §10's "viewers are strangers" are otherwise
-untouched.
+localStorage key, mints no ids, loads no Google script, and contains no timer;
+`index.html`'s library renders plain rows — no summary, no bearer, no listing call
+(§16.6) — and its shell shows no account chip (§17.1); and `video.html` plays the
+video and nothing else, with an Engagement section that explains itself in one
+sentence and makes no request. §9's settings and §10's "viewers are strangers" are
+otherwise untouched.
 
 ### 16.8 Privacy guarantees
 
@@ -1292,6 +1419,16 @@ analytics.**
     one; `v: 2` accepted with exactly 50 non-negative integers and rejected with 49, 51,
     a float, a negative, a string entry, or no `heat` at all; `v` of `0`, `3`, `"2"` or
     absent → null.
+  - The engagement figures §17.6 puts on the video page, which are arithmetic and so
+    live and are tested here: `completionRate` over a mix of completed and not
+    (including all-completed, none-completed, and `null` for no sessions at all);
+    `averageWatchedMs` averaging `watchedMs` over **only** the payloads with
+    `durationMs > 0` — proven by a session with `durationMs: 0` and a non-empty
+    `watched` list changing neither the numerator nor the denominator — and `null`
+    when no payload has a duration; `peakBucket` returning the highest
+    `relativeHeat` bucket with its `×` value, taking the **lowest index** on a tie,
+    and `null` when every bucket is zero (so §17.6's caption is omitted rather than
+    reading "peak 0.0× at 0:00").
 - `tests/beacon.test.ts` keeps its `viewerId` suite unchanged and moves its payload
   suite to v2: the encrypt → decrypt → `parsePayload` round trip on a `v: 2` body with
   a 50-entry `heat`; the same body unreadable under another session's AAD; and the
@@ -1353,14 +1490,16 @@ analytics.**
 - `docs/gateway-setup.md`: an `ANALYTICS_BUCKET` section — creating a **private**
   second bucket on R2/S3/MinIO (no public domain attached, no anonymous read policy),
   the fact that it needs no CORS for writes because the gateway writes it but does
-  need `GET` CORS from the site origin for the dashboard's presigned session fetches,
+  need `GET` CORS from the site origin for the video page's presigned session fetches,
   that leaving the variable unset is a supported configuration, and §16.9's
   one-real-beacon smoke test for Lambda deployments — written the same way §15.7's R2
   step is, with the failure it catches and what to do about it. That smoke test reads
-  its result off the **library dashboard** (§16.6): record a video, watch a minute of
-  it from its share link, then open the recorder, sign in, and expand Analytics on that
-  entry. One view with a plausible heatmap means the beacon survived; "1 session could
-  not be read" on a video whose key has not changed is the failure it exists to catch.
+  its result off the **video page** (§17.4): record a video, watch a minute of it from
+  its share link, then open the app, sign in, and click that recording in **Videos**.
+  One view with a plausible heatmap means the beacon survived; "1 session could not be
+  read" on a video whose key has not changed is the failure it exists to catch. Every
+  pointer that used to say "expand Analytics on that row" says this instead — there is
+  no expander (§16.6).
 - `examples/docker-compose.yml`: the `mc` init job creates the analytics bucket
   (private, no anonymous policy) and sets its GET CORS; the `gateway` profile passes
   `ANALYTICS_BUCKET`.
@@ -1368,6 +1507,404 @@ analytics.**
   roughly when a video id was watched and how big each session object is; it never
   learns watch ranges, viewer identity, or an IP address, because none is read. Watch
   data is readable only by holders of the share link. Its description of *where you
-  read the data* is the library expander, not a third page: no sentence in the README
-  may promise a `stats.html` that the build no longer emits (§12), and what the
-  dashboard shows is views, unique viewers, completions and the replay heatmap (§16.6).
+  read the data* is the **video page** (`video.html`, §17.4), reached by clicking a
+  recording in Videos: no sentence in the README may promise a `stats.html` that the
+  build no longer emits (§12), or an Analytics expander that no longer exists (§16.6).
+  What the video page shows is views, unique viewers, completion rate, average watch
+  time, the replay heatmap and the per-viewer table (§17.6); what a library row shows
+  is views and unique viewers (§17.3).
+
+## 17. Owner-side shell, library and video page
+
+Everything in this section is **owner-side**. The share experience is `view.html`, and it
+is not touched: same markup, same `player.css`, same requests, same behaviour (§1, §8).
+Recipients must not be able to tell that any of §17 happened.
+
+The visual reference is the two approved mockups, `Main.dc.html` (the library) and
+`Video.dc.html` (the video page), which are checked in beside this document at
+`docs/design/` so the reference does not dangle. They are dark-mode renderings whose literal
+hexes are `app.css`'s **dark** token values; translate them back to the tokens
+(`--surface`, `--border`, `--border-strong`, `--accent`, `--accent-soft`, `--text`,
+`--text-muted`, `--text-faint`, the `--space-*` and `--radius-*` scales) rather than
+writing hexes, extending `app.css` only where a token is genuinely missing. The light
+theme then has to be as considered as the dark one: the mockups do not show it, and "it
+inverts" is not a design.
+
+No new runtime dependency, no external asset, no webfont, no chart library, no canvas:
+everything below is DOM, CSS and inline SVG, the way §16.6's heatmap already was.
+Pixel values in the mockups are guidance. This section pins **structure, states and
+behaviour**, and where a mockup and this section disagree, this section is the contract.
+
+### 17.1 The shell
+
+A `<nav>` sidebar, 232px, full height, its own surface against `--bg`, divided from the
+main column by a 1px `--border`. Three parts, top to bottom:
+
+- **Wordmark** — the brand mark `view.html`'s topbar already uses, plus "VideoShare",
+  linking to the library (`#/videos` on `index.html`, `index.html#/videos` on
+  `video.html`). Same mark on every page on purpose: a viewer who follows a link and the
+  owner who made it are looking at one product.
+- **Nav** — three items, each an `<a>` with an inline SVG glyph and a label: **Videos** →
+  `#/videos`, **New recording** → `#/record`, **Settings** → `#/settings`. The active one
+  carries `aria-current="page"` and the accent treatment. On `video.html` the three point
+  at `index.html#/…` and **Videos** is the active one — a video page is a video in the
+  library.
+- **Footer**, in order:
+  - the **"Encrypted in this browser"** lock line, glyph and text as the topbar carries
+    them today. Both modes, both owner pages: it is the one sentence of the threat model
+    a user should never have to go looking for.
+  - the **account chip**, gateway mode only. Signed in: a round monogram (first character
+    of the email, uppercased), the email — ellipsized, with the full address as its
+    `title` — and a **Sign out** control. Signed out, loading or errored: the chip is the
+    mount point for Google's button (`#auth-button`). GIS renders its own button, so that
+    mount must exist exactly once in the document, and the sidebar is where it lives.
+  - **Legacy mode has no chip at all** — no account, no sign-in, nothing to sign out of —
+    and the lock line ends the column.
+
+Auth *messages* do not belong in a 232px column. The status line, the "loading Google
+sign-in" text and the `publicBaseUrl` mismatch warning render in the Settings view's
+**Account** block (§17.2), which also repeats the identity and the Sign out control. The
+chip shows state; the Settings view carries text; there is still exactly one Google
+button, in the chip.
+
+Below 900px the sidebar becomes a **top bar**: the same DOM restyled by a media query —
+wordmark left, the three nav items in a row, the chip right. No drawer, no hamburger, no
+JS; below ~520px the nav labels may reduce to glyphs with the label kept as the
+accessible name. A route change stays the only thing that changes what is shown.
+
+The sidebar's markup is **duplicated literally** in `index.html` and `video.html`, the way
+the topbar is duplicated in `index.html` and `view.html` today; `shell.ts` owns behaviour
+only. Deliberate: the page has a sidebar before any module parses, and nothing about the
+shell depends on script.
+
+### 17.2 Routing and the three views
+
+`index.html`'s main column holds three sibling `<section>`s and nothing else:
+
+| hash | section | contains |
+| --- | --- | --- |
+| `#/videos` | `#view-videos` | §17.3's library — **the default** |
+| `#/record` | `#view-record` | §6's stage machine, its guards and its element ids, verbatim |
+| `#/settings` | `#view-settings` | Recording options; the Account block (gateway mode); the Storage settings form (legacy mode) |
+
+- The router is hand-rolled: a `hashchange` listener plus one application at load.
+  `parseRoute(hash)` is pure — `#/videos`, `#/record`, `#/settings`, a single trailing
+  `/` tolerated, and **everything else — `""`, `"#"`, `"#/"`, an unknown route, a
+  nonsense string — is `"videos"`**. `routeHash(view)` is its inverse and the only place
+  a hash string is written.
+- Applying a route: the matching section loses `hidden`, the other two get it — the
+  attribute, not merely a class, so a hidden view leaves the accessibility tree and its
+  controls leave the tab order; the matching nav link gains `aria-current="page"` and the
+  others lose it; `document.title` follows the view. Nothing is created or destroyed: all
+  three views are in the document from the start and stay there.
+- An unrecognized or empty hash is corrected with **`history.replaceState`**, never by
+  assigning `location.hash`: a history entry for a route the reader did not ask for turns
+  Back into a trap.
+- **Routing never touches the recorder** (§6). A recording, its timer, its assembler and
+  its multipart upload run on while the reader is in another view, and `beforeunload`
+  still guards `recording`/`preview`/`finishing`. The pull in the other direction is §6's
+  rule: a transition into `preview`, `finishing` or `done` **shows the record view**,
+  because those stages are asking the reader for something. While the stage is
+  `recording`, the **New recording** nav item carries a live indicator, so leaving the
+  view never hides a running capture.
+- **Starting a recording from anywhere is a navigation.** The library's "New recording"
+  button and the nav item both go to `#/record` and leave the stage at `idle`. Neither
+  starts capture: the record view's own **Record screen** button does, with the mic
+  toggle beside it, and `getDisplayMedia` keeps the direct user activation it needs.
+- `demandSettings(text)` — route to `#/settings`, make the demanded form visible, move
+  focus into it (its first empty required field) and announce `text` in that view's live
+  region. It no longer opens a `<details>`: the settings view has no disclosure widget,
+  its blocks are simply there.
+- `demandSignIn(text)` — **no navigation**. Sign-in lives in the shell chrome, visible
+  from every view and both owner pages, so there is no view to navigate to: it highlights
+  the account chip, moves focus to the sign-in control, and announces `text` in the
+  current view's live region.
+- The highlight is one shared treatment (`.demanded`): a brief attention ring settling
+  into a static outline, skipping straight to the static state under
+  `prefers-reduced-motion`, cleared on the next interaction with the thing highlighted. A
+  highlight is never the only signal — the message is always in a live region and focus
+  always moves, because neither a colour nor a pulse reaches a screen reader.
+
+`shell.ts`:
+
+```ts
+export type ViewName = "videos" | "record" | "settings";
+export const DEFAULT_VIEW: ViewName;                     // "videos"
+export function parseRoute(hash: string): ViewName;      // pure; never throws
+export function routeHash(view: ViewName): string;       // "#/videos" | "#/record" | "#/settings"
+export interface Router {
+  readonly view: ViewName;
+  go(view: ViewName): void;                              // pushes a history entry
+  onChange(listener: (view: ViewName) => void): void;
+}
+/** index.html only: wires hashchange and applies the current route once. */
+export function startRouter(): Router;
+/** The sidebar's account chip. A null `auth` is legacy mode: the chip is removed. */
+export interface AccountChip { render(state: AuthState): void; highlight(): void; }
+export function initAccountChip(auth: Auth | null): AccountChip;
+```
+
+`video.html` calls `initAccountChip` and marks **Videos** current. It has no router: its
+nav links are ordinary cross-document links.
+
+### 17.3 The library (`#/videos`)
+
+Header: an `<h1>` "Videos", a sub-line, and a primary **New recording** button (§17.2).
+The sub-line counts only what this browser knows — `N recordings · X uploaded from this
+browser`, summing `sizeBytes` over the entries that carry one. It does **not** claim to
+describe the bucket: the mockup's "in your bucket" is a number the local library cannot
+back, because removing an entry leaves the object exactly where it was (§9).
+
+An empty library keeps today's empty state, unchanged in substance.
+
+One card per entry, newest first (§9's order):
+
+1. **Thumbnail placeholder** — a 16:9 block: a CSS-only pattern, a play glyph and a
+   duration chip reading `formatDuration(entry.durationMs)`. No image is fetched, decoded
+   or stored — real thumbnails are a separate upcoming item, and nothing here anticipates
+   them beyond leaving the block's shape for one. The pattern's variant is **derived from
+   `entry.id`** by a pure function, so a row looks the same on every reload; it is
+   decoration and it is `aria-hidden`.
+2. **Title** — `entry.title || "Untitled recording"`, and the row's link.
+3. **Meta line** — today's `librarySubtitle(entry)`, unchanged: created date
+   (`toLocaleString()`) · duration · size · effective bitrate, the last two only when
+   `sizeBytes` is known (§9). **No codec**: `LibraryEntry` carries none, and recording one
+   for new entries only would make older rows read as a different kind of thing. (The
+   mockup shows a codec; the video page, which has `meta.mimeType`, is where it appears.)
+4. **Views summary** — when and only when the gateway answered `analytics: true` and
+   there is a token (§16.6's table): `summarize(...)` rendered as the count above
+   `views · N viewers`. Zero kept sessions reads "No views yet."; a report that failed
+   renders nothing at all. The unreadable-session and truncation notes belong to the video
+   page, which has room to be honest about them.
+5. **Copy link** — copies `entry.link`, the **share link**, always. This is the button
+   whose output goes to other people; it must never hand out a `video.html` URL.
+6. **Overflow menu** — a `⋯` button (`aria-haspopup="menu"`, `aria-expanded`) opening a
+   small menu whose one item is **Remove**, with today's meaning and today's warning (§9:
+   the local entry only; the video stays in the bucket). Escape or an outside click
+   closes it, focus returns to the trigger, and the whole thing works from the keyboard.
+   Remove re-renders the library.
+
+**The row's link target** is `video.html#{id}.{key}`, built by running `entry.link`
+through `parseShareFragment` and re-serialising with `videoPageLink(id, keyB64)` (§11) —
+never by appending to the stored link, and never by writing the key anywhere but that
+`href`. An entry whose link has **no parseable fragment** still renders: its title is
+plain text instead of a link, Copy link still copies what was stored, and no summary is
+attempted.
+
+**What the summaries cost.** §16.6's expander guaranteed that a library of forty videos
+cost the one `/config` request the recorder already makes; summarizing every row eagerly
+would fire forty listings and every session fetch behind them. So a row's summary loads
+**when the row is visible** (`IntersectionObserver`; with no observer available, the first
+`LIBRARY_SUMMARY_EAGER` rows load and the rest on demand), at most `LIBRARY_CONCURRENCY`
+videos in flight, and the queue is abandoned when the library re-renders. Summaries start
+when the videos view is first shown — not on a load that lands on `#/record` — and they
+clear on sign-out. A row whose summary has not arrived shows the space it will occupy and
+nothing else: no per-row spinner, because a list of spinners reads worse than a list that
+fills in.
+
+### 17.4 The video page (`video.html`, `src/video.ts`)
+
+The owner's page for one video: the same video a share link plays, and everything the
+watch data says about it. Nobody is sent this URL, but it holds a key in its address bar
+exactly as `view.html` does, and the rules are the same ones.
+
+- **Fragment contract, identical to §2/§8**: `video.html#{id}.{key}`, parsed by
+  `parseShareFragment`. A missing or malformed fragment gets the same friendly error
+  `view.html` gives, worded for the owner. The key decrypts and does nothing else: it
+  appears in no request path, query, header or body, and is never written to `history`,
+  into a form, or into any storage (§16's second invariant, restated here because this
+  page's own URL carries one).
+- **Config**: `publicBaseUrl()` from `config.js` (§10), resolved exactly as `view.html`
+  resolves it. Gateway mode additionally fetches `{gatewayUrl}/config` once, for
+  `analytics` and the Google client id; legacy mode fetches neither and loads no Google
+  script.
+- **Layout**, per `Video.dc.html`: the shell sidebar with **Videos** active; a back link
+  **"All videos"** to `index.html#/videos`; the title row; the player as the hero; then
+  Engagement (§17.6).
+- **Title row** — the decrypted `meta.title` (or "Untitled recording") as `<h1>`; a meta
+  line; and **Copy link**, which copies `shareLink(id, keyB64)` (§11) — the *viewer's*
+  link, resolved from this page's own URL and therefore byte-identical to the one the
+  recorder stored. The meta line is `meta.createdAt` (`toLocaleDateString`) ·
+  `formatDuration(meta.durationMs)` · `formatBytes(meta.totalBytes)` ·
+  `codecLabel(meta.mimeType)` when it names one, with the frame size appended as `W×H`
+  once the media element reports a `videoWidth` — which is the only honest source for a
+  resolution, since `VideoMeta` carries none. The mockup's `⋯` button beside Copy link is
+  **not built**: there is no second action this page can perform honestly (a video page
+  opened from a link in another browser has no library entry to remove), and an empty menu
+  is worse than no menu.
+- **Player** — the shared core (§17.5) in a framed 16:9 hero, with the browser's own
+  `controls`, as `view.html` uses. `video.css` styles the frame; the mockup's drawn
+  control bar is illustrative and is not a request for a custom one. The page **does not
+  autoplay**: fetching, decrypting and appending start immediately so the video is ready
+  the moment it is wanted, but playback waits for the reader, who came to look at numbers
+  and should not have audio start underneath them. A play affordance sits over the hero
+  and the core's `onAutoplayBlocked` hook feeds the same control. (`view.html` still
+  autoplays — that is §8, unchanged.)
+- **No beacon, ever** (§16.5). The owner's own visit is not a view, and this page writes no
+  `videoshare.viewer` key.
+- A playback failure renders the core's `PlaybackError` (title + sentence) in a designed
+  panel in the hero's place, and **does not hide Engagement**: the watch data is still
+  readable, and is often exactly what the reader came for.
+
+### 17.5 The player core (`src/playback.ts`)
+
+§8 is implemented once and driven by two pages. The split is by subject:
+
+**`playback.ts` owns** all of §8 — meta fetch, parse and validation; the block reader with
+its Range requests and its whole-object fallback; per-chunk decryption and the
+plaintext-length check; the MSE path (`SourceBuffer`, quota eviction, fetch-ahead,
+`endOfStream`); the whole-file fallback and its duration probe; and the buffered-gap
+jumper. `gap.ts` stays exactly where it is and keeps its tests. `PlaybackError` (title +
+message) is `playback.ts`'s export, and §8's strings move with it unchanged.
+
+**A page owns** its own chrome: fragment parsing, title and meta rendering, status and
+error presentation, the play affordance, and — on `view.html` only — starting the watch
+beacon (§16.5).
+
+```ts
+export class PlaybackError extends Error { readonly title: string; }
+export interface PlaybackOptions {
+  video: HTMLVideoElement;
+  publicBaseUrl: string;
+  id: string;
+  key: CryptoKey;
+  meta: VideoMeta;
+  /** view.html: true (§8, unchanged). video.html: false (§17.4). */
+  autoplay: boolean;
+  /** A progress line, or null to clear it. */
+  onStatus(text: string | null): void;
+  /** play() was refused by the autoplay policy — offer a play control. */
+  onAutoplayBlocked(): void;
+}
+export interface Playback {
+  /** Resolves when the last chunk has been appended; rejects with §8's error. */
+  readonly done: Promise<void>;
+  /** True once MSE accepted a chunk or the blob src was set. Before that a media
+      element error is recoverable — the whole-file fallback is still to come — and
+      must not be reported (§8). */
+  sourceCommitted(): boolean;
+}
+export function fetchMeta(publicBaseUrl: string, id: string, key: CryptoKey): Promise<VideoMeta>;
+export function startPlayback(opts: PlaybackOptions): Playback;
+```
+
+Two constraints on the extraction, both load-bearing:
+
+- **No module-level per-playback state.** `player.ts`'s `appendedAny` and
+  `sourceCommitted` are module variables today; in a shared module they become state of
+  the returned `Playback`. Two pages never share one, but a module-level flag is a bug
+  waiting for the first page that plays twice.
+- **`view.html` is unchanged from a viewer's seat**: the same requests in the same order,
+  the same status strings, the same error titles and bodies, the same event wiring (the
+  `play`, `loadeddata` and `error` listeners and the play-overlay button), the same
+  `player.css`. The refactor is only correct if a viewer cannot tell it happened.
+
+### 17.6 Engagement (on the video page)
+
+One section, heading **Engagement**, under the player, with the standing note that watch
+data is encrypted and readable only by holders of the share link (§16.8). Everything in it
+is computed in this browser from decrypted payloads (`watch.ts`, §16.5) after
+`loadReport` (§16.6). `payloads` below is `report.sessions.map(s => s.payload)`.
+
+**Four stat cards**, in this order:
+
+| card | value |
+| --- | --- |
+| **Views** | kept sessions — `report.sessions.length`, one per viewing instance |
+| **Unique viewers** | `groupByViewer(report.sessions).length` |
+| **Completion rate** | `completionRate(payloads)` as a rounded percentage; "—" when null |
+| **Avg watch time** | `averageWatchedMs(payloads)` through `formatDuration`; "—" when null |
+
+**The replay heatmap** — `HEAT_BUCKETS` (50) plain CSS bars, one per 2% of the video, with
+§16.6's two channels unchanged: height = `normalizeHeat(sumHeat(payloads))`, intensity =
+`relativeHeat(payloads)` with a bucket at or above `1.0` reading visibly hotter than one
+below it, tooltip exactly `~N.Nx`. It gains the two things a library row had no width for:
+
+- a **peak caption** from `peakBucket(payloads)`: `peak {times.toFixed(1)}× at {t}`, where
+  `t = formatDuration(index · meta.durationMs / HEAT_BUCKETS)` — the bucket's start, which
+  is the position a reader would scrub to. Omitted entirely when `peakBucket` is null or
+  `meta.durationMs` is 0, rather than printed as zeros;
+- a **time axis** of five labels under the bars — `0`, ¼, ½, ¾ and the full duration,
+  through `formatDuration` — when `meta.durationMs > 0`, and the existing Start/End pair
+  when it is not.
+
+**The viewer table** — one row per unique viewer in `groupByViewer` order (most recent
+activity first):
+
+| column | value |
+| --- | --- |
+| Viewer | `browserId` truncated to `VIEWER_PREFIX` (8) characters and an ellipsis — and the full id nowhere: not in a `title`, not in an `aria-label` (§16.6's reasoning stands) |
+| Plays | that viewer's session count, "N plays" / "1 play" |
+| Attention | their own heatmap, both channels computed over their own payloads |
+| Watched | their best session's coverage as a percentage, or "—" when no session of theirs has a known duration |
+| Last seen | their `lastWatched` (`lastModified`) through `toLocaleString()` |
+
+No IP column, because no IP exists to put in one (§16.8).
+
+At most `VIEWER_ROWS` rows render, followed by an honest line — **"Showing N of M
+viewers"** — and a **Show all** control that reveals the rest in place. It fetches
+nothing: every viewer is already in memory, and this truncation is about a readable page,
+not about a request. The line goes away when N = M.
+
+Two further lines, each **only when true** (§16.6): "N sessions could not be read", and a
+note that the gateway's listing was truncated at `MAX_LISTED_SESSIONS` — so "12 viewers"
+is never quietly "the viewers in the first 1000 sessions". A **Reload** control refetches
+under §16.6's cache rule.
+
+**Zero sessions** is its own line — "No views yet." — with the cards showing zeros, no
+heatmap and no table, rather than 50 hairlines that imply data.
+
+**The three states that are not "signed in with analytics on"** are each a designed block
+in the same footprint, never an absence:
+
+- gateway + `analytics: true` + **signed out** → a sign-in hint: the watch data exists,
+  it is encrypted, signing in is what reads it, and the control is in the sidebar. It
+  makes no request. Signing in renders the section for real, on the same auth-change event
+  that re-renders the library (§16.6).
+- gateway + `analytics: false` → this deployment stores no watch data, pointing at
+  `ANALYTICS_BUCKET` (§16.4). Not an error: it is a supported configuration.
+- legacy (no `gatewayUrl`) → watch data needs a gateway; the video plays either way. No
+  request, no Google script, no storage key (§16.7).
+
+In all of them, and while a report is loading or after one has failed, **the player is
+unaffected**. Engagement is a section of a page, not the page.
+
+### 17.7 Accessibility, motion and theme
+
+What §17 must not lose, stated so it can be checked:
+
+- every control reachable and operable from the keyboard, with `app.css`'s
+  `:focus-visible` ring and not a bespoke one: nav links, the chip's controls, each row's
+  link, Copy link, the overflow trigger and its items, Show all, Reload;
+- `aria-current="page"` on the active nav item; `hidden` on inactive views;
+- the overflow menu: `aria-haspopup`/`aria-expanded`, Escape closes it, focus returns to
+  the trigger;
+- decoration marked `aria-hidden` (the thumbnail pattern, the glyphs), and each heatmap
+  keeping the `role="img"` and real label it has today;
+- messages in live regions, as `#message`, `#settings-status` and `#recording-status`
+  already are;
+- `prefers-reduced-motion`: no pulse, no slide, no animated bar growth — every transition
+  §17 adds degrades to an instant state change;
+- **light-theme parity**: the mockups are dark, so every surface, border, chip, bar and
+  hover state must be expressed in tokens and then looked at in light mode with the same
+  care the dark one got.
+
+### 17.8 What §17 deletes
+
+`analyticsExpander`, `analyticsHint` and the `record.css` rules that styled them (§16.6);
+`index.html`'s topbar and single-column card stack (`.topbar`, `.page-head`, and the
+`<details>` framing of the settings and recording-options panels); `record.ts`'s
+`recordedCodec` + `CODEC_NAMES` and `upload.ts`'s `shareLink`, **moved** to `util.ts`
+(§11) rather than copied. `view.html`, `player.css`, `gateway/` and everything in §§2–8,
+§15 and §16.1–16.5 are untouched.
+
+### 17.9 Docs
+
+- `README.md`: its product description becomes §1's three pages — the shell and its three
+  views, the video page, and the player recipients get — and its analytics paragraph
+  points at the video page rather than an expander (§16.10).
+- `docs/gateway-setup.md`: every "expand **Analytics** on that row" pointer becomes "open
+  the recording from **Videos**", and the troubleshooting rows that name the expander name
+  the video page's Engagement section instead, with their diagnoses unchanged.
+- The one new thing a deployer has to know: `dist/` now contains `video.html`, and a
+  deploy that drops it breaks every library row's link (§12).
