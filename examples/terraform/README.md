@@ -299,6 +299,12 @@ nothing else.
 distribution, waits for that change to finish deploying to every edge, and only
 then deletes it. It is not stuck.
 
+**On Cloudflare, run `terraform destroy` BEFORE deleting the worker with
+wrangler.** Deleting the worker also deletes its custom domain, and the
+provider then errors reading the orphaned `cloudflare_workers_domain` instead
+of treating it as gone — the recovery is `terraform state rm` on that address.
+Destroy first and the ordering never comes up.
+
 **The GCP module leaves its four APIs enabled.** `disable_on_destroy = false`
 throughout: an API that was already on before this module ran is not this
 module's to switch off.
