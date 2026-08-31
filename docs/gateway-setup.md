@@ -183,6 +183,11 @@ cross-origin. Whatever the arrangement, `ALLOWED_ORIGINS` lists the site.
 Pick one. They run the same `handleRequest`; the adapters only translate
 transport shapes.
 
+`examples/terraform/` builds the bucket side of each of these — and the Lambda
+and Cloud Run deployments in full — as Terraform. Its README says which parts of
+this document it replaces and which stay manual (the OAuth client above, always;
+the Worker script, which stays on `wrangler deploy`).
+
 ### Cloudflare Worker
 
 The natural pairing with R2, and free for this workload.

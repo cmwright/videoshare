@@ -1,0 +1,37 @@
+# The values the GCP module was planned against on 2026-08-31. Copy to
+# terraform.tfvars (or drop the .example so it auto-loads) and edit.
+#
+# Nothing here is secret, and no credential is ever pasted in by hand: the one
+# credential in this stack — the Cloud Storage HMAC key the gateway signs with —
+# is minted by the apply and written straight into the Cloud Run environment.
+#
+# THE STATE FILE IS A DIFFERENT MATTER. terraform.tfstate holds that HMAC secret
+# in cleartext, as it holds every value it manages; `sensitive` only keeps it out
+# of the CLI's output. .gitignore keeps *.tfstate out of git, which is the least
+# of it — treat the file itself as the credential: no unencrypted backups, and a
+# remote backend only if it has encryption at rest and access control. Rotating
+# it is `terraform taint google_storage_hmac_key.gateway` plus an apply.
+
+project     = "videoshare-506902"
+region      = "us-central1"
+name_suffix = "val01"
+
+# From console.cloud.google.com/auth/clients. Its authorized JavaScript origins
+# must include https://storage.googleapis.com for a site served out of the site
+# bucket — read the note in buckets.tf about what that origin actually means
+# before using this shape for anything but a validation run.
+google_client_id = "1234567890-abcdef.apps.googleusercontent.com"
+
+allowed_emails = ["you@example.com"]
+
+enable_analytics = true
+presign_expiry   = 900
+
+# Pushed by ./build-and-push.sh, which runs after
+# `terraform apply -target=google_artifact_registry_repository.gateway` and
+# before the full apply — see ../README.md. Bump the tag to roll out a new
+# revision; Cloud Run will not redeploy for a moved "latest".
+gateway_image_tag = "latest"
+
+# Uncomment while testing a local build against the deployed gateway.
+# extra_allowed_origins = ["http://localhost:8080"]

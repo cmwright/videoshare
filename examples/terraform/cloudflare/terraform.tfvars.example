@@ -1,0 +1,27 @@
+# Copy to terraform.tfvars and edit. Do NOT put api_token in here — export
+# CLOUDFLARE_API_TOKEN instead.
+
+account_id = "0000000000000000000000000000000000"
+zone_id    = "0000000000000000000000000000000000"
+
+videos_bucket    = "videoshare"
+analytics_bucket = "videoshare-analytics"
+enable_analytics = true
+
+# The worker wrangler deploys. This module routes a hostname at it; it does not
+# manage the script.
+worker_name      = "videoshare-gateway"
+gateway_hostname = "gateway.example.com"
+
+# The Pages project serving dist/, and the hostname attached to it.
+pages_project = "videoshare"
+site_hostname = "share.example.com"
+
+# Extra origins for the cors_rules output. Uncomment while testing a local build
+# against the deployed bucket, and take it back out afterwards — this document
+# goes onto the production bucket.
+# extra_allowed_origins = ["http://localhost:8080"]
+
+# Records that belong to nothing else. Most deployments leave this empty; it is
+# here for the AWS module's two outputs when the site lives on S3 + CloudFront.
+dns_records = {}

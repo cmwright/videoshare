@@ -1,0 +1,35 @@
+# Copy to terraform.tfvars and edit. Nothing in here is secret, and no credential
+# is ever pasted in by hand: the bucket credentials are minted by the apply and
+# written straight into the Lambda's environment.
+#
+# THE STATE FILE IS A DIFFERENT MATTER. terraform.tfstate holds the IAM user's
+# secret access key in cleartext, as it holds every value it manages;
+# `sensitive` only keeps it out of the CLI's output. .gitignore keeps *.tfstate
+# out of git, which is the least of it — treat the file itself as the credential:
+# no unencrypted backups, and a remote backend only if it has encryption at rest
+# and access control. Rotating it is `terraform taint aws_iam_access_key.gateway`
+# plus an apply.
+
+name_suffix = "94f12f"
+region      = "us-east-1"
+
+# From console.cloud.google.com/auth/clients — a Web application client whose
+# authorized JavaScript origins include every origin in the `allowed_origins`
+# output. Adding them there stays manual.
+google_client_id = "1234567890-abcdef.apps.googleusercontent.com"
+
+# Full addresses or "@domain" suffixes.
+allowed_emails = ["you@example.com"]
+
+# Leave empty to skip ACM and CloudFront and serve the site off the S3 REST
+# endpoint.
+site_domain = ""
+
+# Uncomment while testing a local build against the deployed gateway.
+# extra_allowed_origins = ["http://localhost:8080"]
+
+enable_analytics = true
+presign_expiry   = 900
+
+# Written by ./build.sh.
+lambda_zip = "gateway.zip"

@@ -132,6 +132,10 @@ Two things move: the bucket, and where the static site lives.
    `{wherever you published}/view.html#{id}.{key}`, so the site needs a stable
    home — a moved site breaks every link you have already sent.
 
+[`examples/terraform/`](examples/terraform) has standalone Terraform
+configurations that build all of that — buckets, policies, CORS, lifecycle and
+the optional gateway — on AWS, Google Cloud or Cloudflare.
+
 ### If the site is not at the domain root
 
 `npm run build` emits relative asset paths (`vite.config.ts` sets `base: "./"`),

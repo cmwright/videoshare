@@ -1,0 +1,14 @@
+# Provider plugins and state. The lock files (.terraform.lock.hcl) are NOT
+# ignored — they pin the provider versions each module was verified against.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+
+# Real variable files. The .example ones are checked in.
+*.tfvars
+!*.tfvars.example
+
+# Build output from aws/build.sh.
+gateway.zip
