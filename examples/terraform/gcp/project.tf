@@ -8,6 +8,9 @@ resource "google_project_service" "services" {
     "artifactregistry.googleapis.com",
     "storage.googleapis.com",
     "iam.googleapis.com",
+    // build-and-push.sh builds through Cloud Build; without this it fails
+    // with SERVICE_DISABLED before the first image exists.
+    "cloudbuild.googleapis.com",
   ])
 
   project = var.project
