@@ -105,8 +105,15 @@
   display: none;
 }
 
-.view-head > button {
+.view-head > button,
+.view-head-actions {
   flex: none;
+}
+
+.view-head-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
 }
 
 /* --- Footer (mirrors player.css) ------------------------------------------ */
@@ -577,6 +584,56 @@ code {
   /* The frame carries the letterbox colour, so an off-aspect recording
      letterboxes into it rather than into a second, darker box. */
   background: transparent;
+}
+
+/* Upload: the drop zone (SPEC §19) ------------------------------------------- */
+
+/* A label wrapping the (visually hidden) file input, so a click anywhere in it
+   opens the picker and the input's own focus ring is what keyboard users see. */
+.dropzone {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  max-width: 34rem;
+  padding: var(--space-7) var(--space-6);
+  border: 1.5px dashed var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface-sunken);
+  cursor: pointer;
+  text-align: center;
+  transition: border-color 0.12s ease, background-color 0.12s ease;
+}
+
+.dropzone:hover,
+.dropzone.dragover,
+.dropzone:has(input:focus-visible) {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.dropzone-mark {
+  width: 36px;
+  height: 36px;
+  color: var(--accent);
+}
+
+.dropzone-mark svg {
+  width: 100%;
+  height: 100%;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.dropzone-title {
+  color: var(--text);
+  font-size: 1.0625rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
 }
 
 /* Finishing ------------------------------------------------------------------ */

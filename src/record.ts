@@ -3,8 +3,10 @@
  *
  * Two subjects share this module, the way they share the page:
  *
- * - the **shell** — three hash-routed views around one sidebar (§17.2), the
- *   settings view's two modes (§15.5) and the library (§17.3);
+ * - the **shell** — four hash-routed views around one sidebar (§17.2), the
+ *   settings view's two modes (§15.5), the library (§17.3) and the upload
+ *   view (§19), whose controller lives in `import-view.ts` and is handed what
+ *   it needs from here;
  * - the **recorder** — idle → picking → recording → preview → finishing → done,
  *   unchanged by §17 down to its element ids. The multipart upload is created at
  *   record start and fed 8 MiB chunks while the capture is still running, so
@@ -48,6 +50,7 @@ import {
   selectEngineKind,
   selectFallbackMimeType,
 } from "./encoder";
+import { initImportView } from "./import-view";
 import {
   addToLibrary,
   CODECS,
@@ -182,6 +185,7 @@ const libraryEmpty = el<HTMLElement>("#library-empty");
 const libraryCount = el<HTMLElement>("#library-count");
 const libraryStatus = el<HTMLElement>("#library-status");
 const newRecordingButton = el<HTMLButtonElement>("#new-recording");
+const uploadVideoButton = el<HTMLButtonElement>("#upload-video");
 
 // --- State -------------------------------------------------------------------
 
@@ -344,7 +348,13 @@ function showError(text: string): void {
  */
 function announce(text: string, isError: boolean): void {
   const region =
-    router.view === "videos" ? libraryStatus : router.view === "settings" ? settingsLive : messageLine;
+    router.view === "videos"
+      ? libraryStatus
+      : router.view === "settings"
+        ? settingsLive
+        : router.view === "upload"
+          ? importView.message
+          : messageLine;
   region.textContent = text;
   region.classList.toggle("error", isError);
 }
@@ -2020,18 +2030,35 @@ interface UploadPlan {
 }
 
 /**
- * Resolves who will authorize the upload, or explains what is missing and
- * returns null. The multipart upload starts with the recording, so this has to
- * hold before a screen is even picked.
+ * What each caller is about to do, for the sentence that explains what is
+ * missing: the recorder's upload starts as it records, which is why it asks
+ * before a screen is even picked; an import asks at its Upload button.
  */
-function uploadPlan(): UploadPlan | null {
+const AUTHORIZE_REASONS = {
+  record: {
+    signIn: "Sign in with Google before recording — the upload starts as you record.",
+    settings: "Add your storage settings before recording — the upload starts as you record.",
+  },
+  import: {
+    signIn: "Sign in with Google before uploading.",
+    settings: "Add your storage settings before uploading.",
+  },
+} as const;
+
+/**
+ * Resolves who will authorize an upload, or explains what is missing and
+ * returns null. The settings it returns alongside are the recorder's (SPEC
+ * §15.5 says where each mode keeps them); an import ignores them.
+ */
+function authorizeUpload(purpose: keyof typeof AUTHORIZE_REASONS): UploadPlan | null {
+  const reasons = AUTHORIZE_REASONS[purpose];
   if (gatewayBase) {
     if (!gateway) {
       demandSignIn("The upload gateway is not ready yet — see Settings → Account.");
       return null;
     }
     if (!gateway.auth.getToken()) {
-      demandSignIn("Sign in with Google before recording — the upload starts as you record.");
+      demandSignIn(reasons.signIn);
       return null;
     }
     // The recording options block, not the (removed) settings form, holds the
@@ -2047,7 +2074,7 @@ function uploadPlan(): UploadPlan | null {
 
   const settings = loadSettings();
   if (!settings) {
-    demandSettings("Add your storage settings before recording — the upload starts as you record.");
+    demandSettings(reasons.settings);
     return null;
   }
   try {
@@ -2061,6 +2088,11 @@ function uploadPlan(): UploadPlan | null {
     demandSettings(describe(err));
     return null;
   }
+}
+
+/** The recorder's half of `authorizeUpload` — see there. */
+function uploadPlan(): UploadPlan | null {
+  return authorizeUpload("record");
 }
 
 async function startRecording(): Promise<void> {
@@ -2520,11 +2552,31 @@ againButton.addEventListener("click", () => {
 });
 // Starting a recording from anywhere is a navigation, and nothing more: capture
 // begins at the record view's own button, which is where `getDisplayMedia` gets
-// the direct user activation it needs (SPEC §17.2).
+// the direct user activation it needs (SPEC §17.2). Starting an upload is the
+// same kind of thing: the file picker lives in its own view (SPEC §19).
 newRecordingButton.addEventListener("click", () => router.go("record"));
+uploadVideoButton.addEventListener("click", () => router.go("upload"));
+
+/**
+ * The upload view (SPEC §19). Its controller gets exactly what it cannot own:
+ * who authorizes an upload in this mode, and what the library does with a link.
+ */
+const importView = initImportView({
+  router,
+  signer: () => authorizeUpload("import")?.signer ?? null,
+  onUploaded(entry) {
+    addToLibrary(entry);
+    renderLibrary();
+  },
+  copyLink,
+  copyToClipboard,
+  whenRouted,
+});
 
 window.addEventListener("beforeunload", (event) => {
-  if (stage === "recording" || stage === "preview" || stage === "finishing") event.preventDefault();
+  if (stage === "recording" || stage === "preview" || stage === "finishing" || importView.busy) {
+    event.preventDefault();
+  }
 });
 
 function checkSupport(): void {

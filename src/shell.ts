@@ -16,6 +16,7 @@
  *   <a class="brand" href="…#/videos">…</a>
  *   <a class="nav-item" data-route="videos"   href="…#/videos">…</a>
  *   <a class="nav-item" data-route="record"   href="…#/record">…</a>
+ *   <a class="nav-item" data-route="upload"   href="…#/upload">…</a>
  *   <a class="nav-item" data-route="settings" href="…#/settings">…</a>
  *   <span class="badge-secure">Encrypted in this browser</span>
  *   <div id="account-chip" hidden>            <!-- gateway mode only -->
@@ -29,6 +30,7 @@
  * </nav>
  * <section id="view-videos">…</section>       <!-- index.html only -->
  * <section id="view-record" hidden>…</section>
+ * <section id="view-upload" hidden>…</section>
  * <section id="view-settings" hidden>…</section>
  * ```
  *
@@ -39,23 +41,24 @@
 
 import type { Auth, AuthState } from "./auth";
 
-export type ViewName = "videos" | "record" | "settings";
+export type ViewName = "videos" | "record" | "upload" | "settings";
 
 /** Where an empty, unknown or nonsense hash lands (SPEC §17.2). */
 export const DEFAULT_VIEW: ViewName = "videos";
 
-const VIEWS: readonly ViewName[] = ["videos", "record", "settings"];
+const VIEWS: readonly ViewName[] = ["videos", "record", "upload", "settings"];
 
 /** What the tab says per view; the library's is the product's own name. */
 const TITLES: Record<ViewName, string> = {
   videos: "VideoShare",
   record: "New recording · VideoShare",
+  upload: "Upload video · VideoShare",
   settings: "Settings · VideoShare",
 };
 
 /**
  * Which view a hash names. Pure, total and never throws — every input that is
- * not exactly one of the three routes is the library, because a reader who
+ * not exactly one of the four routes is the library, because a reader who
  * types a hash by hand or follows a stale link should land on something.
  *
  * A single trailing `/` is tolerated (`#/videos/`), and so is a missing leading
@@ -84,7 +87,7 @@ export interface Router {
 /**
  * `index.html` only: wires `hashchange` and applies the current route once.
  *
- * Nothing is created or destroyed — all three sections are in the document from
+ * Nothing is created or destroyed — all four sections are in the document from
  * the start and stay there — so the recorder's stage machine, its timer and its
  * multipart upload run on regardless of which view is showing (SPEC §17.2).
  */

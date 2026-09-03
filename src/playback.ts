@@ -165,7 +165,8 @@ function parseMeta(bytes: Uint8Array): VideoMeta {
     isNonNegativeInt(m.chunkCount) &&
     m.chunkSize > 0 &&
     m.chunkCount > 0 &&
-    m.chunkCount === Math.ceil(m.totalBytes / m.chunkSize);
+    m.chunkCount === Math.ceil(m.totalBytes / m.chunkSize) &&
+    (m.progressive === undefined || typeof m.progressive === "boolean");
   if (!ok) {
     throw new PlaybackError(
       "Unsupported video",
@@ -230,8 +231,12 @@ function bytes(view: Uint8Array): Uint8Array<ArrayBuffer> {
   return view as Uint8Array<ArrayBuffer>;
 }
 
-function canStream(mimeType: string): boolean {
-  return typeof MediaSource !== "undefined" && MediaSource.isTypeSupported(mimeType);
+function canStream(meta: VideoMeta): boolean {
+  // `progressive: false` is an import's word that MSE would accept the type
+  // and then fail on the bytes (§5); the whole-file path is the only one that
+  // plays such a file, so the type is not even asked about.
+  if (meta.progressive === false) return false;
+  return typeof MediaSource !== "undefined" && MediaSource.isTypeSupported(meta.mimeType);
 }
 
 function isQuotaError(err: unknown): boolean {
@@ -442,7 +447,7 @@ class PlaybackRun implements Playback {
     const { meta, id, publicBaseUrl } = this.opts;
     const url = `${publicBaseUrl}/${id}/video.bin`;
 
-    if (canStream(meta.mimeType)) {
+    if (canStream(meta)) {
       // Armed for the whole MSE lifetime, and deliberately left running when the
       // append loop returns: the last chunk landing and endOfStream() is exactly
       // when a hole near the end of the recording strands the playhead (§8).

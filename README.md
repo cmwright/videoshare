@@ -26,7 +26,7 @@ https://videoshare.example.com/view.html#8Kq2vTnR1sYbLm3wXpQdEg.b0Zx…
 
 The site is three static pages:
 
-- **`index.html`** — the app you use: a sidebar and three views behind one hash
+- **`index.html`** — the app you use: a sidebar and four views behind one hash
   route. **Videos** is the library — one row per recording this browser made,
   with its date, duration, size, a Copy link button, an overflow menu that can
   forget a row or delete the video outright, and, with a gateway and analytics
@@ -39,7 +39,12 @@ The site is three static pages:
   recording costs no more memory than a one-minute one. Beside the video and its
   metadata, a recording writes one optional third object: a thumbnail — a single
   frame from its first seconds, ~15–50 KB, encrypted under the same link key, and
-  absent from anything recorded before it existed. **Settings** holds the
+  absent from anything recorded before it existed. **Upload video** takes a
+  video you already have — a WebM or MP4 on disk — and sends it down the same
+  encrypt-and-multipart path, so it gets the same kind of link and the same
+  library row; the container is read for the codec string the player needs,
+  and an MP4 that is not fragmented is marked so viewers download it whole
+  rather than have streaming fail on it. **Settings** holds the
   bucket credentials and the encoder choices. All of it — settings and the
   library of your links — lives in `localStorage`, and a recording keeps
   uploading whichever view you are looking at.

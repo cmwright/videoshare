@@ -63,6 +63,18 @@
             <span id="nav-live-label" class="sr-only"></span>
           </a>
 
+          <a class="nav-item" data-route="upload" href="#/upload">
+            <svg class="nav-glyph" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+              <path class="nav-glyph-stroke" d="M10 14V4.5M6.5 8 10 4.5 13.5 8" />
+              <path class="nav-glyph-stroke" d="M3.5 12.5v2a2 2 0 0 0 2 2h9a2 2 0 0 0 2-2v-2" />
+            </svg>
+            <span class="nav-label">Upload video</span>
+            <!-- Lit while an upload is in flight, for the same reason the
+                 recording item has one (SPEC §19). -->
+            <span id="nav-upload-dot" class="nav-live hidden" aria-hidden="true"></span>
+            <span id="nav-upload-label" class="sr-only"></span>
+          </a>
+
           <a class="nav-item" data-route="settings" href="#/settings">
             <svg class="nav-glyph" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
               <path class="nav-glyph-stroke" d="M3 6h9M15.5 6h1.5M3 14h2M8.5 14H17" />
@@ -119,10 +131,14 @@
                    leaves the object exactly where it was (SPEC §9). -->
               <p id="library-count" class="view-sub"></p>
             </div>
-            <button id="new-recording" type="button" class="primary">
-              <span class="record-glyph" aria-hidden="true"></span>
-              New recording
-            </button>
+            <div class="view-head-actions">
+              <!-- Both are navigations and nothing more (SPEC §17.2, §19). -->
+              <button id="upload-video" type="button" class="ghost">Upload video</button>
+              <button id="new-recording" type="button" class="primary">
+                <span class="record-glyph" aria-hidden="true"></span>
+                New recording
+              </button>
+            </div>
           </header>
 
           <p id="library-status" class="message" role="status" aria-live="polite"></p>
@@ -135,7 +151,7 @@
               </svg>
             </span>
             <span class="library-empty-text">
-              No recordings yet — the ones you upload from this browser will show up here.
+              No videos yet — the ones you record or upload from this browser will show up here.
             </span>
           </p>
 
@@ -254,6 +270,104 @@
             </div>
 
             <p id="message" class="message" role="status" aria-live="polite"></p>
+          </section>
+        </section>
+
+        <!-- ================= Upload video (SPEC §19) ======================= -->
+        <section id="view-upload" class="view" aria-label="Upload video" hidden>
+          <header class="view-head">
+            <div class="view-head-text">
+              <h1>Upload video</h1>
+              <p class="view-sub">
+                Share a video you already have. It is encrypted in this browser before a byte leaves
+                it, and the link you get back carries the only key.
+              </p>
+            </div>
+          </header>
+
+          <section class="card recorder" aria-label="Uploader">
+            <div class="stages">
+              <div data-upstage="pick" class="stage stage-idle">
+                <label id="up-drop" class="dropzone" for="up-file">
+                  <input id="up-file" type="file" class="sr-only" />
+                  <span class="dropzone-mark" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" focusable="false">
+                      <path d="M12 16V5.5M8 9.5 12 5.5l4 4" />
+                      <path d="M4.5 14.5v2.5a2.5 2.5 0 0 0 2.5 2.5h10a2.5 2.5 0 0 0 2.5-2.5v-2.5" />
+                    </svg>
+                  </span>
+                  <span class="dropzone-title">Choose a video</span>
+                  <span class="stage-hint">
+                    or drop one here. WebM or MP4 — anything this browser can play. Nothing is
+                    uploaded until you say so.
+                  </span>
+                </label>
+              </div>
+
+              <div data-upstage="checking" class="stage stage-centered hidden">
+                <span class="spinner spinner-lg" aria-hidden="true"></span>
+                <p class="stage-title">Checking the file</p>
+                <p class="stage-hint">Reading the container to see how it will play.</p>
+              </div>
+
+              <div data-upstage="ready" class="stage hidden">
+                <div class="preview-frame">
+                  <video id="up-preview" class="preview-video" controls playsinline></video>
+                </div>
+                <p id="up-info" class="stage-meta"></p>
+                <p id="up-note" class="stage-hint"></p>
+                <div class="field">
+                  <label for="up-title">Title</label>
+                  <input id="up-title" type="text" placeholder="Untitled video" maxlength="200" />
+                </div>
+                <div class="button-row">
+                  <button id="up-start" type="button" class="primary">Upload</button>
+                  <button id="up-cancel" type="button">Choose another</button>
+                </div>
+              </div>
+
+              <div data-upstage="uploading" class="stage hidden">
+                <h2>Uploading&hellip;</h2>
+                <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="up-progress">
+                  <div id="up-progress-fill" class="progress-fill"></div>
+                </div>
+                <p id="up-progress-text" class="stage-meta">0%</p>
+                <p class="stage-hint">You can keep using the app; the upload carries on in this tab.</p>
+
+                <div id="up-recovery" class="recovery hidden">
+                  <p class="recovery-note">
+                    Nothing was lost — the file is still on your disk. Try again, or cancel.
+                  </p>
+                  <div class="button-row">
+                    <button id="up-retry" type="button" class="primary">Retry</button>
+                    <button id="up-abandon" type="button" class="danger">Cancel upload</button>
+                  </div>
+                </div>
+              </div>
+
+              <div data-upstage="done" class="stage stage-done hidden">
+                <span class="state-icon state-icon-success" aria-hidden="true">
+                  <svg class="state-glyph" viewBox="0 0 24 24" focusable="false">
+                    <circle class="state-glyph-ring" cx="12" cy="12" r="9" />
+                    <path class="state-glyph-check" d="M8.1 12.3 10.8 15 15.9 9.4" />
+                  </svg>
+                </span>
+                <h2>Ready to share</h2>
+                <div class="link-row">
+                  <input id="up-link" type="text" readonly class="mono" aria-label="Share link" />
+                  <button id="up-copy" type="button" class="primary">Copy</button>
+                </div>
+                <p class="stage-hint">
+                  The decryption key lives in the link's <code>#</code> fragment — anyone with the
+                  link can watch, and nobody else can.
+                </p>
+                <div class="button-row">
+                  <button id="up-again" type="button">Upload another</button>
+                </div>
+              </div>
+            </div>
+
+            <p id="up-message" class="message" role="status" aria-live="polite"></p>
           </section>
         </section>
 

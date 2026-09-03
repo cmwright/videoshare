@@ -135,9 +135,19 @@ two owner-side surfaces do — a library row (§17.3) and the video page's poste
   "totalBytes": 19381222,      // plaintext (pre-encryption) video byte length
   "chunkSize": 8388608,        // plaintext chunk size used
   "chunkCount": 5,
-  "createdAt": "2026-08-27T21:04:00.000Z"  // ISO 8601 UTC
+  "createdAt": "2026-08-27T21:04:00.000Z",  // ISO 8601 UTC
+  "progressive": false         // OPTIONAL. Absent means true. See below.
 }
 ```
+
+`progressive` is the one optional field, and it is written by exactly one
+writer: §19's import of an MP4 that is not fragmented. It says the bytes cannot
+be appended to an MSE `SourceBuffer` as they are, so §8's progressive path must
+not be attempted — `MediaSource.isTypeSupported` would say yes to the type and
+MSE would then fail on the bytes, after the point at which the player can still
+fall back. A reader treats a missing field as `true`, which is what every
+recording is, and must not write it for a recording; §8's whole-file path plays
+a `progressive: false` video exactly as it plays a Safari one.
 
 ## 6. Recording
 
@@ -387,7 +397,8 @@ chrome and in not autoplaying (§17.4); it makes the same requests otherwise.
 - Parse fragment → `{ id, key }`; malformed fragment → friendly error.
 - GET `{publicBaseUrl}/{id}/meta.json` (publicBaseUrl configurable per
   deployment — see §10; **no credentials**), decrypt, show title/duration.
-- Progressive path (when `MediaSource.isTypeSupported(meta.mimeType)`):
+- Progressive path (when `meta.progressive !== false` — §5 — and
+  `MediaSource.isTypeSupported(meta.mimeType)`):
   MSE `SourceBuffer` of `meta.mimeType`; fetch `video.bin` with Range requests
   chunk-by-chunk in order, decrypt, `appendBuffer` sequentially; start playback
   once the first chunk is appended; keep fetching ahead until done, then
@@ -467,7 +478,8 @@ at the deployed site + this config's publicBaseUrl.
 `types.ts`
 ```ts
 export interface VideoMeta { v: 1; title: string; mimeType: string; durationMs: number;
-  totalBytes: number; chunkSize: number; chunkCount: number; createdAt: string; }
+  totalBytes: number; chunkSize: number; chunkCount: number; createdAt: string;
+  progressive?: boolean; }                                // §5: absent means true; §19 writes false
 export interface Settings { endpoint: string; region: string; bucket: string;
   accessKeyId: string; secretAccessKey: string; publicBaseUrl: string;
   quality: Quality; codec: CodecChoice; videoBitsPerSecond: number; }
@@ -671,8 +683,23 @@ from `record.css` to `shell.css` because two pages now draw them; their tokens
   and `peakBucket`. §16.9 has the detail, plus what §16 adds to
   `tests/beacon.test.ts`, `tests/crypto.test.ts`, `tests/gateway.test.ts` and
   `tests/e2e.gateway.test.ts`.
+- `tests/import.test.ts` (vitest, Node) — §19's sniffer over hand-built
+  containers: a WebM with each track kind, one whose Segment declares no size,
+  AV1 spelled from `av1C` (and without one), a Matroska DocType, an unknown codec
+  id, a track table that straddles the head window (read exactly once more, at
+  its own size) and one too large to buffer; an MP4 that is faststart (not
+  progressive), one with `mvex` (progressive), one whose `moov` sits after an
+  `mdat` larger than the head window (reached by seeking, with the reads pinned),
+  H.264/HEVC/AV1/VP9 sample entries, `esds` audio object types across all three
+  sample-entry versions, a bare `mp4a`, a hint track, an audio-only file, and a
+  file with no `moov`; `planImport`'s chunk arithmetic and its `progressive`
+  rule; `runImport` against a fake session — full chunks then the tail, an exact
+  multiple, a file smaller than one chunk, and a retry that resumes at
+  `nextChunk` without re-sending a part; the thumbnail offsets; and the view's
+  pure bits (`titleFromFilename`, `progressiveNote`). The browser half — the
+  hidden element, the canvas, the drop zone — is not run in Node.
 - `tests/shell.test.ts` (vitest, Node) — `parseRoute` and `routeHash` (§17.2), the
-  only new pure logic §17 introduces: each of the three hashes; a trailing slash;
+  only new pure logic §17 introduces: each of the four hashes; a trailing slash;
   `""`, `"#"`, `"#/"`, an unknown route and a nonsense one all resolving to
   `"videos"`; round-tripping `routeHash` through `parseRoute`; and that no input
   throws. The router's DOM half — `hashchange`, `hidden`, `aria-current`, focus —
@@ -1938,11 +1965,11 @@ main column by a 1px `--border`. Three parts, top to bottom:
   linking to the library (`#/videos` on `index.html`, `index.html#/videos` on
   `video.html`). Same mark on every page on purpose: a viewer who follows a link and the
   owner who made it are looking at one product.
-- **Nav** — three items, each an `<a>` with an inline SVG glyph and a label: **Videos** →
-  `#/videos`, **New recording** → `#/record`, **Settings** → `#/settings`. The active one
-  carries `aria-current="page"` and the accent treatment. On `video.html` the three point
-  at `index.html#/…` and **Videos** is the active one — a video page is a video in the
-  library.
+- **Nav** — four items, each an `<a>` with an inline SVG glyph and a label: **Videos** →
+  `#/videos`, **New recording** → `#/record`, **Upload video** → `#/upload` (§19),
+  **Settings** → `#/settings`. The active one carries `aria-current="page"` and the accent
+  treatment. On `video.html` the four point at `index.html#/…` and **Videos** is the active
+  one — a video page is a video in the library.
 - **Footer**, in order:
   - the **"Encrypted in this browser"** lock line, glyph and text as the topbar carries
     them today. Both modes, both owner pages: it is the one sentence of the threat model
@@ -1973,20 +2000,21 @@ shell depends on script.
 
 ### 17.2 Routing and the three views
 
-`index.html`'s main column holds three sibling `<section>`s and nothing else:
+`index.html`'s main column holds four sibling `<section>`s and nothing else:
 
 | hash | section | contains |
 | --- | --- | --- |
 | `#/videos` | `#view-videos` | §17.3's library — **the default** |
 | `#/record` | `#view-record` | §6's stage machine, its guards and its element ids, verbatim |
+| `#/upload` | `#view-upload` | §19's uploader — a file already on disk becomes a share link |
 | `#/settings` | `#view-settings` | Recording options; the Account block (gateway mode); the Storage settings form (legacy mode) |
 
 - The router is hand-rolled: a `hashchange` listener plus one application at load.
-  `parseRoute(hash)` is pure — `#/videos`, `#/record`, `#/settings`, a single trailing
-  `/` tolerated, and **everything else — `""`, `"#"`, `"#/"`, an unknown route, a
+  `parseRoute(hash)` is pure — `#/videos`, `#/record`, `#/upload`, `#/settings`, a single
+  trailing `/` tolerated, and **everything else — `""`, `"#"`, `"#/"`, an unknown route, a
   nonsense string — is `"videos"`**. `routeHash(view)` is its inverse and the only place
   a hash string is written.
-- Applying a route: the matching section loses `hidden`, the other two get it — the
+- Applying a route: the matching section loses `hidden`, the others get it — the
   attribute, not merely a class, so a hidden view leaves the accessibility tree and its
   controls leave the tab order; the matching nav link gains `aria-current="page"` and the
   others lose it; `document.title` follows the view. Nothing is created or destroyed: all
@@ -2022,10 +2050,10 @@ shell depends on script.
 `shell.ts`:
 
 ```ts
-export type ViewName = "videos" | "record" | "settings";
+export type ViewName = "videos" | "record" | "upload" | "settings";
 export const DEFAULT_VIEW: ViewName;                     // "videos"
 export function parseRoute(hash: string): ViewName;      // pure; never throws
-export function routeHash(view: ViewName): string;       // "#/videos" | "#/record" | "#/settings"
+export function routeHash(view: ViewName): string;       // "#/videos" | "#/record" | "#/upload" | "#/settings"
 export interface Router {
   readonly view: ViewName;
   go(view: ViewName): void;                              // pushes a history entry
@@ -2043,7 +2071,8 @@ nav links are ordinary cross-document links.
 
 ### 17.3 The library (`#/videos`)
 
-Header: an `<h1>` "Videos", a sub-line, and a primary **New recording** button (§17.2).
+Header: an `<h1>` "Videos", a sub-line, a ghost **Upload video** button (§19) and a
+primary **New recording** button (§17.2) — both navigations and nothing more.
 The sub-line counts only what this browser knows — `N recordings · X uploaded from this
 browser`, summing `sizeBytes` over the entries that carry one. It does **not** claim to
 describe the bucket: the mockup's "in your bucket" is a number the local library cannot
@@ -2812,3 +2841,145 @@ Every existing test keeps passing; §18 adds cases and deletes none (§13).
 - The one thing a deployer of an **existing** installation has to know: nothing
   breaks if they change none of it. Delete video appears, and on a deployment
   whose credentials cannot delete it fails with a sentence that says so.
+
+## 19. Uploading an existing video (`#/upload`)
+
+A video that already exists as a file — a recording repaired offline, an export
+from another tool, a screen capture made somewhere this app was not — gets the
+same link, the same library row and the same objects a recording gets. Nothing
+downstream can tell the difference: the bytes go through §7's session, §3's
+three objects are written in §7's order, and `view.html` is untouched.
+
+What the recorder makes, it knows everything about. An imported file is the
+other way round: the bytes arrive first, and two things have to be learned from
+them — §5's `mimeType`, which is the one string the player hands to MSE (§8),
+and whether MSE can be fed the file at all. Both come from the container's own
+head, never from the whole file, and never from the file's name or the
+browser's `File.type`, neither of which says what is inside.
+
+### 19.1 The view
+
+`#/upload` (§17.2), a fourth nav item and a ghost **Upload video** button in the
+library header beside **New recording**, both plain navigations. Five stages in
+the recorder's footprint and classes:
+
+- **pick** — a drop zone wrapping a visually hidden `<input type="file">`, so a
+  click anywhere in it opens the picker and the input's own focus ring is what
+  keyboard users see. Drag-and-drop lands in the same place. Nothing is uploaded
+  here: choosing a file commits nothing, and the reader is told so.
+- **checking** — the sniffer reads the head (§19.2) and a hidden element
+  confirms **this** browser can play the file and reports its duration and
+  frame size. A file that fails either goes back to **pick** with one sentence
+  saying why: "not a WebM or MP4 this app can describe to a player", "no video
+  track", or "this browser cannot play this file, so viewers will not be able
+  to either". A browser that cannot play a file is the wrong place to upload it
+  from, and the reader hears that before a byte moves.
+- **ready** — a preview `<video>` of the file, a meta line (duration · size ·
+  frame size · the mime type that will be written), a title prefilled from the
+  file name without its extension, **Upload** and **Choose another**. When the
+  file will play but not stream (§19.3) one further sentence says so, and what
+  to do about it, in words that name the ffmpeg flag.
+- **uploading** — §7's progress bar. Authorization is asked for at **Upload**,
+  not at pick: `demandSettings` / `demandSignIn` (§17.2) with sentences of their
+  own ("Sign in with Google before uploading." — the recorder's "the upload
+  starts as you record" would be false here). A failure shows the recovery
+  block: **Retry**, which resumes (§19.4), and **Cancel upload**, which aborts
+  the multipart upload best-effort and returns to **pick**. There is no
+  "Download recording" link because the file never left the disk.
+- **done** — the share link, auto-copied, with **Upload another**.
+
+§6's two rules bind this view to the router as they bind the recorder: a
+transition into **ready**, **uploading** or **done** shows the view, and routing
+away never stops an upload — the **Upload video** nav item carries the same
+live indicator the recording item does while one is in flight, and
+`beforeunload` asks while a stage is **uploading**.
+
+### 19.2 Sniffing (`src/import.ts`, pure)
+
+`sniffContainer(source: ByteSource): Promise<ContainerInfo | null>` reads the
+first `SNIFF_HEAD_BYTES` (1 MiB) and decides by the first bytes: the EBML
+magic is a WebM or Matroska file, an `ftyp` box is ISO BMFF, anything else is
+`null` — "cannot describe", which is not the same as "cannot play", and the
+view refuses it because a `meta.mimeType` that names nothing would leave every
+player guessing.
+
+- **WebM.** The `EBML` header's `DocType` picks `video/webm` or, for
+  `matroska`, `video/x-matroska` (honest, and one `isTypeSupported` says no
+  to, so §8's whole-file path plays it — which Chrome does). Then the
+  `Segment`'s children, in order, until `Tracks` or the first `Cluster`; a
+  `Segment` of unknown size — every MediaRecorder and webm-muxer recording — is
+  walked to the end of the window. `Tracks` that straddles the window is
+  fetched once more at exactly its declared size, bounded by
+  `MAX_TRACKS_BYTES` (1 MiB). Each `TrackEntry` contributes one codec by
+  `TrackType` and `CodecID`: `vp8`, `vp9`, `opus`, `vorbis` in the short
+  spelling MediaRecorder itself writes, `av01.P.LLT.DD` spelled out from
+  `CodecPrivate`'s `av1C` (a short `av1` is not universally recognised; without
+  an `av1C`, a plausible level rather than nothing, since the level only
+  changes `isTypeSupported`'s answer and never the decode), `avc1.PPCCLL` /
+  `hvc1.…` from an `avcC`/`hvcC` for an H.264/HEVC Matroska. An id outside the
+  table becomes its own last segment, lowercased, for the browser to refuse; a
+  miss only costs the streaming path. `progressive` is always `true`.
+- **MP4.** Top-level boxes are walked by size from offset 0 — `ftyp`, `free`,
+  a monolithic `mdat` of any size, 64-bit `largesize` headers included — until
+  `moov`, which is read at exactly its size (`MAX_MOOV_BYTES`, 32 MiB) from the
+  window when it is there and by one seek when it is not. A `moov` is walked
+  `trak` → `mdia` → `hdlr` (only `vide` and `soun` count) → `minf` → `stbl` →
+  `stsd` → the first sample entry, whose type and configuration box give the
+  codec: `avc1`/`avc3` + `avcC` → `avc1.PPCCLL`; `hvc1`/`hev1` + `hvcC` →
+  ISO/IEC 14496-15 Annex E; `av01` + `av1C`; `vp09`/`vp08` + `vpcC`; `mp4a` +
+  `esds` → `mp4a.{OTI}.{AOT}` (AAC-LC assumed without one), across all three
+  sample-entry versions; `Opus`, `fLaC`, `ac-3`, `ec-3`, `.mp3` by name.
+  `progressive` is `true` iff `moov` carries `mvex` — a fragmented file, whose
+  samples are in `moof`/`mdat` pairs — because MSE's ISO BMFF byte stream
+  format has no place for a monolithic `mdat` indexed by a `moov` at the far
+  end of the file, and Chrome accepts such a `moov` and then errors on the
+  `mdat`, after the point where §8's fallback can still run. Two sample entries
+  in one `stsd` are read as the first.
+
+`mimeType` is `{type};codecs={video…,audio…}`, unquoted, exactly as the engines
+write theirs (§6).
+
+### 19.3 What is written
+
+§5's metadata with `chunkSize = CHUNK_SIZE`, `chunkCount = ceil(size /
+CHUNK_SIZE)`, `totalBytes = size`, `durationMs` from the element probe (the
+`Infinity` seek of §6 applied, so an app-made WebM with no duration header
+reports the truth), and `progressive: false` written **only** when the sniffer
+said so — the metadata of a WebM or a fragmented MP4 is byte-for-byte what a
+recording writes. §3's thumbnail is one frame of the file — a second in, or
+halfway through a shorter file, with §6's blank-frame retry at a later offset
+— scaled and encoded by §6's rules, encrypted under `thumbAad(id)` before the
+first part goes up, and handed to `finish()` as always. A frame that cannot be
+had is silently no thumbnail.
+
+The player's change is one line: `progressive === false` skips the MSE path
+without asking `isTypeSupported` (§8). Such a file still plays; it downloads
+whole first, which the **ready** stage told the uploader.
+
+### 19.4 Uploading (`src/import.ts`)
+
+```ts
+export function planImport(size: number, details: ImportDetails): VideoMeta;  // throws on an empty file
+export function createImportJob(file: Blob, meta: VideoMeta, thumb: Uint8Array | null): ImportJob;
+export function runImport(session: UploadSession, job: ImportJob): Promise<UploadResult>;
+```
+
+`runImport` slices the file one `CHUNK_SIZE` at a time — `file.slice(…).arrayBuffer()`,
+so one chunk of plaintext is in memory at once, however large the file — and
+hands each full chunk to `addChunk` and the final one to `finish`, in §7's
+order. `job.nextChunk` advances as chunks are handed over, and `finish()` is
+already safe to call twice (§7), so **Retry** is simply `runImport` again with
+the same job: nothing already sent is sent again, and the parts §7 remembered
+as failed are re-sent by `finish()` as they are for a recording. The session
+is §7's, unchanged, created with the same signer the recorder would use in
+this mode; the gateway needs no new op, no new limit and no new config.
+
+### 19.5 What this does not do
+
+- **No transcoding, no remuxing.** A file is uploaded as it is. Converting a
+  non-fragmented MP4 into one that streams, or an AVI into anything, is a job
+  for ffmpeg, and the **ready** stage says the words to type.
+- **No file the browser cannot play.** The probe is the gate, on purpose: the
+  viewers' browsers are, statistically, this one.
+- **No new dependency, no new endpoint, no new bucket permission.** §7's CORS,
+  IAM and lifecycle notes are the complete list for this feature too.

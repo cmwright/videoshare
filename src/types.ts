@@ -34,6 +34,15 @@ export interface VideoMeta {
   chunkCount: number;
   /** ISO 8601 UTC. */
   createdAt: string;
+  /**
+   * Whether the bytes can be fed to an MSE SourceBuffer as they are (SPEC §5,
+   * §8). Absent means true, which is every recording this app makes. Written
+   * as `false` only by an import (§19) of a non-fragmented MP4, whose `moov`
+   * MSE would accept and whose `mdat` it would then choke on: the player takes
+   * the whole-file path instead, and nothing about the file's playability
+   * changes.
+   */
+  progressive?: boolean;
 }
 
 /** Recorder-page configuration, persisted at `videoshare.settings`. */
